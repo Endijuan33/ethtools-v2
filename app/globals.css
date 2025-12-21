@@ -1,0 +1,105 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ------------------------------------------------------------------ */
+/*  Color variables – light / dark mode                                */
+/* ------------------------------------------------------------------ */
+:root {
+  --foreground-rgb: 0, 0, 0;
+  --background-start-rgb: 214, 219, 220;
+  --background-end-rgb: 255, 255, 255;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --foreground-rgb: 255, 255, 255;
+    --background-start-rgb: 0, 0, 0;
+    --background-end-rgb: 0, 0, 0;
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/*  Base page layout – gradient background and basic padding           */
+/* ------------------------------------------------------------------ */
+body {
+  color: rgb(var(--foreground-rgb));
+  background: linear-gradient(
+      to bottom,
+      transparent,
+      rgb(var(--background-end-rgb))
+    )
+    rgb(var(--background-start-rgb));
+
+  display: block; /* flexible */
+  min-height: 100vh;
+  padding: 1rem; /* for small screen */
+}
+
+/* ------------------------------------------------------------------ */
+/*  Farcaster Mini App – scrollable & responsive                      */
+/* ------------------------------------------------------------------ */
+.farcaster-miniapp {
+  /* Ukuran dan layout */
+  max-width: 424px !important;
+  margin: 0 auto;
+  padding: 0.5rem;
+  box-sizing: border-box;
+  font-size: 16px;
+
+  /* Scroll */
+  overflow-y: auto;
+  overflow-x: hidden;
+  scroll-behavior: smooth;           /* Smooth scroll modern */
+  -webkit-overflow-scrolling: touch; /* iOS momentum scroll */
+  overscroll-behavior: contain;      /* cegah pull-to-refresh */
+}
+
+/* ------------------------------------------------------------------ */
+/*  Interactive elements – tappable di WebView                        */
+/* ------------------------------------------------------------------ */
+.farcaster-miniapp input,
+.farcaster-miniapp textarea,
+.farcaster-miniapp button,
+.farcaster-miniapp select {
+  font-size: 16px !important;  /* Minimum tap size iOS/Android */
+  padding: 12px !important;
+  min-height: 44px;            /* Apple HIG tap target */
+  border-radius: 8px;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Optional warning banner inside Mini App                             */
+/* ------------------------------------------------------------------ */
+.farcaster-miniapp .miniapp-warning {
+  background: #ff9800;
+  color: #fff;
+  padding: 12px;
+  border-radius: 8px;
+  margin: 12px 0;
+  font-size: 14px;
+  text-align: center;
+  font-weight: 500;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Close button injected by layout.tsx                                */
+/* ------------------------------------------------------------------ */
+.farcaster-miniapp-close {
+  position: fixed !important;
+  top: 12px !important;
+  right: 12px !important;
+  z-index: 9999 !important;
+  background: rgba(0,0,0,0.7) !important;
+  color: #fff !important;
+  border: none !important;
+  border-radius: 50% !important;
+  width: 36px !important;
+  height: 36px !important;
+  font-size: 20px !important;
+  font-weight: bold !important;
+  cursor: pointer !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+}
