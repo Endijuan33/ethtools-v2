@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "Secure client-side Ethereum address converter from mnemonic or private key",
+  "envNote": "Optional env vars: NEXT_PUBLIC_ROUTESCAN_MAINNET_URL, NEXT_PUBLIC_ROUTESCAN_TESTNET_URL",
   "scripts": {
     "build": "next build",
     "dev": "next dev",
