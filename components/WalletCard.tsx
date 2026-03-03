@@ -479,6 +479,15 @@ export default function WalletCard() {
   }
 
   // --- RENDER LOGIC ---
+  // Prevent rendering until mounted to avoid hydration mismatches
+  if (!isMounted) {
+    return (
+      <div className="w-full max-w-lg p-6 bg-white/10 backdrop-blur-md rounded-xl shadow-glass border border-white/20 text-white">
+        <div className="text-center py-8 text-gray-300">Loading wallet...</div>
+      </div>
+    )
+  }
+
   if (isUnlocked && activeWallet) {
     return (
       <div className="w-full max-w-lg p-6 bg-white/10 backdrop-blur-md rounded-xl shadow-glass border border-white/20 text-white">

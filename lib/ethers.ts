@@ -334,7 +334,6 @@ export async function getBalance(address: string, network: Network): Promise<str
     const balanceWei = await provider.getBalance(address)
     return Number.parseFloat(formatEther(balanceWei)).toFixed(5)
   } catch (error) {
-    console.error(`Failed to fetch balance for ${network}:`, error)
     throw new Error(`Could not fetch ETH balance on ${networkConfig.name}.`)
   }
 }

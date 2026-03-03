@@ -29,10 +29,14 @@ export default function ClientLayout({
             if (caps.includes("haptics.impactOccurred")) {
               sdk.haptics.impactOccurred("light");
             }
+          }).catch(() => {
+            // Silent fail if haptics unavailable
           });
           (window as any).farcasterSDK = sdk;
         })
-        .catch((err) => console.warn("SDK load failed:", err));
+        .catch(() => {
+          // Silent fail if SDK unavailable
+        });
     }
 
     // Close Button
