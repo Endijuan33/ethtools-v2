@@ -34,7 +34,7 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
         throw new Error("Could not fetch gas price.")
       }
 
-      const gasLimit = 21000n // Gas limit for a standard ETH transfer is 21000 wei
+      const gasLimit = BigInt(21000) // Gas limit for a standard ETH transfer is 21000 wei
       const gasCost = gasLimit * gasPrice
 
       const balance = await provider.getBalance(wallet.address)
