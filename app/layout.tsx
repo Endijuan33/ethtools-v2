@@ -1,3 +1,4 @@
+// app/layout.tsx
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
@@ -5,14 +6,23 @@ import ClientLayout from "./client-layout";
 
 const inter = Inter({ subsets: ["latin"] });
 
-// === METADATA (Server Component) ===
 export const metadata: Metadata = {
   title: "EthTools - Ethereum Wallet Utility",
-  description: "Secure, client-side Ethereum key tools. Your keys never leave your browser.",
-  icons: { icon: "/placeholder-logo.svg" },
+  description:
+    "Secure, client-side Ethereum key tools. Your keys never leave your browser.",
+  icons: {
+    icon: "/placeholder-logo.svg",
+  },
+
+  // Base Mini App metadata
+  other: {
+    "base:app_id": "6a00cc0e9ee68cd142d1b0bd",
+  },
+
   openGraph: {
     title: "EthTools",
-    description: "Convert mnemonics, generate wallets, manage keys — all client-side.",
+    description:
+      "Convert mnemonics, generate wallets, manage keys — all client-side.",
     url: "https://ethtools.vercel.app",
     siteName: "EthTools",
     images: [
@@ -24,7 +34,6 @@ export const metadata: Metadata = {
       },
     ],
   },
-    generator: 'v0.app'
 };
 
 export default function RootLayout({
