@@ -26,8 +26,8 @@ A secure, client-side web application to convert a BIP-39 mnemonic or an Ethereu
 1.  **Clone the Repository**
 
     ```bash
-    git clone https://github.com/your-username/ethereum-address-converter.git
-    cd ethereum-address-converter
+    git clone https://github.com/endijuan33/ethtools-v2.git
+    cd ethtools-v2
     ```
 
 2.  **Install Dependencies**
