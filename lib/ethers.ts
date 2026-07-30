@@ -229,7 +229,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
   },
   "arc-testnet": {
     name: "Arc Testnet",
-    rpcUrl: "https://rpc.testnet.arc.network",
+    rpcUrl: "https://arc-testnet.drpc.org",
     explorerUrl: "https://testnet.arcscan.app",
     currency: "USDC",
     type: 'testnet' as const,
