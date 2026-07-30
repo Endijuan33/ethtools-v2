@@ -227,6 +227,13 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     currency: "ETH",
     type: "testnet" as const,
   },
+  "arc-testnet": {
+    name: "Arc Testnet",
+    rpcUrl: "https://rpc.testnet.arc.network",
+    explorerUrl: "https://testnet.arcscan.app",
+    currency: "USDC",
+    type: 'testnet' as const,
+  },
   "giwa-sepolia": {
     name: "GIWA Sepolia",
     rpcUrl: "https://sepolia-rpc.giwa.io/",
