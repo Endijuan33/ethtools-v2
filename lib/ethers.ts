@@ -119,6 +119,13 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     currency: "XDAI",
     type: "mainnet" as const,
   },
+  "arc-mainnet": {
+    name: "Arc Mainnet",
+    rpcUrl: "https://rpc.blockdaemon.mainnet.arc.io",
+    explorerUrl: "https://arc-mainnet.cloud.blockscout.com/",
+    currency: "USDC",
+    type: 'mainnet' as const,
+  },
 
   mantle: {
     name: "Mantle Mainnet",
