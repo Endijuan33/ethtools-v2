@@ -5,7 +5,7 @@ import {
   X,
   Plus,
   Trash2,
-  Bookmark,
+  Bookmark as BookmarkIcon,
   Copy,
   Check,
   ExternalLink,
@@ -149,7 +149,7 @@ export default function BookmarkManager({
         {/* Header */}
         <div className="flex justify-between items-center mb-4">
           <h3 className="text-lg font-bold text-white flex items-center gap-2">
-            <Bookmark size={20} />
+            <BookmarkIcon size={20} />
             Manage Bookmarks
             {network && (
               <span className="text-sm font-normal text-gray-400">
