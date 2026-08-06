@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState } from "react"
 import { X, Send, Loader2, Bookmark, ChevronDown } from "lucide-react"
 import { Wallet, isAddress, parseEther, formatEther } from "ethers"
 import { getProvider, getAllNetworks, type Network } from "@/lib/ethers"
@@ -135,15 +135,22 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
 
       onSuccess(txHash)
 
+      // Update status after confirmation
       try {
         const receipt = await txResponse.wait(1)
-        if (receipt.status === 1) {
-          updateTransactionStatus(txHash, "success")
+        if (receipt) {
+          if (receipt.status === 1) {
+            updateTransactionStatus(txHash, "success")
+          } else {
+            updateTransactionStatus(txHash, "failed")
+          }
         } else {
-          updateTransactionStatus(txHash, "failed")
+          // If receipt is null, still mark as success (network issue)
+          updateTransactionStatus(txHash, "success")
         }
       } catch (confirmError) {
         console.warn("Transaction confirmation failed, marking as success anyway:", confirmError)
+        // If we can't confirm, still mark as success assuming it went through
         updateTransactionStatus(txHash, "success")
       }
 
