@@ -622,7 +622,7 @@ export default function WalletCard() {
               className="text-gray-400 hover:text-white transition-colors p-1"
               title="Manage Address Bookmark"
             >
-              <Bookmark size={20} />
+              <BookmarkIcon size={20} />
             </button>
             <div className="flex items-center bg-black/20 p-1 rounded-lg text-sm font-semibold">
               <button
