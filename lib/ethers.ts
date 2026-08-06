@@ -1,7 +1,3 @@
-// lib/ethers.ts
-// Ethers.js utilities with multi-RPC support for all blockchain networks.
-// Provides balance fetching, token management, and validation.
-
 "use client"
 
 import {
@@ -15,7 +11,7 @@ import {
   formatUnits,
   isError,
 } from "ethers"
-import { RpcPool, type RpcEndpoint } from "./multiRpc"
+import { RpcPool, type RpcEndpoint, type EndpointHealthStatus } from "./multiRpc"
 
 // ===== Types =====
 
@@ -463,11 +459,34 @@ export async function getProvider(network: Network): Promise<JsonRpcProvider> {
       failoverStrategy: "sequential",
       healthCheckInterval: 60000,
       requestTimeout: 20000,
+      maxBackoffDelay: 30000,
     })
     rpcPools.set(network, pool)
   }
 
   return rpcPools.get(network)!.getProvider()
+}
+
+/**
+ * Get the health status of all RPC pools for UI monitoring.
+ * @param network - Optional specific network to check; if omitted, returns all.
+ * @returns Map of network to array of endpoint health statuses
+ */
+export function getRpcHealthStatus(network?: Network): Map<string, EndpointHealthStatus[]> {
+  const result = new Map<string, EndpointHealthStatus[]>()
+  if (network) {
+    const pool = rpcPools.get(network)
+    if (pool && !pool.isDestroyedPool()) {
+      result.set(network, pool.getHealthStatus())
+    }
+  } else {
+    for (const [key, pool] of rpcPools) {
+      if (!pool.isDestroyedPool()) {
+        result.set(key, pool.getHealthStatus())
+      }
+    }
+  }
+  return result
 }
 
 /**

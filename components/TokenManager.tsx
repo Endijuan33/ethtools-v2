@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useCallback } from "react"
 import { Plus, Trash2, Loader2 } from "lucide-react"
 import { getTokenDetails, getTokenBalance, type Network } from "@/lib/ethers"
 import { isAddress } from "ethers"
@@ -23,6 +23,7 @@ export default function TokenManager({ userAddress, network, onTokensUpdate }: T
   const [newTokenAddress, setNewTokenAddress] = useState("")
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState("")
+  const [isFetchingBalances, setIsFetchingBalances] = useState(false)
 
   // Load tokens from localStorage on mount
   useEffect(() => {
@@ -42,6 +43,40 @@ export default function TokenManager({ userAddress, network, onTokensUpdate }: T
   useEffect(() => {
     localStorage.setItem("ethtools_tokens", JSON.stringify(tokens))
   }, [tokens])
+
+  /**
+   * Fetch balances for all tokens with parallel requests.
+   */
+  const fetchTokenBalances = useCallback(async () => {
+    if (tokens.length === 0) return
+    setIsFetchingBalances(true)
+
+    const promises = tokens.map(async (token) => {
+      try {
+        const balance = await getTokenBalance(token.address, userAddress, network)
+        return { ...token, balance }
+      } catch {
+        return { ...token, balance: "Error" }
+      }
+    })
+
+    const updatedTokens = await Promise.all(promises)
+    setTokens(updatedTokens)
+    onTokensUpdate(updatedTokens)
+    setIsFetchingBalances(false)
+  }, [tokens, userAddress, network, onTokensUpdate])
+
+  // Auto-refresh token balances every 30 seconds
+  useEffect(() => {
+    if (tokens.length === 0) return
+
+    // Initial fetch
+    fetchTokenBalances()
+
+    // Set up interval for auto-refresh
+    const interval = setInterval(fetchTokenBalances, 30000)
+    return () => clearInterval(interval)
+  }, [fetchTokenBalances, tokens.length])
 
   const handleAddToken = async () => {
     if (!isAddress(newTokenAddress)) {
@@ -89,7 +124,11 @@ export default function TokenManager({ userAddress, network, onTokensUpdate }: T
 
   return (
     <div className="bg-black/25 p-4 rounded-lg">
-      <h3 className="text-lg font-bold mb-3">Manage Tokens</h3>
+      <div className="flex justify-between items-center mb-3">
+        <h3 className="text-lg font-bold">Manage Tokens</h3>
+        {isFetchingBalances && <Loader2 size={16} className="animate-spin text-purple-400" />}
+      </div>
+
       <div className="flex items-center space-x-2 mb-3">
         <input
           type="text"
@@ -118,7 +157,9 @@ export default function TokenManager({ userAddress, network, onTokensUpdate }: T
               <p className="text-xs text-gray-400 font-mono">{token.address}</p>
             </div>
             <div className="flex items-center">
-              <span className="mr-4 font-mono">{token.balance}</span>
+              <span className="mr-4 font-mono">
+                {isFetchingBalances ? <Loader2 size={14} className="animate-spin" /> : token.balance || "—"}
+              </span>
               <button onClick={() => handleRemoveToken(token.address)} className="text-red-500 hover:text-red-400">
                 <Trash2 size={18} />
               </button>

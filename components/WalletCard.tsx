@@ -15,6 +15,8 @@ import {
   ChevronDown,
   Wallet,
   Loader2,
+  Circle,
+  Bookmark,
 } from "lucide-react"
 import { Mnemonic, Wallet as EthersWallet, isError } from "ethers"
 import {
@@ -27,12 +29,14 @@ import {
   validateRpcUrl,
   getProvider,
   cleanupRpcPools,
+  getRpcHealthStatus,
   type Network as NetworkType,
   type CustomNetwork,
   type NetworkConfig,
 } from "@/lib/ethers"
 import { QRCodeSVG } from "qrcode.react"
 import SendForm from "./SendForm"
+import BookmarkManager from "./BookmarkManager"
 
 // ===== Types =====
 
@@ -47,10 +51,16 @@ interface Balances {
   [key: string]: { balance: string | null; error: string | null }
 }
 
+interface RpcHealthIndicator {
+  [key: string]: { healthy: boolean; responseTime: number }
+}
+
 // ===== Constants =====
 
 const WALLETS_STORAGE_KEY = "ethtools_wallets"
 const ACTIVE_WALLET_KEY = "ethtools_active_wallet"
+const BALANCE_RETRY_COUNT = 3
+const BALANCE_RETRY_DELAY_MS = 1000
 
 // ===== AddCustomRpcModal (Inline) =====
 
@@ -93,7 +103,6 @@ function AddCustomRpcModal({
     }
 
     setIsValidating(true)
-    // Validate all RPC URLs
     const results = await Promise.all(filteredUrls.map((url) => validateRpcUrl(url)))
     const invalid = results.find((r) => !r.valid)
     if (invalid) {
@@ -319,7 +328,9 @@ export default function WalletCard() {
   const [showLogoutConfirmation, setShowLogoutConfirmation] = useState(false)
   const [isMounted, setIsMounted] = useState(false)
   const [showAddRpc, setShowAddRpc] = useState(false)
+  const [showBookmarkManager, setShowBookmarkManager] = useState(false)
   const [customNetworks, setCustomNetworks] = useState<Record<string, CustomNetwork>>({})
+  const [rpcHealth, setRpcHealth] = useState<RpcHealthIndicator>({})
 
   // --- Derived ---
   const activeWallet = useMemo(
@@ -384,31 +395,80 @@ export default function WalletCard() {
     }
   }, [])
 
-  // Fetch balances
+  // Fetch RPC health status periodically
+  useEffect(() => {
+    if (!isUnlocked) return
+
+    const updateHealthStatus = () => {
+      const healthMap = getRpcHealthStatus()
+      const newHealth: RpcHealthIndicator = {}
+      for (const [network, statuses] of healthMap) {
+        const healthy = statuses.some((s) => s.healthy)
+        const avgResponseTime = statuses.reduce((sum, s) => sum + s.responseTime, 0) / statuses.length
+        newHealth[network] = { healthy, responseTime: avgResponseTime }
+      }
+      setRpcHealth(newHealth)
+    }
+
+    updateHealthStatus()
+    const interval = setInterval(updateHealthStatus, 30000)
+    return () => clearInterval(interval)
+  }, [isUnlocked])
+
+  // --- Balance Fetching with Retry Logic ---
+
+  const fetchBalanceWithRetry = useCallback(
+    async (address: string, networkKey: string, retries: number = BALANCE_RETRY_COUNT): Promise<{
+      networkKey: string
+      balance: string | null
+      error: string | null
+    }> => {
+      let lastError: Error | null = null
+      for (let attempt = 0; attempt < retries; attempt++) {
+        try {
+          const balance = await getBalance(address, networkKey)
+          return { networkKey, balance, error: null }
+        } catch (e) {
+          lastError = e instanceof Error ? e : new Error("Unknown error")
+          console.warn(
+            `Balance fetch attempt ${attempt + 1}/${retries} failed for ${networkKey}:`,
+            lastError.message
+          )
+          if (attempt < retries - 1) {
+            const delay = BALANCE_RETRY_DELAY_MS * Math.pow(2, attempt)
+            await new Promise((resolve) => setTimeout(resolve, delay))
+          }
+        }
+      }
+      const errorMsg = lastError?.message || "Failed to fetch balance"
+      return { networkKey, balance: null, error: errorMsg }
+    },
+    []
+  )
+
   const fetchAllBalances = useCallback(async () => {
     if (!activeWallet?.address) return
     setIsLoadingBalances(true)
 
+    const address = activeWallet.address
     const balancePromises = displayedNetworks.map(async ([key]) => {
       const networkKey = key as NetworkType
-      try {
-        const balance = await getBalance(activeWallet.address, networkKey)
-        return { networkKey, balance, error: null }
-      } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : "Failed to fetch"
-        return { networkKey, balance: null, error: errorMsg }
-      }
+      return await fetchBalanceWithRetry(address, networkKey)
     })
 
     const results = await Promise.all(balancePromises)
     const newBalances: Balances = {}
     for (const result of results) {
-      newBalances[result.networkKey] = { balance: result.balance, error: result.error }
+      newBalances[result.networkKey] = {
+        balance: result.balance,
+        error: result.error,
+      }
     }
     setBalances((prev) => ({ ...prev, ...newBalances }))
     setIsLoadingBalances(false)
-  }, [activeWallet?.address, displayedNetworks])
+  }, [activeWallet?.address, displayedNetworks, fetchBalanceWithRetry])
 
+  // Auto-refresh balances every 30 seconds
   useEffect(() => {
     if (activeWallet?.address && isUnlocked) {
       setBalances({})
@@ -555,23 +615,33 @@ export default function WalletCard() {
 
         <div className="flex justify-between items-center mb-4">
           <h2 className="text-xl font-bold">Wallet Dashboard</h2>
-          <div className="flex items-center bg-black/20 p-1 rounded-lg text-sm font-semibold">
+          <div className="flex items-center gap-2">
+            {/* Bookmark Manager Button */}
             <button
-              onClick={() => setNetworkView("mainnet")}
-              className={`px-4 py-1 rounded-md transition-colors ${
-                networkView === "mainnet" ? "bg-purple-600" : ""
-              }`}
+              onClick={() => setShowBookmarkManager(true)}
+              className="text-gray-400 hover:text-white transition-colors p-1"
+              title="Manage Address Bookmark"
             >
-              Mainnets
+              <Bookmark size={20} />
             </button>
-            <button
-              onClick={() => setNetworkView("testnet")}
-              className={`px-4 py-1 rounded-md transition-colors ${
-                networkView === "testnet" ? "bg-purple-600" : ""
-              }`}
-            >
-              Testnets
-            </button>
+            <div className="flex items-center bg-black/20 p-1 rounded-lg text-sm font-semibold">
+              <button
+                onClick={() => setNetworkView("mainnet")}
+                className={`px-4 py-1 rounded-md transition-colors ${
+                  networkView === "mainnet" ? "bg-purple-600" : ""
+                }`}
+              >
+                Mainnets
+              </button>
+              <button
+                onClick={() => setNetworkView("testnet")}
+                className={`px-4 py-1 rounded-md transition-colors ${
+                  networkView === "testnet" ? "bg-purple-600" : ""
+                }`}
+              >
+                Testnets
+              </button>
+            </div>
           </div>
         </div>
 
@@ -607,10 +677,18 @@ export default function WalletCard() {
                 const balanceInfo = balances[networkKey]
                 const canSend = balanceInfo?.balance && Number.parseFloat(balanceInfo.balance) > 0
                 const isCustom = "isCustom" in networkInfo && networkInfo.isCustom
+                const health = rpcHealth[networkKey]
+                const isHealthy = health?.healthy ?? true
+
                 return (
                   <div key={key} className="flex justify-between items-center bg-black/20 p-3 rounded-md">
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
+                        <Circle
+                          size={10}
+                          className={`${isHealthy ? "text-green-400 fill-green-400" : "text-red-400 fill-red-400"}`}
+                          title={isHealthy ? "RPC healthy" : "RPC unhealthy"}
+                        />
                         <span className="font-semibold truncate">{networkInfo.name}</span>
                         {isCustom && <span className="text-xs bg-purple-600/50 px-1.5 py-0.5 rounded">Custom</span>}
                       </div>
@@ -703,6 +781,12 @@ export default function WalletCard() {
           onClose={() => setShowAddRpc(false)}
           onAdd={handleAddCustomNetwork}
           networkType={networkView}
+        />
+
+        <BookmarkManager
+          isOpen={showBookmarkManager}
+          onClose={() => setShowBookmarkManager(false)}
+          network={networkView}
         />
 
         {showLogoutConfirmation && (

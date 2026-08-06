@@ -5,7 +5,8 @@ import { motion } from 'framer-motion';
 import InputCard from '@/components/InputCard';
 import AddressCard from '@/components/AddressCard';
 import GeneratorCard from '@/components/GeneratorCard';
-import WalletCard from '@/components/WalletCard'; // Import the new WalletCard component
+import WalletCard from '@/components/WalletCard';
+import TransactionHistory from '@/components/TransactionHistory';
 import FooterCredit from '@/components/FooterCredit';
 import { getAddressFromMnemonic, getAddressFromPrivateKey } from '@/lib/ethers';
 
@@ -64,17 +65,20 @@ export default function Home() {
       <div className="w-full max-w-2xl bg-black/20 p-1 rounded-lg flex justify-center space-x-2 mb-6">
         <button
           onClick={() => setActiveTab('converter')}
-          className={`w-full py-2 rounded-md font-semibold transition-colors ${activeTab === 'converter' ? 'bg-green-600 text-white' : 'text-gray-300 hover:bg-white/10'}`}>
+          className={`w-full py-2 rounded-md font-semibold transition-colors ${activeTab === 'converter' ? 'bg-green-600 text-white' : 'text-gray-300 hover:bg-white/10'}`}
+        >
           Converter
         </button>
         <button
           onClick={() => setActiveTab('generator')}
-          className={`w-full py-2 rounded-md font-semibold transition-colors ${activeTab === 'generator' ? 'bg-blue-600 text-white' : 'text-gray-300 hover:bg-white/10'}`}>
+          className={`w-full py-2 rounded-md font-semibold transition-colors ${activeTab === 'generator' ? 'bg-blue-600 text-white' : 'text-gray-300 hover:bg-white/10'}`}
+        >
           Generator
         </button>
         <button
           onClick={() => setActiveTab('wallet')}
-          className={`w-full py-2 rounded-md font-semibold transition-colors ${activeTab === 'wallet' ? 'bg-purple-600 text-white' : 'text-gray-300 hover:bg-white/10'}`}>
+          className={`w-full py-2 rounded-md font-semibold transition-colors ${activeTab === 'wallet' ? 'bg-purple-600 text-white' : 'text-gray-300 hover:bg-white/10'}`}
+        >
           Wallet
         </button>
       </div>
@@ -108,6 +112,11 @@ export default function Home() {
           {`Conversion Failed: ${error}`}
         </motion.div>
       )}
+
+      {/* Transaction History - displayed above footer on all tabs */}
+      <div className="w-full max-w-2xl mt-6">
+        <TransactionHistory />
+      </div>
 
       <FooterCredit />
     </main>

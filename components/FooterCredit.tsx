@@ -6,7 +6,7 @@ export default function FooterCredit() {
     <footer className="text-center p-4 mt-8 text-gray-400">
       {/* Copyright */}
       <p className="text-sm mb-3">
-        ©2025 built by <span className="text-white">endcore.base.eth</span>
+        ©2026 built by <span className="text-green-500">endcore.base.eth</span>
       </p>
 
       {/* More details */}
