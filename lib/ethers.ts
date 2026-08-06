@@ -1,9 +1,27 @@
+// lib/ethers.ts
+// Ethers.js utilities with multi-RPC support for all blockchain networks.
+// Provides balance fetching, token management, and validation.
+
 "use client"
-import { Mnemonic, HDNodeWallet, Wallet, isAddress, JsonRpcProvider, formatEther, Contract, formatUnits } from "ethers"
+
+import {
+  Mnemonic,
+  HDNodeWallet,
+  Wallet,
+  isAddress,
+  JsonRpcProvider,
+  formatEther,
+  Contract,
+  formatUnits,
+  isError,
+} from "ethers"
+import { RpcPool, type RpcEndpoint } from "./multiRpc"
+
+// ===== Types =====
 
 export interface CustomNetwork {
   name: string
-  rpcUrl: string
+  rpcUrls: string[] // Now supports multiple RPC URLs
   explorerUrl: string
   currency: string
   type: "mainnet" | "testnet"
@@ -12,7 +30,7 @@ export interface CustomNetwork {
 
 export interface BuiltInNetwork {
   name: string
-  rpcUrl: string
+  rpcUrls: string[] // Now supports multiple RPC URLs
   explorerUrl: string
   currency: string
   type: "mainnet" | "testnet"
@@ -21,243 +39,355 @@ export interface BuiltInNetwork {
 
 export type NetworkConfig = BuiltInNetwork | CustomNetwork
 
-// Add a 'type' property to classify networks and remove deprecated ones
+export type Network = keyof typeof NETWORKS | string
+
+// ===== Built-in Networks with Multiple RPCs =====
+
 export const NETWORKS: Record<string, BuiltInNetwork> = {
   // Mainnet Network
   mainnet: {
     name: "Ethereum Mainnet",
-    rpcUrl: "https://eth-mainnet.public.blastapi.io",
+    rpcUrls: [
+      "https://eth-mainnet.public.blastapi.io",
+      "https://rpc.ankr.com/eth",
+      "https://cloudflare-eth.com",
+      "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+    ],
     explorerUrl: "https://etherscan.io",
     currency: "ETH",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   optimism: {
     name: "Optimism",
-    rpcUrl: "https://mainnet.optimism.io",
+    rpcUrls: [
+      "https://mainnet.optimism.io",
+      "https://rpc.ankr.com/optimism",
+      "https://optimism-mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+    ],
     explorerUrl: "https://optimistic.etherscan.io",
     currency: "ETH",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   arbitrum: {
     name: "Arbitrum One",
-    rpcUrl: "https://arb1.arbitrum.io/rpc",
+    rpcUrls: [
+      "https://arb1.arbitrum.io/rpc",
+      "https://rpc.ankr.com/arbitrum",
+      "https://arbitrum-mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+    ],
     explorerUrl: "https://arbiscan.io",
     currency: "ETH",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   polygon: {
     name: "Polygon Mainnet",
-    rpcUrl: "https://polygon-rpc.com",
+    rpcUrls: [
+      "https://polygon-rpc.com",
+      "https://rpc-mainnet.matic.network",
+      "https://rpc-mainnet.matic.quiknode.pro",
+    ],
     explorerUrl: "https://polygonscan.com",
     currency: "MATIC",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   bsc: {
     name: "BNB Smart Chain",
-    rpcUrl: "https://binance.llamarpc.com",
+    rpcUrls: [
+      "https://bsc-dataseed1.binance.org",
+      "https://bsc-dataseed2.binance.org",
+      "https://rpc.ankr.com/bsc",
+    ],
     explorerUrl: "https://bscscan.com",
     currency: "BNB",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   base: {
     name: "Base",
-    rpcUrl: "https://base.llamarpc.com",
+    rpcUrls: [
+      "https://mainnet.base.org",
+      "https://base.llamarpc.com",
+      "https://rpc.notadegen.com/base",
+    ],
     explorerUrl: "https://basescan.org",
     currency: "ETH",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   avalanche: {
     name: "Avalanche C-Chain Mainnet",
-    rpcUrl: "https://avalanche-c-chain-rpc.publicnode.com",
+    rpcUrls: [
+      "https://api.avax.network/ext/bc/C/rpc",
+      "https://rpc.ankr.com/avalanche",
+      "https://avalanche-mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+    ],
     explorerUrl: "https://snowtrace.io",
     currency: "AVAX",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   fantom: {
     name: "Fantom Opera Mainnet",
-    rpcUrl: "https://rpc.fantom.network",
+    rpcUrls: [
+      "https://rpc.fantom.network",
+      "https://fantom-mainnet.public.blastapi.io",
+      "https://rpc.ankr.com/fantom",
+    ],
     explorerUrl: "https://explorer.fantom.network",
     currency: "FTM",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   celo: {
     name: "Celo Mainnet",
-    rpcUrl: "https://rpc.ankr.com/celo",
+    rpcUrls: [
+      "https://rpc.ankr.com/celo",
+      "https://celo-mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+    ],
     explorerUrl: "https://celoscan.io",
     currency: "CELO",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   scroll: {
     name: "Scroll Mainnet",
-    rpcUrl: "https://scroll-rpc.publicnode.com",
+    rpcUrls: [
+      "https://scroll-rpc.publicnode.com",
+      "https://rpc.ankr.com/scroll",
+    ],
     explorerUrl: "https://scrollscan.com",
     currency: "ETH",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   zksyncera: {
     name: "zkSync Era Mainnet",
-    rpcUrl: "https://rpc.ankr.com/zksync_era",
+    rpcUrls: [
+      "https://rpc.ankr.com/zksync_era",
+      "https://zksync-era-mainnet.publicnode.com",
+    ],
     explorerUrl: "https://era.zksync.network",
     currency: "ETH",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   gnosis: {
     name: "Gnosis Chain (xDai) Mainnet",
-    rpcUrl: "https://gnosis-rpc.publicnode.com",
+    rpcUrls: [
+      "https://gnosis-rpc.publicnode.com",
+      "https://rpc.ankr.com/gnosis",
+    ],
     explorerUrl: "https://gnosisscan.io",
     currency: "XDAI",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
+
   "arc-mainnet": {
     name: "Arc Mainnet",
-    rpcUrl: "https://rpc.blockdaemon.mainnet.arc.io",
+    rpcUrls: [
+      "https://arc-mainnet.infura.io/v3/b6bf7d3508c941499b10025c0776eaf8",
+    ],
     explorerUrl: "https://arc-mainnet.cloud.blockscout.com/",
     currency: "USDC",
-    type: 'mainnet' as const,
+    type: "mainnet",
   },
 
   mantle: {
     name: "Mantle Mainnet",
-    rpcUrl: "https://mantle-rpc.publicnode.com",
+    rpcUrls: [
+      "https://mantle-rpc.publicnode.com",
+      "https://rpc.ankr.com/mantle",
+    ],
     explorerUrl: "https://mantlescan.xyz",
     currency: "MNT",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   metis: {
     name: "Metis Andromeda Mainnet",
-    rpcUrl: "https://metis-rpc.publicnode.com",
+    rpcUrls: [
+      "https://metis-rpc.publicnode.com",
+      "https://rpc-metis.rockx.com",
+    ],
     explorerUrl: "https://metisscan.info",
     currency: "METIS",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   moonbeam: {
     name: "Moonbeam Mainnet",
-    rpcUrl: "https://moonbeam-rpc.publicnode.com",
+    rpcUrls: [
+      "https://moonbeam-rpc.publicnode.com",
+      "https://rpc.api.moonbeam.network",
+    ],
     explorerUrl: "https://moonscan.io",
     currency: "GLMR",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   zetachain: {
     name: "ZetaChain Mainnet",
-    rpcUrl: "https://zetachain-evm.blockpi.network/v1/rpc/public",
+    rpcUrls: [
+      "https://zetachain-evm.blockpi.network/v1/rpc/public",
+      "https://zetachain-mainnet.publicnode.com",
+    ],
     explorerUrl: "https://zetascan.com",
     currency: "ZETA",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   kaia: {
     name: "KAIA Mainnet",
-    rpcUrl: "https://rpc.ankr.com/kaia",
+    rpcUrls: [
+      "https://rpc.ankr.com/kaia",
+      "https://kaia-mainnet.publicnode.com",
+    ],
     explorerUrl: "https://kaiascan.io",
     currency: "KAIA",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   berachain: {
     name: "Berachain Mainnet",
-    rpcUrl: "https://berachain-rpc.publicnode.com",
+    rpcUrls: [
+      "https://berachain-rpc.publicnode.com",
+      "https://rpc.berachain.io",
+    ],
     explorerUrl: "https://berascan.com",
     currency: "BERA",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
   somnia: {
     name: "Somnia Mainnet",
-    rpcUrl: "https://somnia-rpc.publicnode.com",
+    rpcUrls: [
+      "https://somnia-rpc.publicnode.com",
+      "https://rpc.somnia.network",
+    ],
     explorerUrl: "https://explorer.somnia.network",
     currency: "SOMI",
-    type: "mainnet" as const,
+    type: "mainnet",
   },
 
-  // Testnet Network
+  // --- Testnets ---
 
   sepolia: {
     name: "Sepolia Testnet",
-    rpcUrl: "https://ethereum-sepolia-rpc.publicnode.com",
+    rpcUrls: [
+      "https://ethereum-sepolia-rpc.publicnode.com",
+      "https://rpc.sepolia.org",
+      "https://sepolia.gateway.tenderly.co",
+    ],
     explorerUrl: "https://sepolia.etherscan.io",
     currency: "ETH",
-    type: "testnet" as const,
+    type: "testnet",
   },
+
   "base-sepolia": {
     name: "Base Sepolia",
-    rpcUrl: "https://base-sepolia-rpc.publicnode.com",
+    rpcUrls: [
+      "https://base-sepolia-rpc.publicnode.com",
+      "https://sepolia.base.org",
+    ],
     explorerUrl: "https://sepolia.basescan.org/",
     currency: "ETH",
-    type: "testnet" as const,
+    type: "testnet",
   },
+
   "mode-sepolia": {
     name: "Mode Sepolia",
-    rpcUrl: "https://sepolia.mode.network",
+    rpcUrls: [
+      "https://sepolia.mode.network",
+      "https://mode-sepolia.publicnode.com",
+    ],
     explorerUrl: "https://testnet.modescan.io/",
     currency: "ETH",
-    type: "testnet" as const,
+    type: "testnet",
   },
+
   "optimism-sepolia": {
     name: "Optimism Sepolia",
-    rpcUrl: "https://sepolia.optimism.io",
+    rpcUrls: [
+      "https://sepolia.optimism.io",
+      "https://optimism-sepolia.publicnode.com",
+    ],
     explorerUrl: "https://sepolia-optimism.etherscan.io",
     currency: "ETH",
-    type: "testnet" as const,
+    type: "testnet",
   },
+
   "arbitrum-sepolia": {
     name: "Arbitrum Sepolia",
-    rpcUrl: "https://sepolia-rollup.arbitrum.io/rpc",
+    rpcUrls: [
+      "https://sepolia-rollup.arbitrum.io/rpc",
+      "https://arbitrum-sepolia.publicnode.com",
+    ],
     explorerUrl: "https://sepolia.arbiscan.io",
     currency: "ETH",
-    type: "testnet" as const,
+    type: "testnet",
   },
+
   hoodi: {
     name: "Hoodi Testnet",
-    rpcUrl: "https://0xrpc.io/hoodi",
+    rpcUrls: [
+      "https://0xrpc.io/hoodi",
+      "https://hoodi.publicnode.com",
+    ],
     explorerUrl: "https://hoodi.etherscan.io",
     currency: "ETH",
-    type: "testnet" as const,
+    type: "testnet",
   },
+
   megaeth: {
     name: "MegaETH Testnet",
-    rpcUrl: "https://carrot.megaeth.com/rpc",
+    rpcUrls: [
+      "https://carrot.megaeth.com/rpc",
+      "https://megaeth-testnet.publicnode.com",
+    ],
     explorerUrl: "https://megaeth-testnet.blockscout.com",
     currency: "ETH",
-    type: "testnet" as const,
+    type: "testnet",
   },
+
   "arc-testnet": {
     name: "Arc Testnet",
-    rpcUrl: "https://arc-testnet.drpc.org",
+    rpcUrls: [
+      "https://arc-testnet.drpc.org",
+      "https://testnet-arc.publicnode.com",
+    ],
     explorerUrl: "https://testnet.arcscan.app",
     currency: "USDC",
-    type: 'testnet' as const,
+    type: "testnet",
   },
+
   "giwa-sepolia": {
     name: "GIWA Sepolia",
-    rpcUrl: "https://sepolia-rpc.giwa.io/",
+    rpcUrls: [
+      "https://sepolia-rpc.giwa.io/",
+      "https://giwa-sepolia.publicnode.com",
+    ],
     explorerUrl: "https://sepolia-explorer.giwa.io",
     currency: "ETH",
-    type: "testnet" as const,
+    type: "testnet",
   },
+
   unichain: {
     name: "Unichain Testnet",
-    rpcUrl: "https://unichain-sepolia-rpc.publicnode.com",
+    rpcUrls: [
+      "https://unichain-sepolia-rpc.publicnode.com",
+      "https://sepolia.unichain.org",
+    ],
     explorerUrl: "https://unichain-sepolia.blockscout.com/",
     currency: "ETH",
-    type: "testnet" as const,
+    type: "testnet",
   },
 }
 
-export type Network = keyof typeof NETWORKS | string
+// ===== Custom Networks Storage =====
 
 const CUSTOM_NETWORKS_KEY = "ethtools_custom_networks"
 
@@ -275,34 +405,82 @@ export function saveCustomNetwork(key: string, network: CustomNetwork): void {
   const existing = getCustomNetworks()
   existing[key] = network
   localStorage.setItem(CUSTOM_NETWORKS_KEY, JSON.stringify(existing))
+  // Clear RPC pools so they are recreated with new network
+  rpcPools.delete(key)
 }
 
 export function removeCustomNetwork(key: string): void {
   const existing = getCustomNetworks()
   delete existing[key]
   localStorage.setItem(CUSTOM_NETWORKS_KEY, JSON.stringify(existing))
+  rpcPools.delete(key)
 }
 
 export function getAllNetworks(): Record<string, NetworkConfig> {
   return { ...NETWORKS, ...getCustomNetworks() }
 }
 
-export const getProvider = (network: Network) => {
+// ===== RPC Pool Cache =====
+
+const rpcPools = new Map<string, RpcPool>()
+
+/**
+ * Get a JsonRpcProvider for the specified network with automatic multi-RPC failover.
+ * @param network - Network key (e.g., "mainnet", "sepolia")
+ * @returns Promise resolving to a JsonRpcProvider
+ * @throws {Error} If network is not configured or no RPC endpoints available
+ */
+export async function getProvider(network: Network): Promise<JsonRpcProvider> {
   const allNetworks = getAllNetworks()
-  const networkConfig = allNetworks[network]
-  if (!networkConfig?.rpcUrl) throw new Error(`RPC URL not found for network: ${network}`)
-  return new JsonRpcProvider(networkConfig.rpcUrl)
+  const config = allNetworks[network]
+  if (!config) {
+    throw new Error(`Network "${network}" not found`)
+  }
+
+  let rpcEndpoints: RpcEndpoint[] = []
+  if (Array.isArray(config.rpcUrls)) {
+    if (config.rpcUrls.length === 0) {
+      throw new Error(`No RPC URLs configured for network "${network}"`)
+    }
+    // Convert string URLs to RpcEndpoint objects if needed
+    rpcEndpoints = config.rpcUrls.map((item) =>
+      typeof item === "string" ? { url: item, priority: 1 } : item
+    )
+  } else {
+    // Fallback for legacy single-string rpcUrl
+    const url = (config as any).rpcUrl
+    if (typeof url === "string" && url) {
+      rpcEndpoints = [{ url, priority: 1 }]
+    } else {
+      throw new Error(`Invalid rpcUrls format for network "${network}"`)
+    }
+  }
+
+  // Reuse or create a pool for this network
+  if (!rpcPools.has(network)) {
+    const pool = new RpcPool(rpcEndpoints, {
+      retryCount: 3,
+      failoverStrategy: "sequential",
+      healthCheckInterval: 60000,
+      requestTimeout: 20000,
+    })
+    rpcPools.set(network, pool)
+  }
+
+  return rpcPools.get(network)!.getProvider()
 }
 
-export async function validateRpcUrl(rpcUrl: string): Promise<{ valid: boolean; chainId?: number; error?: string }> {
-  try {
-    const provider = new JsonRpcProvider(rpcUrl)
-    const network = await provider.getNetwork()
-    return { valid: true, chainId: Number(network.chainId) }
-  } catch (error) {
-    return { valid: false, error: error instanceof Error ? error.message : "Invalid RPC URL" }
+/**
+ * Clean up all RPC pools (e.g., on logout or app unmount).
+ */
+export function cleanupRpcPools(): void {
+  for (const pool of rpcPools.values()) {
+    pool.destroy()
   }
+  rpcPools.clear()
 }
+
+// ===== Balance and Token Functions =====
 
 const ERC20_ABI = [
   "function name() view returns (string)",
@@ -310,6 +488,85 @@ const ERC20_ABI = [
   "function decimals() view returns (uint8)",
   "function balanceOf(address) view returns (uint)",
 ]
+
+/**
+ * Get the native balance of an address on a given network.
+ * @param address - Ethereum address
+ * @param network - Network key
+ * @returns Promise resolving to formatted balance string (with 5 decimals)
+ * @throws {Error} If address is invalid or RPC fails
+ */
+export async function getBalance(address: string, network: Network): Promise<string> {
+  if (!isAddress(address)) {
+    throw new Error("Invalid address.")
+  }
+  const provider = await getProvider(network)
+  try {
+    const balanceWei = await provider.getBalance(address)
+    return Number.parseFloat(formatEther(balanceWei)).toFixed(5)
+  } catch (error) {
+    console.error(`Error fetching balance on ${network}:`, error)
+    throw new Error(`Failed to fetch balance on ${network}`)
+  }
+}
+
+/**
+ * Get the balance of an ERC-20 token for a given address.
+ * @param contractAddress - Token contract address
+ * @param userAddress - Wallet address
+ * @param network - Network key
+ * @returns Promise resolving to formatted token balance string
+ * @throws {Error} If address is invalid or token fetch fails
+ */
+export async function getTokenBalance(
+  contractAddress: string,
+  userAddress: string,
+  network: Network
+): Promise<string> {
+  if (!isAddress(contractAddress) || !isAddress(userAddress)) {
+    throw new Error("Invalid address.")
+  }
+  const provider = await getProvider(network)
+  const contract = new Contract(contractAddress, ERC20_ABI, provider)
+  try {
+    const balance = await contract.balanceOf(userAddress)
+    const decimals = await contract.decimals()
+    return Number.parseFloat(formatUnits(balance, decimals)).toFixed(4)
+  } catch (error) {
+    console.error(`Error fetching token balance on ${network}:`, error)
+    throw new Error("Failed to fetch token balance.")
+  }
+}
+
+/**
+ * Get ERC-20 token details (name, symbol, decimals).
+ */
+export async function getTokenDetails(contractAddress: string, network: Network): Promise<{
+  name: string
+  symbol: string
+  decimals: number
+}> {
+  if (!isAddress(contractAddress)) {
+    throw new Error("Invalid contract address.")
+  }
+  const provider = await getProvider(network)
+  const contract = new Contract(contractAddress, ERC20_ABI, provider)
+  try {
+    const [name, symbol, decimals] = await Promise.all([
+      contract.name(),
+      contract.symbol(),
+      contract.decimals(),
+    ])
+    return { name, symbol, decimals: Number(decimals) }
+  } catch (error) {
+    console.error(`Error fetching token details on ${network}:`, error)
+    throw new Error(
+      "Failed to fetch token details. Make sure the address is a valid ERC20 contract on the selected network."
+    )
+  }
+}
+
+// ===== Address Derivation =====
 
 export function getAddressFromMnemonic(mnemonic: string): string {
   try {
@@ -330,53 +587,33 @@ export function getAddressFromPrivateKey(privateKey: string): string {
   }
 }
 
+// ===== Validation =====
+
+export async function validateRpcUrl(rpcUrl: string): Promise<{
+  valid: boolean
+  chainId?: number
+  error?: string
+}> {
+  try {
+    const provider = new JsonRpcProvider(rpcUrl)
+    const network = await provider.getNetwork()
+    return { valid: true, chainId: Number(network.chainId) }
+  } catch (error) {
+    return {
+      valid: false,
+      error: error instanceof Error ? error.message : "Invalid RPC URL",
+    }
+  }
+}
+
+// ===== Explorer Links =====
+
 export function getRoutescanUrl(addressOrTxHash: string, network: Network): string {
   const allNetworks = getAllNetworks()
   const networkConfig = allNetworks[network]
   if (!networkConfig?.explorerUrl) return ""
   const path = addressOrTxHash.length === 42 ? "address" : "tx"
   return `${networkConfig.explorerUrl}/${path}/${addressOrTxHash}`
-}
-
-export async function getBalance(address: string, network: Network): Promise<string> {
-  if (!isAddress(address)) throw new Error("Invalid address.")
-  const allNetworks = getAllNetworks()
-  const networkConfig = allNetworks[network]
-  if (!networkConfig) throw new Error(`Network not found: ${network}`)
-  const provider = getProvider(network)
-  try {
-    const balanceWei = await provider.getBalance(address)
-    return Number.parseFloat(formatEther(balanceWei)).toFixed(5)
-  } catch (error) {
-    throw new Error(`Could not fetch ETH balance on ${networkConfig.name}.`)
-  }
-}
-
-export async function getTokenDetails(contractAddress: string, network: Network) {
-  if (!isAddress(contractAddress)) throw new Error("Invalid contract address.")
-  const provider = getProvider(network)
-  const contract = new Contract(contractAddress, ERC20_ABI, provider)
-  try {
-    const [name, symbol, decimals] = await Promise.all([contract.name(), contract.symbol(), contract.decimals()])
-    return { name, symbol, decimals: Number(decimals) }
-  } catch {
-    throw new Error(
-      "Failed to fetch token details. Make sure the address is a valid ERC20 contract on the selected network.",
-    )
-  }
-}
-
-export async function getTokenBalance(contractAddress: string, userAddress: string, network: Network) {
-  if (!isAddress(contractAddress) || !isAddress(userAddress)) throw new Error("Invalid address.")
-  const provider = getProvider(network)
-  const contract = new Contract(contractAddress, ERC20_ABI, provider)
-  try {
-    const balance = await contract.balanceOf(userAddress)
-    const decimals = await contract.decimals()
-    return Number.parseFloat(formatUnits(balance, decimals)).toFixed(4)
-  } catch {
-    throw new Error("Failed to fetch token balance.")
-  }
 }
 
 /**

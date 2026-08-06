@@ -14,6 +14,7 @@ import {
   X,
   ChevronDown,
   Wallet,
+  Loader2,
 } from "lucide-react"
 import { Mnemonic, Wallet as EthersWallet, isError } from "ethers"
 import {
@@ -24,12 +25,16 @@ import {
   saveCustomNetwork,
   removeCustomNetwork,
   validateRpcUrl,
+  getProvider,
+  cleanupRpcPools,
   type Network as NetworkType,
   type CustomNetwork,
   type NetworkConfig,
 } from "@/lib/ethers"
 import { QRCodeSVG } from "qrcode.react"
 import SendForm from "./SendForm"
+
+// ===== Types =====
 
 interface ImportedWallet {
   id: string
@@ -42,8 +47,12 @@ interface Balances {
   [key: string]: { balance: string | null; error: string | null }
 }
 
+// ===== Constants =====
+
 const WALLETS_STORAGE_KEY = "ethtools_wallets"
 const ACTIVE_WALLET_KEY = "ethtools_active_wallet"
+
+// ===== AddCustomRpcModal (Inline) =====
 
 function AddCustomRpcModal({
   isOpen,
@@ -57,33 +66,47 @@ function AddCustomRpcModal({
   networkType: "mainnet" | "testnet"
 }) {
   const [name, setName] = useState("")
-  const [rpcUrl, setRpcUrl] = useState("")
+  const [rpcUrls, setRpcUrls] = useState<string[]>([""])
   const [explorerUrl, setExplorerUrl] = useState("")
   const [currency, setCurrency] = useState("")
   const [isValidating, setIsValidating] = useState(false)
   const [error, setError] = useState("")
 
+  const handleAddRpcUrl = () => setRpcUrls((prev) => [...prev, ""])
+  const handleRemoveRpcUrl = (index: number) => {
+    if (rpcUrls.length <= 1) return
+    setRpcUrls((prev) => prev.filter((_, i) => i !== index))
+  }
+
   const handleSubmit = async () => {
     setError("")
 
-    if (!name.trim() || !rpcUrl.trim() || !currency.trim()) {
-      setError("Name, RPC URL, and Currency are required.")
+    if (!name.trim() || !currency.trim()) {
+      setError("Name and Currency are required.")
+      return
+    }
+
+    const filteredUrls = rpcUrls.filter((url) => url.trim() !== "")
+    if (filteredUrls.length === 0) {
+      setError("At least one RPC URL is required.")
       return
     }
 
     setIsValidating(true)
-    const validation = await validateRpcUrl(rpcUrl)
-    setIsValidating(false)
-
-    if (!validation.valid) {
-      setError(`Invalid RPC: ${validation.error}`)
+    // Validate all RPC URLs
+    const results = await Promise.all(filteredUrls.map((url) => validateRpcUrl(url)))
+    const invalid = results.find((r) => !r.valid)
+    if (invalid) {
+      setError(`Invalid RPC URL: ${invalid.error}`)
+      setIsValidating(false)
       return
     }
+    setIsValidating(false)
 
     const key = name.toLowerCase().replace(/\s+/g, "-") + "-custom"
     const network: CustomNetwork = {
       name: name.trim(),
-      rpcUrl: rpcUrl.trim(),
+      rpcUrls: filteredUrls,
       explorerUrl: explorerUrl.trim() || "",
       currency: currency.trim().toUpperCase(),
       type: networkType,
@@ -92,7 +115,7 @@ function AddCustomRpcModal({
 
     onAdd(key, network)
     setName("")
-    setRpcUrl("")
+    setRpcUrls([""])
     setExplorerUrl("")
     setCurrency("")
     onClose()
@@ -102,7 +125,7 @@ function AddCustomRpcModal({
 
   return (
     <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
-      <div className="bg-gray-800 p-6 rounded-2xl shadow-lg w-full max-w-md mx-4">
+      <div className="bg-gray-800 p-6 rounded-2xl shadow-lg w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto">
         <div className="flex justify-between items-center mb-4">
           <h3 className="text-lg font-bold">Add Custom RPC ({networkType})</h3>
           <button onClick={onClose} className="text-gray-400 hover:text-white">
@@ -123,14 +146,36 @@ function AddCustomRpcModal({
           </div>
 
           <div>
-            <label className="text-sm text-gray-300 block mb-1">RPC URL *</label>
-            <input
-              type="text"
-              value={rpcUrl}
-              onChange={(e) => setRpcUrl(e.target.value)}
-              placeholder="https://rpc.example.com"
-              className="w-full p-3 bg-black/30 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
-            />
+            <label className="text-sm text-gray-300 block mb-1">RPC URLs * (at least one)</label>
+            {rpcUrls.map((url, index) => (
+              <div key={index} className="flex items-center gap-2 mb-2">
+                <input
+                  type="text"
+                  value={url}
+                  onChange={(e) => {
+                    const newUrls = [...rpcUrls]
+                    newUrls[index] = e.target.value
+                    setRpcUrls(newUrls)
+                  }}
+                  placeholder="https://rpc.example.com"
+                  className="flex-1 p-3 bg-black/30 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                />
+                {rpcUrls.length > 1 && (
+                  <button
+                    onClick={() => handleRemoveRpcUrl(index)}
+                    className="text-red-400 hover:text-red-300"
+                  >
+                    <Trash2 size={18} />
+                  </button>
+                )}
+              </div>
+            ))}
+            <button
+              onClick={handleAddRpcUrl}
+              className="text-sm text-purple-400 hover:text-purple-300 flex items-center gap-1"
+            >
+              <Plus size={16} /> Add another RPC URL
+            </button>
           </div>
 
           <div>
@@ -162,13 +207,15 @@ function AddCustomRpcModal({
             disabled={isValidating}
             className="w-full bg-purple-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-purple-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {isValidating ? "Validating RPC..." : "Add Network"}
+            {isValidating ? "Validating RPCs..." : "Add Network"}
           </button>
         </div>
       </div>
     </div>
   )
 }
+
+// ===== WalletSelector =====
 
 function WalletSelector({
   wallets,
@@ -251,9 +298,10 @@ function WalletSelector({
   )
 }
 
-// The main wallet component
+// ===== Main WalletCard Component =====
+
 export default function WalletCard() {
-  // --- STATE MANAGEMENT ---
+  // --- State ---
   const [wallets, setWallets] = useState<ImportedWallet[]>([])
   const [activeWalletId, setActiveWalletId] = useState<string | null>(null)
   const [isAddingWallet, setIsAddingWallet] = useState(false)
@@ -273,13 +321,14 @@ export default function WalletCard() {
   const [showAddRpc, setShowAddRpc] = useState(false)
   const [customNetworks, setCustomNetworks] = useState<Record<string, CustomNetwork>>({})
 
-  const activeWallet = useMemo(() => {
-    return wallets.find((w) => w.id === activeWalletId) || null
-  }, [wallets, activeWalletId])
+  // --- Derived ---
+  const activeWallet = useMemo(
+    () => wallets.find((w) => w.id === activeWalletId) || null,
+    [wallets, activeWalletId]
+  )
 
   const isUnlocked = wallets.length > 0 && !isAddingWallet
 
-  // --- DERIVED STATE ---
   const { wordCount, isMnemonic } = useMemo(() => {
     const words = inputValue.trim().split(/\s+/).filter(Boolean)
     const count = words.length
@@ -294,7 +343,7 @@ export default function WalletCard() {
     ][]
   }, [networkView, customNetworks])
 
-  // --- HOOKS ---
+  // --- Effects ---
   useEffect(() => {
     setIsMounted(true)
   }, [])
@@ -306,7 +355,6 @@ export default function WalletCard() {
 
   useEffect(() => {
     if (!isMounted) return
-
     try {
       const storedWalletsJSON = localStorage.getItem(WALLETS_STORAGE_KEY)
       const storedActiveId = localStorage.getItem(ACTIVE_WALLET_KEY)
@@ -315,7 +363,6 @@ export default function WalletCard() {
         const storedWallets: ImportedWallet[] = JSON.parse(storedWalletsJSON)
         if (Array.isArray(storedWallets) && storedWallets.length > 0) {
           setWallets(storedWallets)
-          // Set active wallet from storage or use first wallet
           if (storedActiveId && storedWallets.some((w) => w.id === storedActiveId)) {
             setActiveWalletId(storedActiveId)
           } else {
@@ -330,7 +377,14 @@ export default function WalletCard() {
     }
   }, [isMounted])
 
-  // Fetch balances for all networks
+  // Cleanup RPC pools on unmount
+  useEffect(() => {
+    return () => {
+      cleanupRpcPools()
+    }
+  }, [])
+
+  // Fetch balances
   const fetchAllBalances = useCallback(async () => {
     if (!activeWallet?.address) return
     setIsLoadingBalances(true)
@@ -347,25 +401,24 @@ export default function WalletCard() {
     })
 
     const results = await Promise.all(balancePromises)
-
     const newBalances: Balances = {}
     for (const result of results) {
       newBalances[result.networkKey] = { balance: result.balance, error: result.error }
     }
-
     setBalances((prev) => ({ ...prev, ...newBalances }))
     setIsLoadingBalances(false)
   }, [activeWallet?.address, displayedNetworks])
 
-  // Re-fetch balances when active wallet changes or view changes
   useEffect(() => {
     if (activeWallet?.address && isUnlocked) {
-      setBalances({}) // Clear balances when switching wallet
+      setBalances({})
       fetchAllBalances()
+      const interval = setInterval(fetchAllBalances, 30000)
+      return () => clearInterval(interval)
     }
   }, [activeWallet?.address, isUnlocked, fetchAllBalances])
 
-  // --- ACTION HANDLERS ---
+  // --- Handlers ---
   const handleAddCustomNetwork = (key: string, network: CustomNetwork) => {
     saveCustomNetwork(key, network)
     setCustomNetworks((prev) => ({ ...prev, [key]: network }))
@@ -400,7 +453,6 @@ export default function WalletCard() {
           })()
         : new EthersWallet(trimmedInput)
 
-      // Check if wallet already exists
       if (wallets.some((w) => w.address.toLowerCase() === importedWallet.address.toLowerCase())) {
         setError("This wallet is already imported.")
         return
@@ -461,6 +513,7 @@ export default function WalletCard() {
     setError("")
     setBalances({})
     setShowLogoutConfirmation(false)
+    cleanupRpcPools()
   }
 
   const handleCopy = (text: string) => {
@@ -478,8 +531,7 @@ export default function WalletCard() {
     }
   }
 
-  // --- RENDER LOGIC ---
-  // Prevent rendering until mounted to avoid hydration mismatches
+  // --- Render ---
   if (!isMounted) {
     return (
       <div className="w-full max-w-lg p-6 bg-white/10 backdrop-blur-md rounded-xl shadow-glass border border-white/20 text-white">
@@ -506,13 +558,17 @@ export default function WalletCard() {
           <div className="flex items-center bg-black/20 p-1 rounded-lg text-sm font-semibold">
             <button
               onClick={() => setNetworkView("mainnet")}
-              className={`px-4 py-1 rounded-md transition-colors ${networkView === "mainnet" ? "bg-purple-600" : ""}`}
+              className={`px-4 py-1 rounded-md transition-colors ${
+                networkView === "mainnet" ? "bg-purple-600" : ""
+              }`}
             >
               Mainnets
             </button>
             <button
               onClick={() => setNetworkView("testnet")}
-              className={`px-4 py-1 rounded-md transition-colors ${networkView === "testnet" ? "bg-purple-600" : ""}`}
+              className={`px-4 py-1 rounded-md transition-colors ${
+                networkView === "testnet" ? "bg-purple-600" : ""
+              }`}
             >
               Testnets
             </button>
@@ -540,7 +596,11 @@ export default function WalletCard() {
             </div>
           </div>
           <div className="space-y-2 max-h-80 overflow-y-auto">
-            {isLoadingBalances && <p className="text-center text-gray-300">Loading balances...</p>}
+            {isLoadingBalances && (
+              <div className="flex justify-center py-4">
+                <Loader2 className="animate-spin text-purple-400" size={24} />
+              </div>
+            )}
             {!isLoadingBalances &&
               displayedNetworks.map(([key, networkInfo]) => {
                 const networkKey = key as NetworkType
@@ -586,7 +646,7 @@ export default function WalletCard() {
           </div>
         </div>
 
-        {/* Buttons and modals */}
+        {/* Buttons */}
         <div className="grid grid-cols-2 gap-4 mb-6">
           <button
             onClick={() => setShowReceive(true)}
@@ -621,7 +681,9 @@ export default function WalletCard() {
             <label className="text-sm font-bold text-gray-300">Private Key</label>
             <div className="relative">
               <p
-                className={`text-sm text-orange-400 break-all bg-black/20 p-2 rounded-lg font-mono ${isMasked ? "blur-sm" : ""}`}
+                className={`text-sm text-orange-400 break-all bg-black/20 p-2 rounded-lg font-mono ${
+                  isMasked ? "blur-sm" : ""
+                }`}
               >
                 {activeWallet.privateKey}
               </p>
@@ -635,6 +697,7 @@ export default function WalletCard() {
           </div>
         </div>
 
+        {/* Modals */}
         <AddCustomRpcModal
           isOpen={showAddRpc}
           onClose={() => setShowAddRpc(false)}
@@ -642,7 +705,6 @@ export default function WalletCard() {
           networkType={networkView}
         />
 
-        {/* Existing modals */}
         {showLogoutConfirmation && (
           <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
             <div className="bg-gray-800 p-6 rounded-2xl shadow-lg text-center w-full max-w-sm mx-4">
@@ -665,6 +727,7 @@ export default function WalletCard() {
             </div>
           </div>
         )}
+
         {sendFromNetwork && (
           <SendForm
             wallet={activeWallet}
@@ -673,6 +736,7 @@ export default function WalletCard() {
             onSuccess={handleSendSuccess}
           />
         )}
+
         {txSuccess && (
           <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
             <div className="bg-gray-800 p-6 rounded-2xl shadow-lg text-center w-full max-w-sm mx-4">
@@ -695,6 +759,7 @@ export default function WalletCard() {
             </div>
           </div>
         )}
+
         {showReceive && (
           <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
             <div className="bg-gray-800 p-6 rounded-2xl shadow-lg text-center w-full max-w-sm mx-4">
@@ -731,7 +796,7 @@ export default function WalletCard() {
     )
   }
 
-  // Render the wallet import view
+  // --- Import View ---
   return (
     <div className="w-full max-w-lg p-6 bg-white/10 backdrop-blur-md rounded-xl shadow-glass border border-white/20 text-white">
       <h2 className="text-xl font-bold text-center mb-2">

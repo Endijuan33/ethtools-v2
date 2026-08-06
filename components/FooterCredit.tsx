@@ -13,7 +13,7 @@ export default function FooterCredit() {
       <div className="flex justify-center items-center space-x-8">
         {/* GitHub */}
         <a
-          href="https://github.com/Endijuan33/ethtools.git"
+          href="https://github.com/Endijuan33/ethtools-v2.git"
           target="_blank"
           rel="noopener noreferrer"
           className="flex flex-col items-center hover:text-white transition-colors"

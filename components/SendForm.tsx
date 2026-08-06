@@ -26,7 +26,7 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
     setIsCalculatingMax(true)
     setError("")
     try {
-      const provider = getProvider(network)
+      const provider = await getProvider(network)
       const feeData = await provider.getFeeData()
 
       const gasPrice = feeData.maxFeePerGas || feeData.gasPrice
@@ -34,7 +34,7 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
         throw new Error("Could not fetch gas price.")
       }
 
-      const gasLimit = BigInt(21000) // Gas limit for a standard ETH transfer is 21000 wei
+      const gasLimit = BigInt(21000) // Standard ETH transfer gas limit
       const gasCost = gasLimit * gasPrice
 
       const balance = await provider.getBalance(wallet.address)
@@ -71,7 +71,7 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
 
     setIsSending(true)
     try {
-      const provider = getProvider(network)
+      const provider = await getProvider(network)
       if (!provider) {
         throw new Error("Could not connect to provider.")
       }
