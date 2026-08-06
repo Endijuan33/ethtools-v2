@@ -17,6 +17,7 @@ import {
   Loader2,
   Circle,
   Bookmark as BookmarkIcon,
+  FileJson,
 } from "lucide-react"
 import { Mnemonic, Wallet as EthersWallet, isError } from "ethers"
 import {
@@ -37,6 +38,8 @@ import {
 import { QRCodeSVG } from "qrcode.react"
 import SendForm from "./SendForm"
 import BookmarkManager from "./BookmarkManager"
+import BackupManager from "./BackupManager"
+import { getPricesForNetworks, getCoinIdForNetwork } from "@/lib/priceFeed"
 
 // ===== Types =====
 
@@ -55,12 +58,17 @@ interface RpcHealthIndicator {
   [key: string]: { healthy: boolean; responseTime: number }
 }
 
+interface PriceMap {
+  [key: string]: number | null
+}
+
 // ===== Constants =====
 
 const WALLETS_STORAGE_KEY = "ethtools_wallets"
 const ACTIVE_WALLET_KEY = "ethtools_active_wallet"
 const BALANCE_RETRY_COUNT = 3
 const BALANCE_RETRY_DELAY_MS = 1000
+const PRICE_REFRESH_INTERVAL = 120000 // 2 minutes
 
 // ===== AddCustomRpcModal (Inline) =====
 
@@ -329,8 +337,11 @@ export default function WalletCard() {
   const [isMounted, setIsMounted] = useState(false)
   const [showAddRpc, setShowAddRpc] = useState(false)
   const [showBookmarkManager, setShowBookmarkManager] = useState(false)
+  const [showBackupManager, setShowBackupManager] = useState(false)
   const [customNetworks, setCustomNetworks] = useState<Record<string, CustomNetwork>>({})
   const [rpcHealth, setRpcHealth] = useState<RpcHealthIndicator>({})
+  const [prices, setPrices] = useState<PriceMap>({})
+  const [isLoadingPrices, setIsLoadingPrices] = useState(false)
 
   // --- Derived ---
   const activeWallet = useMemo(
@@ -388,6 +399,38 @@ export default function WalletCard() {
     }
   }, [isMounted])
 
+  // Listen for wallet data updates from backup import
+  useEffect(() => {
+    const handleWalletUpdate = () => {
+      try {
+        const storedWalletsJSON = localStorage.getItem(WALLETS_STORAGE_KEY)
+        if (storedWalletsJSON) {
+          const storedWallets: ImportedWallet[] = JSON.parse(storedWalletsJSON)
+          if (Array.isArray(storedWallets)) {
+            setWallets(storedWallets)
+            if (storedWallets.length > 0) {
+              const storedActiveId = localStorage.getItem(ACTIVE_WALLET_KEY)
+              if (storedActiveId && storedWallets.some((w) => w.id === storedActiveId)) {
+                setActiveWalletId(storedActiveId)
+              } else {
+                setActiveWalletId(storedWallets[0].id)
+              }
+            } else {
+              setActiveWalletId(null)
+            }
+          }
+        }
+      } catch (e) {
+        console.error("Error reloading wallets:", e)
+      }
+    }
+
+    window.addEventListener("walletDataUpdated", handleWalletUpdate)
+    return () => {
+      window.removeEventListener("walletDataUpdated", handleWalletUpdate)
+    }
+  }, [])
+
   // Cleanup RPC pools on unmount
   useEffect(() => {
     return () => {
@@ -414,6 +457,44 @@ export default function WalletCard() {
     const interval = setInterval(updateHealthStatus, 30000)
     return () => clearInterval(interval)
   }, [isUnlocked])
+
+  // --- Price Feed ---
+  const fetchPrices = useCallback(async () => {
+    if (!isUnlocked || displayedNetworks.length === 0) return
+
+    // Only fetch prices for mainnet networks (testnet prices are not meaningful)
+    const mainnetNetworks = displayedNetworks
+      .filter(([, config]) => config.type === "mainnet")
+      .map(([key]) => key)
+
+    if (mainnetNetworks.length === 0) {
+      setPrices({})
+      return
+    }
+
+    setIsLoadingPrices(true)
+    try {
+      const priceMap = await getPricesForNetworks(mainnetNetworks, "usd")
+      const newPrices: PriceMap = {}
+      for (const [network, price] of priceMap) {
+        newPrices[network] = price
+      }
+      setPrices((prev) => ({ ...prev, ...newPrices }))
+    } catch (error) {
+      console.error("Failed to fetch prices:", error)
+      // Keep existing prices on error
+    } finally {
+      setIsLoadingPrices(false)
+    }
+  }, [isUnlocked, displayedNetworks])
+
+  // Auto-refresh prices periodically
+  useEffect(() => {
+    if (!isUnlocked) return
+    fetchPrices()
+    const interval = setInterval(fetchPrices, PRICE_REFRESH_INTERVAL)
+    return () => clearInterval(interval)
+  }, [isUnlocked, fetchPrices])
 
   // --- Balance Fetching with Retry Logic ---
 
@@ -496,6 +577,12 @@ export default function WalletCard() {
       delete updated[key]
       return updated
     })
+    // Also remove price data for this network
+    setPrices((prev) => {
+      const updated = { ...prev }
+      delete updated[key]
+      return updated
+    })
   }
 
   const handleImport = () => {
@@ -572,6 +659,7 @@ export default function WalletCard() {
     setActiveWalletId(null)
     setError("")
     setBalances({})
+    setPrices({})
     setShowLogoutConfirmation(false)
     cleanupRpcPools()
   }
@@ -589,6 +677,25 @@ export default function WalletCard() {
       setSendFromNetwork(null)
       fetchAllBalances()
     }
+  }
+
+  // Helper to format USD value
+  const formatUsd = (value: number | null): string => {
+    if (value === null || value === undefined) return "—"
+    if (value >= 1) return `$${value.toFixed(2)}`
+    if (value >= 0.01) return `$${value.toFixed(4)}`
+    return `$${value.toFixed(6)}`
+  }
+
+  // Calculate USD value from balance
+  const getUsdValue = (networkKey: string, balance: string | null): string => {
+    if (!balance) return "—"
+    const price = prices[networkKey]
+    if (price === null || price === undefined) return "—"
+    const balanceNum = Number.parseFloat(balance)
+    if (isNaN(balanceNum) || balanceNum === 0) return "$0.00"
+    const usd = balanceNum * price
+    return formatUsd(usd)
   }
 
   // --- Render ---
@@ -616,13 +723,19 @@ export default function WalletCard() {
         <div className="flex justify-between items-center mb-4">
           <h2 className="text-xl font-bold">Wallet Dashboard</h2>
           <div className="flex items-center gap-2">
-            {/* Bookmark Manager Button */}
             <button
               onClick={() => setShowBookmarkManager(true)}
               className="text-gray-400 hover:text-white transition-colors p-1"
-              title="Manage Address Bookmark"
+              title="Manage Address Bookmarks"
             >
               <BookmarkIcon size={20} />
+            </button>
+            <button
+              onClick={() => setShowBackupManager(true)}
+              className="text-gray-400 hover:text-white transition-colors p-1"
+              title="Backup & Restore Data"
+            >
+              <FileJson size={20} />
             </button>
             <div className="flex items-center bg-black/20 p-1 rounded-lg text-sm font-semibold">
               <button
@@ -657,11 +770,15 @@ export default function WalletCard() {
                 <Plus size={20} />
               </button>
               <button
-                onClick={fetchAllBalances}
-                disabled={isLoadingBalances}
+                onClick={() => {
+                  fetchAllBalances()
+                  fetchPrices()
+                }}
+                disabled={isLoadingBalances || isLoadingPrices}
                 className="text-gray-400 hover:text-white transition-colors disabled:opacity-50"
+                title="Refresh balances and prices"
               >
-                <RefreshCw size={20} className={isLoadingBalances ? "animate-spin" : ""} />
+                <RefreshCw size={20} className={(isLoadingBalances || isLoadingPrices) ? "animate-spin" : ""} />
               </button>
             </div>
           </div>
@@ -679,6 +796,8 @@ export default function WalletCard() {
                 const isCustom = "isCustom" in networkInfo && networkInfo.isCustom
                 const health = rpcHealth[networkKey]
                 const isHealthy = health?.healthy ?? true
+                const isMainnet = networkInfo.type === "mainnet"
+                const usdValue = isMainnet ? getUsdValue(networkKey, balanceInfo?.balance ?? null) : null
 
                 return (
                   <div key={key} className="flex justify-between items-center bg-black/20 p-3 rounded-md">
@@ -696,9 +815,16 @@ export default function WalletCard() {
                       {balanceInfo?.error ? (
                         <p className="text-red-400 text-xs">Error: {balanceInfo.error}</p>
                       ) : (
-                        <p className="font-mono text-sm">
-                          {balanceInfo?.balance ?? "0.00000"} {networkInfo.currency}
-                        </p>
+                        <div>
+                          <p className="font-mono text-sm">
+                            {balanceInfo?.balance ?? "0.00000"} {networkInfo.currency}
+                          </p>
+                          {isMainnet && (
+                            <p className="text-xs text-gray-400">
+                              {isLoadingPrices ? "Loading price..." : usdValue}
+                            </p>
+                          )}
+                        </div>
                       )}
                     </div>
                     <div className="flex items-center gap-2">
@@ -788,6 +914,11 @@ export default function WalletCard() {
           isOpen={showBookmarkManager}
           onClose={() => setShowBookmarkManager(false)}
           network={networkView}
+        />
+
+        <BackupManager
+          isOpen={showBackupManager}
+          onClose={() => setShowBackupManager(false)}
         />
 
         {showLogoutConfirmation && (
