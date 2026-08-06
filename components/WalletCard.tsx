@@ -16,7 +16,7 @@ import {
   Wallet,
   Loader2,
   Circle,
-  Bookmark,
+  Bookmark as BookmarkIcon,
 } from "lucide-react"
 import { Mnemonic, Wallet as EthersWallet, isError } from "ethers"
 import {
