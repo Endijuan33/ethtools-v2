@@ -687,7 +687,8 @@ export default function WalletCard() {
                         <Circle
                           size={10}
                           className={`${isHealthy ? "text-green-400 fill-green-400" : "text-red-400 fill-red-400"}`}
-                          title={isHealthy ? "RPC healthy" : "RPC unhealthy"}
+                          aria-label={isHealthy ? "RPC healthy" : "RPC unhealthy"}
+                          role="img"
                         />
                         <span className="font-semibold truncate">{networkInfo.name}</span>
                         {isCustom && <span className="text-xs bg-purple-600/50 px-1.5 py-0.5 rounded">Custom</span>}
