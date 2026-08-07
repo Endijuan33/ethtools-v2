@@ -70,9 +70,14 @@ A secure, client-side web application to convert a BIP-39 mnemonic or an Ethereu
 4.  **Run the Development Server**
 
     ```bash
+    pnpm dev
+    ```
+    or
+    ```
     npm run dev
     ```
 
+    
     The application will be accessible at `http://localhost:3000`.
 
 ## 📖 Usage Guide
