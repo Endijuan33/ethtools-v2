@@ -34,13 +34,15 @@ A secure, client-side web application to convert a BIP-39 mnemonic or an Ethereu
 
     Choose your preferred package manager:
 
-    ```bash
+    ```
     # Using pnpm (recommended)
     pnpm install
-
+    ```
+    ```
     # Using npm
     npm install
-
+    ```
+    ```
     # Using Yarn
     yarn install
     ```
@@ -121,19 +123,69 @@ The project is organized as follows:
 
 ```
 .
-├── components/         # Reusable React components
-│   ├── ui/             # UI elements (buttons, inputs, etc.)
-│   └── ...
-├── lib/                # Core logic and utilities
-│   ├── ethers.ts       # Ethereum provider, balance checks, and contract logic
-│   └── ...
-├── app/                # Next.js App Router pages
-│   ├── page.tsx        # Main application page
-│   └── layout.tsx      # Root layout
-├── public/             # Static assets
-├── .env.local          # Local environment variables
-├── next.config.js      # Next.js configuration
-└── package.json        # Project dependencies and scripts
+|-- .env.example                 # Example environment variables for local development
+|-- .eslintrc.json               # ESLint configuration for code quality and style enforcement
+|-- .gitignore                   # Files and directories excluded from Git version control
+|-- LICENSE                      # Project license information
+|-- README.md                    # Project documentation and usage guide
+|-- app                          # Next.js App Router entry point
+|   |-- api                      # Server-side API routes
+|   |   `-- frame
+|   |       `-- route.ts         # API endpoint for Farcaster Frame integration
+|   |-- client-layout.tsx        # Client-side layout wrapper for shared providers
+|   |-- globals.css              # Global application styles
+|   |-- layout.tsx               # Root layout shared across all pages
+|   `-- page.tsx                 # Main application page
+|-- components                   # Reusable React components
+|   |-- AddressCard.tsx          # Displays wallet address information
+|   |-- BackupManager.tsx        # Handles wallet backup and restoration
+|   |-- BookmarkManager.tsx      # Manages saved wallet address bookmarks
+|   |-- FooterCredit.tsx         # Application footer and credits
+|   |-- GeneratorCard.tsx        # Generates wallets or cryptographic data
+|   |-- InputCard.tsx            # User input form for wallet operations
+|   |-- SendForm.tsx             # Token transfer form
+|   |-- TokenManager.tsx         # Manages custom ERC-20 token list
+|   |-- TransactionHistory.tsx   # Displays recent transaction history
+|   |-- WalletCard.tsx           # Main wallet dashboard and balance display
+|   `-- theme-provider.tsx       # Provides application theme support
+|-- components.json              # shadcn/ui component configuration
+|-- lib                          # Core application logic and utilities
+|   |-- backup.ts                # Backup import/export utility functions
+|   |-- bookmarks.ts             # Bookmark storage and management logic
+|   |-- ethers.ts                # Ethereum provider, wallet, and blockchain utilities
+|   |-- multiRpc.ts              # Multi-RPC load balancing and failover system
+|   |-- priceFeed.ts             # Cryptocurrency price fetching utilities
+|   |-- transactionHistory.ts    # Transaction history management utilities
+|   `-- utils.ts                 # Shared helper and utility functions
+|-- next-env.d.ts                # TypeScript definitions for Next.js
+|-- next.config.mjs              # Next.js framework configuration
+|-- package.json                 # Project metadata, dependencies, and scripts
+|-- pnpm-lock.yaml               # Locked dependency versions for pnpm
+|-- pnpm-workspace.yaml          # pnpm workspace configuration
+|-- postcss.config.cjs           # PostCSS configuration (CommonJS)
+|-- postcss.config.js            # PostCSS configuration (JavaScript)
+|-- postcss.config.mjs           # PostCSS configuration (ES Module)
+|-- public                       # Static assets served directly by Next.js
+|   |-- .well-known
+|   |   `-- farcaster.json       # Farcaster Frame verification metadata
+|   |-- apple-icon.png           # Apple touch icon
+|   |-- icon-dark-32x32.png      # Dark theme application icon
+|   |-- icon-light-32x32.png     # Light theme application icon
+|   |-- icon.svg                 # Primary application logo
+|   |-- icons
+|   |   |-- github.svg           # GitHub icon asset
+|   |   `-- telegram.svg         # Telegram icon asset
+|   |-- placeholder-logo.png     # Placeholder logo image
+|   |-- placeholder-logo.svg     # Placeholder logo in SVG format
+|   |-- placeholder-user.jpg     # Placeholder user avatar
+|   |-- placeholder.jpg          # Generic placeholder image
+|   `-- placeholder.svg          # Generic placeholder SVG asset
+|-- styles
+|   `-- globals.css              # Additional global stylesheet
+|-- tailwind.config.cjs          # Tailwind CSS configuration (CommonJS)
+|-- tailwind.config.ts           # Tailwind CSS configuration (TypeScript)
+|-- tsconfig.json                # Main TypeScript compiler configuration
+`-- tsconfig.node.json           # TypeScript configuration for Node.js environment
 ```
 
 ### Key Dependencies
