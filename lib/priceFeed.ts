@@ -72,16 +72,17 @@ export async function fetchPricesBatch(
   const uniqueIds = [...new Set(coinIds)]
   if (uniqueIds.length === 0) return new Map()
 
+  const currentCache = batchCache;
+
   // Check cache first
-  const cacheKey = uniqueIds.sort().join(",")
-  if (batchCache && Date.now() - batchCache.timestamp < batchCache.ttl) {
+  if (currentCache && Date.now() - currentCache.timestamp < currentCache.ttl) {
     // Check if all requested coinIds are in cache
-    const missing = uniqueIds.filter((id) => !(id in batchCache.prices))
+    const missing = uniqueIds.filter((id) => !(id in currentCache.prices))
     if (missing.length === 0) {
       // All prices are cached
       const result = new Map<string, number | null>()
       for (const id of uniqueIds) {
-        result.set(id, batchCache.prices[id] ?? null)
+        result.set(id, currentCache.prices[id] ?? null)
       }
       return result
     }
