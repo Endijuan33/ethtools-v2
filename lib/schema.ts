@@ -1,0 +1,267 @@
+/**
+ * Runtime validation for everything that crosses a trust boundary.
+ *
+ * Two untrusted sources feed this app's state: `localStorage` (which any script
+ * on the origin can rewrite) and imported backup files. A shallow
+ * `Array.isArray` check is not enough — an unvalidated record can carry a
+ * hostile `explorerUrl` that later lands in an anchor `href`, or RPC endpoints
+ * that silently reroute every request. These guards validate every field and
+ * drop records that fail.
+ */
+
+import { isAddress } from "ethers"
+
+// ===== Primitives =====
+
+/** Whether a value is a plain object (not null, not an array). */
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+/** Whether a value is a non-empty string, optionally length-capped. */
+export function isNonEmptyString(value: unknown, maxLength = 512): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= maxLength
+}
+
+/** Whether a value is a finite integer within an inclusive range. */
+export function isIntegerInRange(value: unknown, min: number, max: number): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= min && value <= max
+}
+
+/**
+ * Whether a string is an `https:` URL.
+ *
+ * Enforced on every stored URL. `javascript:` is the direct XSS vector when a
+ * value reaches an `href`; `http:` would be blocked as mixed content on the
+ * HTTPS deployment and would expose RPC traffic in cleartext anyway.
+ *
+ * @param value - Candidate URL.
+ */
+export function isHttpsUrl(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 2048) return false
+  try {
+    return new URL(value).protocol === "https:"
+  } catch {
+    return false
+  }
+}
+
+/** Whether a value is a checksum-valid or lowercase Ethereum address. */
+export function isEthAddress(value: unknown): value is string {
+  return typeof value === "string" && isAddress(value)
+}
+
+/** Whether a value is a 32-byte hex transaction hash. */
+export function isTxHash(value: unknown): value is string {
+  return typeof value === "string" && /^0x[0-9a-fA-F]{64}$/.test(value)
+}
+
+/**
+ * Keep only the array entries that satisfy a guard.
+ *
+ * Preferred over rejecting a whole payload: one corrupt bookmark should not
+ * discard the other forty.
+ *
+ * @param value - Candidate array of unknown provenance.
+ * @param guard - Per-item type guard.
+ * @param maxItems - Hard cap to bound memory from a hostile file.
+ */
+export function filterValid<T>(
+  value: unknown,
+  guard: (item: unknown) => item is T,
+  maxItems = 5000
+): T[] {
+  if (!Array.isArray(value)) return []
+  const out: T[] = []
+  for (const item of value) {
+    if (out.length >= maxItems) break
+    if (guard(item)) out.push(item)
+  }
+  return out
+}
+
+// ===== Domain shapes =====
+
+/** A wallet account held inside the encrypted vault. */
+export interface VaultAccount {
+  id: string
+  label: string
+  address: string
+  /** Present for accounts imported as a raw key. */
+  privateKey?: string
+  /** Index into the seed's derivation path, for seed-derived accounts. */
+  derivationIndex?: number
+  /** Full derivation path used, for seed-derived accounts. */
+  derivationPath?: string
+}
+
+/** Decrypted vault contents. Only ever exists in memory while unlocked. */
+export interface VaultPayload {
+  /** BIP-39 phrase, present only when the user chose to store a seed. */
+  mnemonic?: string
+  /** Optional BIP-39 passphrase ("25th word") paired with the mnemonic. */
+  mnemonicPassphrase?: string
+  accounts: VaultAccount[]
+}
+
+/** Whether a value is a valid vault account. */
+export function isVaultAccount(value: unknown): value is VaultAccount {
+  if (!isRecord(value)) return false
+  if (!isNonEmptyString(value.id, 128)) return false
+  if (!isNonEmptyString(value.label, 128)) return false
+  if (!isEthAddress(value.address)) return false
+  if (value.privateKey !== undefined && !isNonEmptyString(value.privateKey, 200)) return false
+  if (
+    value.derivationIndex !== undefined &&
+    !isIntegerInRange(value.derivationIndex, 0, 2_147_483_647)
+  ) {
+    return false
+  }
+  if (value.derivationPath !== undefined && !isNonEmptyString(value.derivationPath, 128)) {
+    return false
+  }
+  return true
+}
+
+/** Whether a value is a valid decrypted vault payload. */
+export function isVaultPayload(value: unknown): value is VaultPayload {
+  if (!isRecord(value)) return false
+  if (value.mnemonic !== undefined && !isNonEmptyString(value.mnemonic, 1024)) return false
+  if (
+    value.mnemonicPassphrase !== undefined &&
+    typeof value.mnemonicPassphrase !== "string"
+  ) {
+    return false
+  }
+  if (!Array.isArray(value.accounts)) return false
+  return value.accounts.every(isVaultAccount)
+}
+
+/** A saved address label. */
+export interface StoredBookmark {
+  id: string
+  address: string
+  label: string
+  /** Network key this bookmark is scoped to. Absent means all networks. */
+  network?: string
+  createdAt: number
+}
+
+/** Whether a value is a valid bookmark. */
+export function isStoredBookmark(value: unknown): value is StoredBookmark {
+  if (!isRecord(value)) return false
+  return (
+    isNonEmptyString(value.id, 128) &&
+    isEthAddress(value.address) &&
+    isNonEmptyString(value.label, 128) &&
+    (value.network === undefined || isNonEmptyString(value.network, 64)) &&
+    isIntegerInRange(value.createdAt, 0, Number.MAX_SAFE_INTEGER)
+  )
+}
+
+/** A recorded transaction. */
+export interface StoredTransaction {
+  hash: string
+  network: string
+  from: string
+  to: string
+  amount: string
+  currency: string
+  timestamp: number
+  status: "pending" | "success" | "failed" | "unknown"
+}
+
+/** Terminal and non-terminal states a recorded transaction can hold. */
+const TX_STATUSES = ["pending", "success", "failed", "unknown"] as const
+
+/** Whether a value is a valid stored transaction. */
+export function isStoredTransaction(value: unknown): value is StoredTransaction {
+  if (!isRecord(value)) return false
+  return (
+    isTxHash(value.hash) &&
+    isNonEmptyString(value.network, 64) &&
+    isEthAddress(value.from) &&
+    isEthAddress(value.to) &&
+    isNonEmptyString(value.amount, 80) &&
+    isNonEmptyString(value.currency, 16) &&
+    isIntegerInRange(value.timestamp, 0, Number.MAX_SAFE_INTEGER) &&
+    typeof value.status === "string" &&
+    (TX_STATUSES as readonly string[]).includes(value.status)
+  )
+}
+
+/** A user-added network. */
+export interface StoredCustomNetwork {
+  name: string
+  rpcUrls: string[]
+  explorerUrl: string
+  currency: string
+  type: "mainnet" | "testnet"
+  isCustom: true
+  /** Native currency decimals. Defaults to 18 when absent. */
+  decimals?: number
+}
+
+/**
+ * Whether a value is a valid custom network.
+ *
+ * Every RPC and explorer URL must be `https:`. This is the check that stops an
+ * imported backup from pointing the app at an attacker's RPC or smuggling a
+ * `javascript:` URL into an explorer link.
+ */
+export function isStoredCustomNetwork(value: unknown): value is StoredCustomNetwork {
+  if (!isRecord(value)) return false
+  if (!isNonEmptyString(value.name, 64)) return false
+  if (!Array.isArray(value.rpcUrls) || value.rpcUrls.length === 0) return false
+  if (value.rpcUrls.length > 20) return false
+  if (!value.rpcUrls.every(isHttpsUrl)) return false
+  // An explorer is optional, but if present it must be a safe absolute URL.
+  if (value.explorerUrl !== "" && !isHttpsUrl(value.explorerUrl)) return false
+  if (!isNonEmptyString(value.currency, 16)) return false
+  if (value.type !== "mainnet" && value.type !== "testnet") return false
+  if (value.isCustom !== true) return false
+  if (value.decimals !== undefined && !isIntegerInRange(value.decimals, 0, 36)) return false
+  return true
+}
+
+/** A tracked ERC-20 token. */
+export interface StoredToken {
+  address: string
+  symbol: string
+  name: string
+  decimals: number
+  /** Network key the token contract lives on. */
+  network: string
+}
+
+/** Whether a value is a valid tracked token. */
+export function isStoredToken(value: unknown): value is StoredToken {
+  if (!isRecord(value)) return false
+  return (
+    isEthAddress(value.address) &&
+    isNonEmptyString(value.symbol, 32) &&
+    isNonEmptyString(value.name, 128) &&
+    isIntegerInRange(value.decimals, 0, 36) &&
+    isNonEmptyString(value.network, 64)
+  )
+}
+
+/**
+ * Validate a custom-network map, dropping entries that fail.
+ *
+ * Keys that collide with a built-in network are rejected by the caller, not
+ * here, since this module does not know the built-in registry.
+ *
+ * @param value - Candidate record of network key to config.
+ */
+export function filterValidCustomNetworks(
+  value: unknown
+): Record<string, StoredCustomNetwork> {
+  if (!isRecord(value)) return {}
+  const out: Record<string, StoredCustomNetwork> = {}
+  for (const [key, config] of Object.entries(value)) {
+    if (!/^[a-z0-9-]{1,64}$/.test(key)) continue
+    if (isStoredCustomNetwork(config)) out[key] = config
+  }
+  return out
+}

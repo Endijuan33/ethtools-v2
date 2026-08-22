@@ -1,98 +1,125 @@
-'use client';
+"use client"
 
-import { useState, useMemo } from 'react';
-import { AlertTriangle } from 'lucide-react';
+import { useMemo, useState } from "react"
+import Card, { CardHeader, CardTitle } from "./ui/Card"
+import Button from "./ui/Button"
+import Field, { inputClassName, secretInputProps } from "./ui/Field"
+import Alert from "./ui/Alert"
+import Badge from "./ui/Badge"
+import Tabs from "./ui/Tabs"
+import { classifySecret, MNEMONIC_WORD_COUNTS } from "@/lib/hdWallet"
+import { cn } from "@/lib/utils"
 
-type Network = 'mainnet' | 'testnet';
+type Network = "mainnet" | "testnet"
+
+const NETWORKS = [
+  { id: "mainnet", label: "Mainnet" },
+  { id: "testnet", label: "Testnet" },
+] as const
 
 interface InputCardProps {
-  onConvert: (input: string, network: Network) => void;
-  isLoading: boolean;
+  onConvert: (input: string, network: Network) => void
+  isLoading: boolean
 }
 
+/**
+ * Secret entry for the converter.
+ *
+ * The live counter is driven by `classifySecret`, the same function the
+ * conversion itself uses. Deriving it independently is what previously let the
+ * counter disagree with the parser — it reported "15 / 12 words" for a phrase
+ * length BIP-39 actually permits.
+ */
 export default function InputCard({ onConvert, isLoading }: InputCardProps) {
-  const [inputValue, setInputValue] = useState('');
-  const [network, setNetwork] = useState<Network>('mainnet');
-  const [error, setError] = useState('');
+  const [inputValue, setInputValue] = useState("")
+  const [network, setNetwork] = useState<Network>("mainnet")
+  const [error, setError] = useState("")
 
-  const handleInputChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setInputValue(e.target.value);
-  };
+  const classification = useMemo(() => classifySecret(inputValue), [inputValue])
 
-  const handleConvert = () => {
-    setError('');
-    const trimmedInput = inputValue.trim();
-    if (!trimmedInput) {
-      setError('Input cannot be empty.');
-      return;
+  const handleConvert = (): void => {
+    setError("")
+    if (inputValue.trim() === "") {
+      setError("Enter a recovery phrase or a private key.")
+      return
     }
-    onConvert(trimmedInput, network);
-  };
+    onConvert(inputValue, network)
+  }
 
-  const { wordCount, charCount } = useMemo(() => {
-    const trimmedInput = inputValue.trim();
-    const words = trimmedInput.split(/\s+/).filter(Boolean);
-    return {
-      wordCount: trimmedInput ? words.length : 0,
-      charCount: inputValue.length,
-    };
-  }, [inputValue]);
-
-  const isPrivateKey = wordCount < 12 && charCount > 60;
-  const isMnemonic = wordCount === 12 || wordCount === 18 || wordCount === 24;
+  /** Live feedback on what the input currently looks like. */
+  const counter =
+    inputValue.trim() === "" ? undefined : classification.kind === "private-key" ? (
+      <Badge tone="success">Private key</Badge>
+    ) : classification.kind === "mnemonic" ? (
+      <Badge tone="success">{classification.wordCount} words</Badge>
+    ) : (
+      <Badge tone="neutral">
+        {classification.wordCount > 1 ? `${classification.wordCount} words` : "Unrecognized"}
+      </Badge>
+    )
 
   return (
-    <div className="w-full max-w-md p-6 bg-white/10 backdrop-blur-md rounded-xl shadow-glass border border-white/20">
-        <h2 className="text-xl font-bold text-white mb-4 text-center">Private Key / Mnemonic Converter</h2>
-        <div className="bg-yellow-500/10 border border-yellow-500 text-yellow-300 text-sm p-3 rounded-lg mb-4 flex">
-            <AlertTriangle size={32} className="mr-2 flex-shrink-0" />
-            <p><strong>Security Warning:</strong> This tool runs locally in your browser. Your keys are never sent to a server, but always be cautious and do not use on public devices.</p>
-        </div>
-      <div className="relative mb-4">
-        <textarea
-          value={inputValue}
-          onChange={handleInputChange}
-          placeholder="Enter your 12, 18, 24 word mnemonic or a private key..."
-          className="w-full h-32 p-3 bg-black/20 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-shadow resize-none"
-        />
-        <div className="absolute bottom-3 right-3 text-xs text-gray-400">
-          {isPrivateKey ? (
-            <span className={charCount === 64 || charCount === 66 ? 'text-green-400' : ''}>
-              {charCount} / {inputValue.startsWith('0x') ? 66 : 64} chars
-            </span>
-          ) : (
-            <span className={isMnemonic ? 'text-green-400' : ''}>
-              {wordCount} / {wordCount < 18 ? 12 : (wordCount < 24 ? 18 : 24)} words
-            </span>
-          )}
-        </div>
-      </div>
-      {error && <p className="text-red-400 text-sm mt-2">{error}</p>}
+    <Card className="w-full max-w-md">
+      <CardHeader>
+        <CardTitle>Key to address converter</CardTitle>
+      </CardHeader>
 
-      <div className="flex items-center gap-3">
-        <div className="flex items-center bg-black/20 p-1 rounded-lg">
-            {(['mainnet', 'testnet'] as Network[]).map((net) => (
-                <button
-                    key={net}
-                    onClick={() => setNetwork(net)}
-                    className={`px-4 py-2 rounded-md text-sm font-semibold capitalize transition-colors ${
-                        network === net
-                        ? 'bg-blue-600 text-white'
-                        : 'text-gray-300 hover:bg-white/10'
-                    }`}
-                >
-                    {net}
-                </button>
-            ))}
-        </div>
-        <button
-            onClick={handleConvert}
-            disabled={isLoading || !inputValue.trim()}
-            className="flex-grow w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed"
+      <form
+        className="space-y-4"
+        onSubmit={(event) => {
+          event.preventDefault()
+          handleConvert()
+        }}
+      >
+        <Alert tone="warning" title="Your keys never leave this browser">
+          Derivation happens locally and nothing is transmitted. Even so, avoid entering a phrase
+          that holds real funds on a shared or public device.
+        </Alert>
+
+        <Field
+          label="Recovery phrase or private key"
+          error={error}
+          action={counter}
+          hint={`Accepts ${MNEMONIC_WORD_COUNTS.join(", ")} words, or a 64-character private key. Press Ctrl+Enter (Cmd+Enter on Mac) to convert.`}
         >
-            {isLoading ? 'Converting...' : 'Convert'}
-        </button>
-      </div>
-    </div>
-  );
+          {(field) => (
+            <textarea
+              {...field}
+              {...secretInputProps}
+              value={inputValue}
+              onChange={(event) => setInputValue(event.target.value)}
+              onKeyDown={(event) => {
+                // A bare Enter must stay a newline: phrases are whitespace
+                // delimited and are routinely pasted across multiple lines.
+                if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+                  event.preventDefault()
+                  handleConvert()
+                }
+              }}
+              placeholder="abandon ability able … or 0x…"
+              className={cn(inputClassName, "h-32 resize-none font-mono text-sm")}
+            />
+          )}
+        </Field>
+
+        <Tabs
+          items={NETWORKS}
+          value={network}
+          onChange={setNetwork}
+          label="Explorer network"
+          layoutGroupId="converter-network"
+        />
+
+        <Button
+          type="submit"
+          fullWidth
+          isLoading={isLoading}
+          loadingLabel="Converting…"
+          disabled={isLoading || inputValue.trim() === ""}
+        >
+          Convert
+        </Button>
+      </form>
+    </Card>
+  )
 }

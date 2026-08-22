@@ -2,104 +2,273 @@
 @tailwind components;
 @tailwind utilities;
 
-/* ------------------------------------------------------------------ */
-/*  Color variables – light / dark mode                                */
-/* ------------------------------------------------------------------ */
-:root {
-  --foreground-rgb: 0, 0, 0;
-  --background-start-rgb: 214, 219, 220;
-  --background-end-rgb: 255, 255, 255;
-}
+/* ==================================================================== */
+/*  Design tokens                                                       */
+/*                                                                      */
+/*  Every colour in the UI resolves through one of these variables.     */
+/*  Components must not hardcode palette values such as `bg-gray-900`   */
+/*  or `text-white`, because those cannot respond to the active theme.  */
+/*                                                                      */
+/*  Values are bare HSL channels so Tailwind can compose them with an   */
+/*  alpha modifier, e.g. `bg-primary/20`.                               */
+/* ==================================================================== */
 
-@media (prefers-color-scheme: dark) {
+@layer base {
   :root {
-    --foreground-rgb: 255, 255, 255;
-    --background-start-rgb: 0, 0, 0;
-    --background-end-rgb: 0, 0, 0;
+    /* Page and primary surfaces */
+    --background: 0 0% 100%;
+    --foreground: 224 71% 4%;
+
+    /* Cards and popovers sit above the page */
+    --card: 0 0% 100%;
+    --card-foreground: 224 71% 4%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 224 71% 4%;
+
+    /* Translucent panel behind the frosted surfaces */
+    --surface: 220 14% 98%;
+    --surface-foreground: 224 71% 4%;
+
+    /* Brand */
+    --primary: 262 83% 52%;
+    --primary-foreground: 0 0% 100%;
+
+    /* Low-emphasis backgrounds and secondary actions */
+    --secondary: 220 14% 96%;
+    --secondary-foreground: 224 71% 11%;
+    --muted: 220 14% 96%;
+    --muted-foreground: 220 9% 40%;
+    --accent: 262 83% 96%;
+    --accent-foreground: 262 83% 30%;
+
+    /* Semantic status. Chosen for >=4.5:1 against --background. */
+    --success: 142 72% 29%;
+    --success-foreground: 0 0% 100%;
+    --warning: 26 90% 33%;
+    --warning-foreground: 0 0% 100%;
+    --destructive: 0 72% 42%;
+    --destructive-foreground: 0 0% 100%;
+    --info: 217 91% 42%;
+    --info-foreground: 0 0% 100%;
+
+    /* Lines, inputs, focus ring */
+    --border: 220 13% 91%;
+    --input: 220 13% 85%;
+    --ring: 262 83% 52%;
+
+    --radius: 0.75rem;
+  }
+
+  .dark {
+    /* A deep blue-tinted neutral rather than pure black. Pure black smears
+       during scroll on OLED and removes any sense of depth between layers. */
+    --background: 224 71% 4%;
+    --foreground: 210 20% 98%;
+
+    --card: 224 44% 8%;
+    --card-foreground: 210 20% 98%;
+    --popover: 224 44% 9%;
+    --popover-foreground: 210 20% 98%;
+
+    --surface: 220 33% 11%;
+    --surface-foreground: 210 20% 98%;
+
+    --primary: 263 85% 70%;
+    --primary-foreground: 224 71% 6%;
+
+    --secondary: 215 28% 16%;
+    --secondary-foreground: 210 20% 96%;
+    --muted: 215 28% 16%;
+    --muted-foreground: 218 14% 71%;
+    --accent: 263 40% 22%;
+    --accent-foreground: 263 85% 88%;
+
+    /* Lightened for dark surfaces so status text keeps its contrast ratio. */
+    --success: 142 69% 58%;
+    --success-foreground: 224 71% 6%;
+    --warning: 38 95% 62%;
+    --warning-foreground: 224 71% 6%;
+    --destructive: 0 84% 68%;
+    --destructive-foreground: 224 71% 6%;
+    --info: 213 94% 70%;
+    --info-foreground: 224 71% 6%;
+
+    --border: 215 25% 21%;
+    --input: 215 25% 25%;
+    --ring: 263 85% 70%;
   }
 }
 
-/* ------------------------------------------------------------------ */
-/*  Base page layout – gradient background and basic padding           */
-/* ------------------------------------------------------------------ */
-body {
-  color: rgb(var(--foreground-rgb));
-  background: linear-gradient(
-      to bottom,
+/* ==================================================================== */
+/*  Base element styles                                                 */
+/* ==================================================================== */
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html {
+    /* Anchored scrolling must clear the sticky app header. */
+    scroll-padding-top: 5rem;
+    -webkit-text-size-adjust: 100%;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+    /* Deliberately not 100vh: mobile browser chrome makes 100vh taller than
+       the visible viewport, which is what forced a permanent scrollbar
+       alongside the previous `min-height: 100vh` plus body padding. */
+    min-height: 100dvh;
+  }
+
+  /* Tabular figures stop balances and hashes from reflowing as they update. */
+  .font-mono,
+  code,
+  kbd,
+  samp {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* One consistent focus treatment, shown only for keyboard users. */
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+
+  /* Let the browser paint native controls and form UI to match the theme. */
+  :root {
+    color-scheme: light;
+  }
+  .dark {
+    color-scheme: dark;
+  }
+
+  ::selection {
+    @apply bg-primary/25;
+  }
+
+  /* Themed scrollbars. */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: hsl(var(--border)) transparent;
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply rounded-full border-2 border-solid border-transparent bg-border bg-clip-content;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    @apply bg-muted-foreground/50;
+  }
+}
+
+/* ==================================================================== */
+/*  Utilities                                                           */
+/* ==================================================================== */
+
+@layer utilities {
+  /* Frosted panel shared by cards, dialogs, and the app header. */
+  .surface-glass {
+    background-color: hsl(var(--surface) / 0.72);
+    backdrop-filter: blur(16px) saturate(140%);
+    -webkit-backdrop-filter: blur(16px) saturate(140%);
+  }
+
+  /* Ambient page backdrop. Rendered behind content and non-interactive. */
+  .app-backdrop {
+    background-image:
+      radial-gradient(55rem 55rem at 10% -12%, hsl(var(--primary) / 0.18), transparent 60%),
+      radial-gradient(45rem 45rem at 105% 4%, hsl(var(--info) / 0.14), transparent 55%);
+  }
+
+  /* Hairline rule that reads correctly in both themes. */
+  .divider-soft {
+    background-image: linear-gradient(
+      to right,
       transparent,
-      rgb(var(--background-end-rgb))
-    )
-    rgb(var(--background-start-rgb));
+      hsl(var(--border)),
+      transparent
+    );
+  }
 
-  display: block; /* flexible */
-  min-height: 100vh;
-  padding: 1rem; /* for small screen */
+  /* Clear the OS home indicator inside bottom sheets. */
+  .pb-safe {
+    padding-bottom: max(1rem, env(safe-area-inset-bottom));
+  }
+
+  /* Two-line clamp without pulling in a plugin. */
+  .clamp-2 {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+  }
 }
 
-/* ------------------------------------------------------------------ */
-/*  Farcaster Mini App – scrollable & responsive                      */
-/* ------------------------------------------------------------------ */
+/* ==================================================================== */
+/*  Motion                                                              */
+/*                                                                      */
+/*  Users who ask for reduced motion get essentially none. Framer Motion */
+/*  is told the same thing via `useReducedMotion` in the components.     */
+/* ==================================================================== */
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* ==================================================================== */
+/*  Farcaster Mini App                                                  */
+/*                                                                      */
+/*  The `farcaster-miniapp` class is added to <html> by                  */
+/*  app/client-layout.tsx when running inside a Mini App host. It        */
+/*  constrains the layout to the host viewport and enlarges tap targets  */
+/*  for a WebView.                                                      */
+/* ==================================================================== */
+
 .farcaster-miniapp {
-  /* Ukuran dan layout */
-  max-width: 424px !important;
-  margin: 0 auto;
-  padding: 0.5rem;
-  box-sizing: border-box;
-  font-size: 16px;
-
-  /* Scroll */
-  overflow-y: auto;
-  overflow-x: hidden;
-  scroll-behavior: smooth;           /* Smooth scroll modern */
-  -webkit-overflow-scrolling: touch; /* iOS momentum scroll */
-  overscroll-behavior: contain;      /* cegah pull-to-refresh */
+  max-width: 424px;
+  margin-inline: auto;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Interactive elements – tappable di WebView                        */
-/* ------------------------------------------------------------------ */
 .farcaster-miniapp input,
 .farcaster-miniapp textarea,
-.farcaster-miniapp button,
-.farcaster-miniapp select {
-  font-size: 16px !important;  /* Minimum tap size iOS/Android */
-  padding: 12px !important;
-  min-height: 44px;            /* Apple HIG tap target */
-  border-radius: 8px;
+.farcaster-miniapp select,
+.farcaster-miniapp button {
+  /* 16px stops iOS Safari zooming the page when a field gains focus. */
+  font-size: 16px;
+  min-height: 44px;
 }
 
-/* ------------------------------------------------------------------ */
-/*  Optional warning banner inside Mini App                             */
-/* ------------------------------------------------------------------ */
-.farcaster-miniapp .miniapp-warning {
-  background: #ff9800;
-  color: #fff;
-  padding: 12px;
-  border-radius: 8px;
-  margin: 12px 0;
-  font-size: 14px;
-  text-align: center;
-  font-weight: 500;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Close button injected by layout.tsx                                */
-/* ------------------------------------------------------------------ */
 .farcaster-miniapp-close {
-  position: fixed !important;
-  top: 12px !important;
-  right: 12px !important;
-  z-index: 9999 !important;
-  background: rgba(0,0,0,0.7) !important;
-  color: #fff !important;
-  border: none !important;
-  border-radius: 50% !important;
-  width: 36px !important;
-  height: 36px !important;
-  font-size: 20px !important;
-  font-weight: bold !important;
-  cursor: pointer !important;
-  display: flex !important;
-  align-items: center !important;
-  justify-content: center !important;
+  position: fixed;
+  top: max(0.75rem, env(safe-area-inset-top));
+  right: 0.75rem;
+  z-index: 60;
+  display: flex;
+  width: 2.25rem;
+  height: 2.25rem;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid hsl(var(--border));
+  border-radius: 9999px;
+  background-color: hsl(var(--card) / 0.9);
+  color: hsl(var(--card-foreground));
+  font-size: 1.25rem;
+  line-height: 1;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
 }

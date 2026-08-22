@@ -1,255 +1,233 @@
-# Ethereum Address Converter 🔐
+# EthTools
 
-A secure, client-side web application to convert a BIP-39 mnemonic or an Ethereum private key to a public address. This tool is designed with security as a top priority—**all cryptographic operations run exclusively in your browser**. No sensitive data is ever transmitted to a server.
+A client-side Ethereum wallet utility. Derive addresses, generate wallets, manage encrypted accounts across 30+ networks, send native transfers, and decode calldata — entirely in the browser.
 
-## ✨ Key Features
+**All cryptography runs locally.** No key, recovery phrase, or password is transmitted to any server. Read [Security model](#security-model) before using this with real funds — it states plainly what is and is not protected.
 
-- ✅ **Client-Side Only**: All cryptographic processes, including key derivation, run securely within your browser.
-- ✅ **Mnemonic & Private Key Support**: Accepts both BIP-39 mnemonic phrases (12 or 24 words) and standard 64-character hexadecimal private keys.
-- ✅ **Multi-Network Support**: Seamlessly switch between Ethereum Mainnet and a variety of testnets, including Sepolia, Holesky, and others.
-- ✅ **Real-Time Balance Checker**: Instantly check the ETH balance of any derived or pasted address.
-- ✅ **ERC20 Token Support**: In addition to ETH, you can check balances for any ERC20 token by providing the contract address.
-- ✅ **Direct Explorer Integration**: One-click links to verify addresses and transactions on Etherscan or other relevant block explorers.
-- ✅ **Modern UI/UX**: A clean, responsive interface with a default dark theme and a convenient light/dark mode toggle.
-- ✅ **Built-in Security Warnings**: Clear, persistent warnings to educate users on security best practices.
-- ✅ **QR Code Support**: Generate a QR code for your public address for easy sharing.
+---
 
-## 🚀 Installation and Setup
+## Features
+
+### Encrypted vault
+- Accounts are encrypted at rest with **AES-256-GCM**, keyed by **PBKDF2-HMAC-SHA256 at 600,000 iterations** via WebCrypto.
+- A password is required to unlock. It is never stored or transmitted and **cannot be recovered**.
+- The vault locks automatically after 5 minutes of inactivity.
+- Wallets left over from an earlier, unencrypted version are detected and migrated on first unlock; the plaintext copies are deleted only after the encrypted copy is written and verified.
+
+### Hierarchical deterministic wallets
+- All five BIP-39 phrase lengths: **12, 15, 18, 21, and 24 words**.
+- **BIP-39 passphrase** support (the "25th word").
+- Derive many accounts from one phrase, with three path layouts: BIP-44 (`m/44'/60'/0'/0/{index}`), Ledger Live (`m/44'/60'/{index}'/0/0`), and legacy MEW/Ledger (`m/44'/60'/0'/{index}`). Custom templates are also accepted.
+- Derivation is verified against the published Hardhat test vectors.
+
+### Multi-network balances
+- 30+ built-in networks, mainnet and testnet.
+- Add custom networks. RPC and explorer URLs must be `https:`; anything else is rejected.
+- Per-network RPC pools with **real per-request retry and failover**, plus a health indicator derived from actual request outcomes.
+- Balance polling pauses entirely while the tab is hidden.
+
+### Transactions
+- Native transfers with gas estimation and a "Max" calculation that reserves headroom for base-fee movement and L2 data fees.
+- Gas estimation failure **blocks the send** rather than broadcasting a transaction expected to revert.
+- A transaction is recorded as `success` only when a receipt confirms it. An unobtainable receipt is recorded as `unknown`, never as success.
+- Broadcasting deliberately does **not** fail over, because retrying an ambiguous timeout could submit twice.
+
+### Backup and recovery
+- **Encrypted file backup** containing accounts and recovery phrase, protected by a password.
+- **Settings-only backup** that is structurally incapable of holding secrets — useful for moving bookmarks and networks between devices.
+- **Encrypted QR backup** for offline or printed storage.
+- Restore validates every record, shows exactly what will be written, and offers merge or replace. Writes are atomic and roll back on partial failure.
+
+### Developer tools
+- **Unit converter** — bigint-exact wei/gwei/ether conversion; no floating point anywhere.
+- **ENS lookup** — forward and reverse, always resolved on Ethereum mainnet. Reverse records are forward-confirmed, and an unverified name is labelled as such.
+- **Calldata decoder** — decodes with a supplied ABI, or names the function from a built-in selector table. Also decodes `Error(string)`, `Panic(uint256)`, and custom errors.
+
+### Interface
+- Light, dark, and system themes. Every colour resolves through design tokens; all 14 semantic token pairs meet WCAG AA contrast (≥4.5:1) in both themes.
+- Mobile-first. Dialogs render as bottom sheets on touch viewports and centred dialogs on desktop.
+- Full keyboard support: focus traps, roving-tabindex tab strips, Escape handling, and visible focus rings.
+- Error boundaries around each panel, so one failure cannot blank the dashboard.
+- Offline detection that distinguishes "you are offline" from "this RPC is down".
+
+---
+
+## Getting started
 
 ### Prerequisites
+- **Node.js** 18.17 or newer
+- **pnpm** (recommended), npm, or Yarn
 
-- **Node.js**: Version 18.17.0 or higher.
-- **Package Manager**: npm, Yarn, or pnpm (pnpm is recommended).
+### Setup
 
-### Steps
-
-1.  **Clone the Repository**
-
-    ```bash
-    git clone https://github.com/endijuan33/ethtools-v2.git
-    cd ethtools-v2
-    ```
-
-2.  **Install Dependencies**
-
-    Choose your preferred package manager:
-
-    ```
-    # Using pnpm (recommended)
-    pnpm install
-    ```
-    ```
-    # Using npm
-    npm install
-    ```
-    ```
-    # Using Yarn
-    yarn install
-    ```
-
-3.  **Set Up Environment Variables**
-
-    This project uses environment variables to manage Explorer endpoints for different networks. Copy the example file to create your local configuration:
-
-    ```bash
-    cp .env.example .env.local
-    ```
-
-    Now, edit the `.env.local` file and add routescan URLs.
-
-    ```env
-    # to allow pnpm build (standard environment configuration for vercel production)
-    PNPM_APPROVE_BUILD=true
-
-    # Mainnet Explorer
-    NEXT_PUBLIC_ROUTESCAN_MAINNET=https://routescan.io
-
-    # Testnet Explorer
-    NEXT_PUBLIC_ROUTESCAN_TESTNET=https://testnet.routescan.io
-
-    ```
-
-4.  **Run the Development Server**
-
-    ```bash
-    pnpm dev
-    ```
-    or
-    ```
-    npm run dev
-    ```
-
-    
-    The application will be accessible at `http://localhost:3000`.
-
-## 📖 Usage Guide
-
-### From Mnemonic
-
-1.  Navigate to the application.
-2.  Select the desired network (e.g., Mainnet, Sepolia).
-3.  Paste your 12 or 24-word mnemonic phrase into the input field.
-4.  Click **"Convert to Address"**.
-5.  The corresponding public address will be displayed, along with a button to check its ETH balance.
-
-### From Private Key
-
-1.  Navigate to the application.
-2.  Select the desired network.
-3.  Paste your 64-character hexadecimal private key (the `0x` prefix is optional).
-4.  Click **"Convert to Address"**.
-5.  The public address will be displayed. You can reveal or hide your private key using the toggle button.
-
-### Checking Balances
-
--   **ETH Balance**: After an address is generated, click **"Check Balance"** to see its ETH balance.
--   **ERC20 Token Balance**: To check a token balance, paste the token's contract address into the appropriate field and click the check button.
--   **Verify on Explorer**: Click the **"View on Explorer"** link to open the address on a block explorer like Etherscan for the selected network.
-
-## 🛠️ Development
-
-### Available Scripts
-
-This project uses `npm` scripts for common development tasks:
-
--   `npm run dev`: Starts the Next.js development server.
--   `npm run build`: Builds the application for production.
--   `npm run start`: Starts a production server.
--   `npm run lint`: Lints the codebase using ESLint to identify and report on patterns.
-
-### Project Structure
-
-The project is organized as follows:
-
-```
-.
-|-- .env.example                 # Example environment variables for local development
-|-- .eslintrc.json               # ESLint configuration for code quality and style enforcement
-|-- .gitignore                   # Files and directories excluded from Git version control
-|-- LICENSE                      # Project license information
-|-- README.md                    # Project documentation and usage guide
-|-- app                          # Next.js App Router entry point
-|   |-- api                      # Server-side API routes
-|   |   `-- frame
-|   |       `-- route.ts         # API endpoint for Farcaster Frame integration
-|   |-- client-layout.tsx        # Client-side layout wrapper for shared providers
-|   |-- globals.css              # Global application styles
-|   |-- layout.tsx               # Root layout shared across all pages
-|   `-- page.tsx                 # Main application page
-|-- components                   # Reusable React components
-|   |-- AddressCard.tsx          # Displays wallet address information
-|   |-- BackupManager.tsx        # Handles wallet backup and restoration
-|   |-- BookmarkManager.tsx      # Manages saved wallet address bookmarks
-|   |-- FooterCredit.tsx         # Application footer and credits
-|   |-- GeneratorCard.tsx        # Generates wallets or cryptographic data
-|   |-- InputCard.tsx            # User input form for wallet operations
-|   |-- SendForm.tsx             # Token transfer form
-|   |-- TokenManager.tsx         # Manages custom ERC-20 token list
-|   |-- TransactionHistory.tsx   # Displays recent transaction history
-|   |-- WalletCard.tsx           # Main wallet dashboard and balance display
-|   `-- theme-provider.tsx       # Provides application theme support
-|-- components.json              # shadcn/ui component configuration
-|-- lib                          # Core application logic and utilities
-|   |-- backup.ts                # Backup import/export utility functions
-|   |-- bookmarks.ts             # Bookmark storage and management logic
-|   |-- ethers.ts                # Ethereum provider, wallet, and blockchain utilities
-|   |-- multiRpc.ts              # Multi-RPC load balancing and failover system
-|   |-- priceFeed.ts             # Cryptocurrency price fetching utilities
-|   |-- transactionHistory.ts    # Transaction history management utilities
-|   `-- utils.ts                 # Shared helper and utility functions
-|-- next-env.d.ts                # TypeScript definitions for Next.js
-|-- next.config.mjs              # Next.js framework configuration
-|-- package.json                 # Project metadata, dependencies, and scripts
-|-- pnpm-lock.yaml               # Locked dependency versions for pnpm
-|-- pnpm-workspace.yaml          # pnpm workspace configuration
-|-- postcss.config.cjs           # PostCSS configuration (CommonJS)
-|-- postcss.config.js            # PostCSS configuration (JavaScript)
-|-- postcss.config.mjs           # PostCSS configuration (ES Module)
-|-- public                       # Static assets served directly by Next.js
-|   |-- .well-known
-|   |   `-- farcaster.json       # Farcaster Frame verification metadata
-|   |-- apple-icon.png           # Apple touch icon
-|   |-- icon-dark-32x32.png      # Dark theme application icon
-|   |-- icon-light-32x32.png     # Light theme application icon
-|   |-- icon.svg                 # Primary application logo
-|   |-- icons
-|   |   |-- github.svg           # GitHub icon asset
-|   |   `-- telegram.svg         # Telegram icon asset
-|   |-- placeholder-logo.png     # Placeholder logo image
-|   |-- placeholder-logo.svg     # Placeholder logo in SVG format
-|   |-- placeholder-user.jpg     # Placeholder user avatar
-|   |-- placeholder.jpg          # Generic placeholder image
-|   `-- placeholder.svg          # Generic placeholder SVG asset
-|-- styles
-|   `-- globals.css              # Additional global stylesheet
-|-- tailwind.config.cjs          # Tailwind CSS configuration (CommonJS)
-|-- tailwind.config.ts           # Tailwind CSS configuration (TypeScript)
-|-- tsconfig.json                # Main TypeScript compiler configuration
-`-- tsconfig.node.json           # TypeScript configuration for Node.js environment
+```bash
+git clone https://github.com/Endijuan33/ethtools-v2.git
+cd ethtools-v2
+pnpm install
+cp .env.example .env.local   # optional; sensible defaults apply
+pnpm dev
 ```
 
-### Key Dependencies
+The app runs at `http://localhost:3000`.
 
--   **Framework**: [Next.js](https://nextjs.org/) 14
--   **UI Library**: [React](https://reactjs.org/) 18
--   **Language**: [TypeScript](https://www.typescriptlang.org/)
--   **Styling**: [Tailwind CSS](https://tailwindcss.com/)
--   **Animations**: [Framer Motion](https://www.framer.com/motion/)
--   **Ethereum Interaction**: [Ethers.js](https://ethers.io/) v6
--   **Icons**: [Lucide React](https://lucide.dev/)
+> **WebCrypto requires a secure context.** `localhost` counts as secure, so local development works. A non-HTTPS deployment on any other host disables the vault rather than falling back to storing keys unprotected.
 
-## 🔒 Security and Privacy
+### Environment variables
 
-### ⚠️ IMPORTANT: Read Before Using
+All variables are optional and all are `NEXT_PUBLIC_*`, meaning they are **inlined into the client bundle and are not secret**. Never place an API key or any key material in them.
 
-1.  **Client-Side Operation**: This application is designed to be completely client-side. **No private keys or mnemonics are ever sent to any server.**
-2.  **No Data Storage**: The application does not store your sensitive information in `localStorage`, cookies, or any other persistent storage.
-3.  **Secure Environment**: Only use this application on a trusted, malware-free device and a secure network.
-4.  **Do Not Share Keys**: Never share your private key or mnemonic phrase with anyone, including the developers of this application.
-5.  **Verify the URL**: Always ensure you are on the correct, official URL before entering any sensitive information.
-6.  **Use HTTPS**: If deploying this application, ensure it is served over HTTPS to prevent man-in-the-middle attacks.
+| Variable | Purpose | Default |
+|---|---|---|
+| `NEXT_PUBLIC_ROUTESCAN_MAINNET_URL` | Explorer for the Converter/Generator panels | `https://routescan.io` |
+| `NEXT_PUBLIC_ROUTESCAN_TESTNET_URL` | Testnet explorer | `https://testnet.routescan.io` |
+| `NEXT_PUBLIC_SITE_URL` | Canonical origin for metadata | Vercel host, else production URL |
+| `PNPM_APPROVE_BUILD` | Lets pnpm run dependency build scripts on Vercel | — |
 
-### Best Practices
+The `_URL` suffix matters. An earlier version of this file documented the names without it, so the values silently never applied.
 
--   ✅ Use this tool for address derivation and verification, not for signing transactions.
--   ✅ For significant funds, always use a hardware wallet.
--   ✅ Double-check the address on a block explorer before sending any funds.
--   ✅ Keep offline, encrypted backups of your mnemonics and private keys.
+---
 
-## 🌐 Deployment
+## Scripts
 
-This Next.js application is optimized for deployment on platforms like Vercel or Netlify.
+| Command | Purpose |
+|---|---|
+| `pnpm dev` | Development server |
+| `pnpm build` | Production build |
+| `pnpm start` | Serve a production build |
+| `pnpm lint` | ESLint via `next lint` |
+| `pnpm typecheck` | `tsc --noEmit` across the app |
+| `pnpm test` | Compile `lib/` to CommonJS and run the unit suite |
+| `pnpm verify` | typecheck + lint + test |
 
-### Deploy with Vercel (Recommended)
+### Tests
 
-1.  Push your code to a Git repository (GitHub, GitLab, etc.).
-2.  [Import the project](https://vercel.com/new) into Vercel.
-3.  Vercel will automatically detect it as a Next.js project.
-4.  Add your environment variables from `.env.local` to the Vercel project settings.
-5.  Click **Deploy**. Your application will be live in minutes.
+227 unit tests cover the logic layer. They compile `lib/` to CommonJS in `.test-build/` and run on the Node built-in test runner, so no test framework is installed.
 
-### Deploy with Netlify
+| Module | Tests | Focus |
+|---|---:|---|
+| `calldata` | 38 | Selector extraction, ABI decode, revert reasons |
+| `units` | 32 | Bigint-exact conversion, truncation direction |
+| `hdWallet` | 23 | Published BIP-44 vectors, all five phrase lengths, passphrases |
+| `backup` | 19 | Encryption round trip, malicious-import rejection |
+| `multiRpc` | 19 | Failover, benching, timeouts, abort, no-retry broadcast |
+| `ens` | 18 | Result-union contract, forward confirmation, late rejections |
+| `vault` / `vaultStore` | 30 | AES-GCM round trip, wrong password, plaintext migration |
+| `format` | 14 | Never rounds a balance up; dust is distinguishable from zero |
+| `storage` / `schema` | 23 | Quota handling, atomic rollback, hostile-URL rejection |
+| `logger` | 11 | Redaction of keys, API keys, and nested error stacks |
 
-1.  Push your code to a Git repository.
-2.  [Import the project](https://app.netlify.com/start) into Netlify.
-3.  Configure the build settings (usually auto-detected for Next.js).
-4.  Add your environment variables.
-5.  Deploy.
+---
 
-## 📝 License
+## Architecture
 
-This project is licensed under the **MIT License**. Feel free to use, modify, and distribute it for personal and commercial purposes. See the [`LICENSE`](/LICENSE) file for more details.
+Next.js 14 App Router. There is no backend: the only route handler serves static Farcaster embed metadata.
 
-## 🤝 Contributing
+```
+app/
+  layout.tsx          Root layout, theme provider, toast host
+  page.tsx            Dashboard shell: header, nav rail, lazy-loaded panels
+  client-layout.tsx   Farcaster Mini App integration
+  error.tsx           Route-level error boundary
+  global-error.tsx    Root-layout error boundary (self-contained)
+  globals.css         Design tokens (light + dark) and base styles
+  api/frame/route.ts  Static Farcaster embed metadata
 
-Contributions are welcome! If you have suggestions or find a bug, please:
+components/
+  ui/                 Design system: Button, Card, Field, ResponsiveDialog,
+                      SecretField, Tabs, Toast, Skeleton, Badge, Alert…
+  WalletVault.tsx     Encrypted vault: create, unlock, accounts, auto-lock
+  WalletCard.tsx      Multi-network balances (legacy storage path)
+  SendForm.tsx        Transaction construction and broadcast
+  DevToolsCard.tsx    Units, ENS, calldata
+  ...
 
-1.  Fork the repository.
-2.  Create a new feature branch (`git checkout -b feature/NewFeature`).
-3.  Make your changes and commit them (`git commit -m 'Add NewFeature'`).
-4.  Push to the branch (`git push origin feature/NewFeature`).
-5.  Open a **Pull Request**.
+lib/
+  vault.ts            AES-256-GCM + PBKDF2 envelope encryption
+  vaultStore.ts       Vault persistence and legacy migration
+  storage.ts          Validated, quota-safe, atomic localStorage access
+  schema.ts           Runtime validators for every trust boundary
+  logger.ts           Redacting logger; raw console.* is banned
+  multiRpc.ts         RPC pool with per-request failover
+  ethers.ts           Network registry and pooled chain access
+  hdWallet.ts         BIP-32/39/44 derivation; secret classification
+  format.ts           Bigint-exact value formatting
+  backup.ts           Encrypted export/import
+  units.ts  ens.ts  calldata.ts   Developer tools
+  i18n.ts             Typed message catalogue (English only so far)
+```
 
-## ⚠️ Disclaimer
+### Design principles
 
-This application is provided "AS IS" and without any warranty of any kind. The developer is not responsible for any loss of funds, private keys, or any other damages that may result from the use of this software. **Use at your own risk and always exercise extreme caution with your cryptographic keys.**
+**Trust boundaries are validated.** `localStorage` is writable by anything running on the origin, and a backup file is arbitrary user input. Both pass through `lib/schema.ts`, which rejects non-`https:` URLs, malformed records, and custom networks that would shadow a built-in key.
+
+**Money is `bigint`.** Balances and amounts are only converted to a string for display, and display always truncates toward zero. Rounding a balance up would show funds the user does not have.
+
+**Secrets stay out of the DOM.** `SecretField` does not render a hidden secret at all — a CSS blur is a visual effect, not an access control.
+
+**Logs cannot leak.** `lib/logger.ts` redacts key-length hex, API keys in RPC paths, query credentials, and base64 blobs, recursively and depth-bounded, including error stacks. Ethereum addresses are deliberately preserved because they are public and are the most useful diagnostic field.
+
+---
+
+## Security model
+
+### What is protected
+
+- Key derivation, signing, and encryption run **only in the browser**. No key material is sent anywhere.
+- Vault contents are encrypted at rest with AES-256-GCM under a PBKDF2-derived key (600,000 iterations). A wrong password or a tampered payload fails the GCM authentication check.
+- Untrusted iteration counts are bounds-checked, so a hostile backup cannot wedge the browser with an absurd work factor.
+- Secret inputs set `autoComplete`, `autoCorrect`, `autoCapitalize`, and `spellCheck="false"`, preventing mobile keyboards and spell-checkers from transmitting typed phrase words to third-party prediction services.
+- Copying a secret to the clipboard requires an explicit confirmation that names the risk.
+- Revealed secrets auto-hide on a visible countdown.
+
+### What is not protected — read this
+
+- **`components/WalletCard.tsx` still writes private keys to `localStorage` in cleartext.** The encrypted vault (the **Vault** panel) is a separate, safe path. The legacy Balances panel has not been migrated. Use the Vault panel, and treat anything imported through the legacy path as exposed.
+- **No Content-Security-Policy is deployed.** Any successful XSS would have full access to `localStorage`.
+- **A password cannot be recovered.** Lose it and the accounts in that vault are unrecoverable.
+- **An encrypted backup file plus its password equals full control of the funds.** Store them separately.
+- **`localStorage` is not secure storage.** It is readable by any script on the origin and by browser extensions with storage permission. Encryption at rest raises the bar; it does not make a shared or compromised device safe.
+
+### Recommended practice
+
+- Use a hardware wallet for significant funds. This tool is best suited to development, testing, and recovery.
+- Verify the URL before entering a phrase.
+- Keep offline backups, and verify a backup restores before relying on it.
+- Prefer a dedicated browser profile.
+
+---
+
+## Deployment
+
+### Vercel
+
+1. Push to a Git repository.
+2. [Import the project](https://vercel.com/new). Next.js is detected automatically.
+3. Add environment variables from `.env.local` if you overrode any defaults.
+4. Deploy.
+
+`pnpm verify` should pass before every deployment.
+
+### Recommended security headers
+
+The repository ships **no** `headers()` configuration, so no CSP, `X-Frame-Options`, `X-Content-Type-Options`, or `Referrer-Policy` is sent. For a production deployment holding real funds, add them to `next.config.mjs`.
+
+Note that `frame-ancestors` must be an allowlist rather than `DENY`: this app is intended to be embedded by Farcaster Mini App clients, and `DENY` would break that.
+
+---
+
+## Contributing
+
+1. Fork and branch (`git checkout -b feature/thing`).
+2. Make the change; add tests for anything in `lib/`.
+3. Run `pnpm verify` — typecheck, lint, and tests must all pass.
+4. Open a pull request.
+
+House style: double quotes, no semicolons, 2-space indent, JSDoc on exported symbols explaining *why*. All code, comments, and UI text in English. Colours must resolve through design tokens; hardcoded Tailwind palette classes (`bg-gray-900`, `text-purple-400`) are not accepted. Use `lib/logger.ts` rather than `console.*`.
+
+## License
+
+MIT. See [`LICENSE`](/LICENSE).
+
+## Disclaimer
+
+Provided "AS IS" without warranty of any kind. The author is not responsible for any loss of funds, keys, or data arising from use of this software. Cryptographic key management is unforgiving: **use at your own risk.**

@@ -1,45 +1,60 @@
 "use client"
 
-import { useState, useMemo, useEffect, useCallback } from "react"
+import { useState, useMemo, useEffect, useCallback, useRef } from "react"
 import {
-  AlertTriangle,
-  Eye,
-  EyeOff,
-  Copy,
-  Check,
   RefreshCw,
   Send,
   Plus,
   Trash2,
-  X,
   ChevronDown,
   Wallet,
-  Loader2,
-  Circle,
   Bookmark as BookmarkIcon,
   FileJson,
 } from "lucide-react"
 import { Mnemonic, Wallet as EthersWallet, isError } from "ethers"
 import {
-  getBalance,
+  getBalanceWei,
+  getNativeDecimals,
   getRoutescanUrl,
   NETWORKS,
   getCustomNetworks,
   saveCustomNetwork,
   removeCustomNetwork,
   validateRpcUrl,
-  getProvider,
   cleanupRpcPools,
   getRpcHealthStatus,
   type Network as NetworkType,
   type CustomNetwork,
   type NetworkConfig,
 } from "@/lib/ethers"
+import { RpcError } from "@/lib/multiRpc"
+import { APP_EVENTS, onAppEvent } from "@/lib/appEvents"
 import { QRCodeSVG } from "qrcode.react"
 import SendForm from "./SendForm"
 import BookmarkManager from "./BookmarkManager"
 import BackupManager from "./BackupManager"
-import { getPricesForNetworks, getCoinIdForNetwork } from "@/lib/priceFeed"
+import { getPricesForNetworks } from "@/lib/priceFeed"
+import { logger, describeError } from "@/lib/logger"
+import {
+  formatBalanceForDisplay,
+  formatFiat,
+  isNonZeroAmount,
+  toFiatValue,
+  UNKNOWN_VALUE,
+} from "@/lib/format"
+import { filterValid, isEthAddress, isNonEmptyString, isRecord } from "@/lib/schema"
+import { STORAGE_KEYS, readRaw, removeKey, readJson, writeJson, writeRaw } from "@/lib/storage"
+import Card, { CardHeader, CardTitle } from "./ui/Card"
+import Button from "./ui/Button"
+import ResponsiveDialog from "./ui/ResponsiveDialog"
+import Field, { inputClassName, monoInputClassName, secretInputProps } from "./ui/Field"
+import Alert from "./ui/Alert"
+import Badge from "./ui/Badge"
+import CopyButton from "./ui/CopyButton"
+import SecretField from "./ui/SecretField"
+import Tabs, { TabPanel, type TabItem } from "./ui/Tabs"
+import { SkeletonList } from "./ui/Skeleton"
+import { cn } from "@/lib/utils"
 
 // ===== Types =====
 
@@ -50,12 +65,49 @@ interface ImportedWallet {
   privateKey: string
 }
 
-interface Balances {
-  [key: string]: { balance: string | null; error: string | null }
+/** One network's balance, or the reason it could not be read. */
+interface BalanceEntry {
+  /**
+   * Exact balance in base units, or null when the read failed.
+   *
+   * Read from `getBalanceWei`, never re-parsed from a display string. The
+   * string-returning `getBalance` truncates to five decimal places, so parsing it
+   * back reported 0 for an account holding less than 0.00001 — which then disabled
+   * the Send button on funds that were genuinely spendable.
+   */
+  baseUnits: bigint | null
+  /**
+   * Decimals of this network's native unit.
+   *
+   * Carried per entry rather than assumed to be 18: Arc's native unit is USDC at 6
+   * decimals, and formatting it as 18 understated the balance by a factor of a
+   * trillion and mispriced the fiat column by the same amount.
+   */
+  decimals: number
+  /** Already-sanitised, user-presentable failure message. */
+  error: string | null
 }
 
+interface Balances {
+  [networkKey: string]: BalanceEntry
+}
+
+/**
+ * Per-network RPC health, keyed by network.
+ *
+ * Mirrors the fields of `PoolHealth` that this card actually renders. The pool
+ * derives these from real request outcomes, so there is nothing to poll: the
+ * snapshot only changes when a balance request succeeds or fails.
+ */
 interface RpcHealthIndicator {
-  [key: string]: { healthy: boolean; responseTime: number }
+  [key: string]: {
+    /** At least one endpoint is currently usable. */
+    usable: boolean
+    /** Best observed latency in ms, or null when nothing has been measured yet. */
+    bestLatencyMs: number | null
+    healthyEndpoints: number
+    totalEndpoints: number
+  }
 }
 
 interface PriceMap {
@@ -64,11 +116,70 @@ interface PriceMap {
 
 // ===== Constants =====
 
-const WALLETS_STORAGE_KEY = "ethtools_wallets"
-const ACTIVE_WALLET_KEY = "ethtools_active_wallet"
-const BALANCE_RETRY_COUNT = 3
-const BALANCE_RETRY_DELAY_MS = 1000
-const PRICE_REFRESH_INTERVAL = 120000 // 2 minutes
+/**
+ * Base tick of the single polling scheduler.
+ *
+ * One timer drives balances, RPC health, and prices. Three independent intervals
+ * meant three chances to leak a timer and three separate wake-ups per minute; a
+ * single tick also keeps the network fan-out from overlapping with itself.
+ */
+const POLL_INTERVAL_MS = 30_000
+
+/** Ticks between price refreshes. Fiat prices move far slower than balances. */
+const PRICE_REFRESH_TICKS = 4
+
+/**
+ * How long the tab must stay hidden before RPC pools are released.
+ *
+ * Releasing the pools frees their sockets and cached provider state after a
+ * sustained absence. The grace period stops a brief tab switch from thrashing
+ * them, and the next visible refresh recreates them lazily.
+ */
+const IDLE_TEARDOWN_MS = 60_000
+
+/** Mainnet/testnet switch. Declared once so the tab strip stays a stable list. */
+const NETWORK_TABS: readonly TabItem<"mainnet" | "testnet">[] = [
+  { id: "mainnet", label: "Mainnets" },
+  { id: "testnet", label: "Testnets" },
+]
+
+/** Links the wallet-selector trigger to the list it controls. */
+const WALLET_LIST_ID = "wallet-selector-list"
+
+// ===== Module helpers =====
+
+/** Whether the tab is currently hidden. Safe to call before hydration. */
+function isDocumentHidden(): boolean {
+  return typeof document !== "undefined" && document.hidden
+}
+
+/** Whether a stored value is a usable legacy wallet record. */
+function isImportedWallet(value: unknown): value is ImportedWallet {
+  if (!isRecord(value)) return false
+  return (
+    isNonEmptyString(value.id, 128) &&
+    isNonEmptyString(value.label, 128) &&
+    isEthAddress(value.address) &&
+    isNonEmptyString(value.privateKey, 200)
+  )
+}
+
+/** Array shape guard for the raw stored wallet list. */
+function isUnknownArray(value: unknown): value is unknown[] {
+  return Array.isArray(value)
+}
+
+/**
+ * Read the legacy wallet list.
+ *
+ * Routed through `lib/storage` so a blocked or corrupted store degrades to an
+ * empty list instead of throwing during render, and validated per record so one
+ * malformed entry does not discard the rest.
+ */
+function readStoredWallets(): ImportedWallet[] {
+  const raw = readJson<unknown[]>(STORAGE_KEYS.LEGACY_WALLETS, isUnknownArray, [])
+  return filterValid(raw, isImportedWallet)
+}
 
 // ===== AddCustomRpcModal (Inline) =====
 
@@ -138,35 +249,52 @@ function AddCustomRpcModal({
     onClose()
   }
 
-  if (!isOpen) return null
-
   return (
-    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
-      <div className="bg-gray-800 p-6 rounded-2xl shadow-lg w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto">
-        <div className="flex justify-between items-center mb-4">
-          <h3 className="text-lg font-bold">Add Custom RPC ({networkType})</h3>
-          <button onClick={onClose} className="text-gray-400 hover:text-white">
-            <X size={20} />
-          </button>
-        </div>
+    <ResponsiveDialog
+      isOpen={isOpen}
+      onClose={onClose}
+      title={`Add Custom RPC (${networkType})`}
+      footer={
+        <Button
+          onClick={handleSubmit}
+          disabled={isValidating}
+          isLoading={isValidating}
+          loadingLabel="Validating RPCs…"
+          fullWidth
+        >
+          Add Network
+        </Button>
+      }
+    >
+      <Field label="Network Name" required>
+        {(props) => (
+          <input
+            {...props}
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. My Custom Chain"
+            className={inputClassName}
+          />
+        )}
+      </Field>
 
-        <div className="space-y-4">
-          <div>
-            <label className="text-sm text-gray-300 block mb-1">Network Name *</label>
-            <input
-              type="text"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. My Custom Chain"
-              className="w-full p-3 bg-black/30 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
-            />
-          </div>
-
-          <div>
-            <label className="text-sm text-gray-300 block mb-1">RPC URLs * (at least one)</label>
-            {rpcUrls.map((url, index) => (
-              <div key={index} className="flex items-center gap-2 mb-2">
+      <fieldset className="space-y-2">
+        <legend className="mb-1.5 text-sm font-medium text-foreground">
+          RPC URLs
+          <span className="ml-1 text-destructive" aria-hidden="true">
+            *
+          </span>
+          <span className="sr-only"> (required)</span> (at least one)
+        </legend>
+        {rpcUrls.map((url, index) => (
+          // The label is per-row so each input has its own accessible name;
+          // hidden because the legend already carries the visible heading.
+          <Field key={index} label={`RPC URL ${index + 1}`} hideLabel>
+            {(props) => (
+              <div className="flex items-center gap-2">
                 <input
+                  {...props}
                   type="text"
                   value={url}
                   onChange={(e) => {
@@ -175,60 +303,62 @@ function AddCustomRpcModal({
                     setRpcUrls(newUrls)
                   }}
                   placeholder="https://rpc.example.com"
-                  className="flex-1 p-3 bg-black/30 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
+                  className={cn(monoInputClassName, "flex-1")}
                 />
                 {rpcUrls.length > 1 && (
-                  <button
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-11 w-11 hover:text-destructive"
                     onClick={() => handleRemoveRpcUrl(index)}
-                    className="text-red-400 hover:text-red-300"
+                    aria-label={`Remove RPC URL ${index + 1}`}
                   >
-                    <Trash2 size={18} />
-                  </button>
+                    <Trash2 size={18} aria-hidden="true" />
+                  </Button>
                 )}
               </div>
-            ))}
-            <button
-              onClick={handleAddRpcUrl}
-              className="text-sm text-purple-400 hover:text-purple-300 flex items-center gap-1"
-            >
-              <Plus size={16} /> Add another RPC URL
-            </button>
-          </div>
+            )}
+          </Field>
+        ))}
+        <Button
+          variant="link"
+          size="sm"
+          className="h-auto px-0"
+          onClick={handleAddRpcUrl}
+          icon={<Plus size={16} aria-hidden="true" />}
+        >
+          Add another RPC URL
+        </Button>
+      </fieldset>
 
-          <div>
-            <label className="text-sm text-gray-300 block mb-1">Explorer URL (optional)</label>
-            <input
-              type="text"
-              value={explorerUrl}
-              onChange={(e) => setExplorerUrl(e.target.value)}
-              placeholder="https://explorer.example.com"
-              className="w-full p-3 bg-black/30 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
-            />
-          </div>
+      <Field label="Explorer URL" hint="Optional.">
+        {(props) => (
+          <input
+            {...props}
+            type="text"
+            value={explorerUrl}
+            onChange={(e) => setExplorerUrl(e.target.value)}
+            placeholder="https://explorer.example.com"
+            className={inputClassName}
+          />
+        )}
+      </Field>
 
-          <div>
-            <label className="text-sm text-gray-300 block mb-1">Currency Symbol *</label>
-            <input
-              type="text"
-              value={currency}
-              onChange={(e) => setCurrency(e.target.value)}
-              placeholder="e.g. ETH, BNB"
-              className="w-full p-3 bg-black/30 rounded-lg text-white placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-purple-500"
-            />
-          </div>
+      <Field label="Currency Symbol" required>
+        {(props) => (
+          <input
+            {...props}
+            type="text"
+            value={currency}
+            onChange={(e) => setCurrency(e.target.value)}
+            placeholder="e.g. ETH, BNB"
+            className={inputClassName}
+          />
+        )}
+      </Field>
 
-          {error && <p className="text-red-400 text-sm">{error}</p>}
-
-          <button
-            onClick={handleSubmit}
-            disabled={isValidating}
-            className="w-full bg-purple-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-purple-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {isValidating ? "Validating RPCs..." : "Add Network"}
-          </button>
-        </div>
-      </div>
-    </div>
+      {error && <Alert tone="danger">{error}</Alert>}
+    </ResponsiveDialog>
   )
 }
 
@@ -251,61 +381,93 @@ function WalletSelector({
 
   return (
     <div className="relative">
-      <button
+      <Button
+        variant="secondary"
+        fullWidth
         onClick={() => setIsOpen(!isOpen)}
-        className="flex items-center gap-2 bg-black/30 px-4 py-2 rounded-lg hover:bg-black/40 transition-colors w-full"
+        aria-expanded={isOpen}
+        aria-controls={WALLET_LIST_ID}
+        aria-haspopup="true"
+        className="justify-start"
+        icon={<Wallet size={18} aria-hidden="true" />}
       >
-        <Wallet size={18} />
-        <span className="flex-1 text-left truncate">{activeWallet?.label || "Select Wallet"}</span>
-        <ChevronDown size={18} className={`transition-transform ${isOpen ? "rotate-180" : ""}`} />
-      </button>
+        <span className="flex-1 truncate text-left">{activeWallet?.label || "Select Wallet"}</span>
+        <ChevronDown
+          size={18}
+          aria-hidden="true"
+          className={cn("transition-transform", isOpen && "rotate-180")}
+        />
+      </Button>
 
       {isOpen && (
-        <div className="absolute top-full left-0 right-0 mt-2 bg-gray-800 rounded-lg shadow-lg border border-white/10 z-40 overflow-hidden">
+        <div
+          id={WALLET_LIST_ID}
+          role="group"
+          aria-label="Your wallets"
+          className="absolute left-0 right-0 top-full z-40 mt-2 overflow-hidden rounded-lg border border-border bg-card shadow-glass-lg"
+        >
           <div className="max-h-60 overflow-y-auto">
             {wallets.map((wallet) => (
               <div
                 key={wallet.id}
-                className={`flex items-center justify-between px-4 py-3 hover:bg-black/30 cursor-pointer ${
-                  activeWallet?.id === wallet.id ? "bg-purple-600/30" : ""
-                }`}
+                className={cn(
+                  "flex items-center justify-between gap-2 pr-2 transition-colors hover:bg-secondary",
+                  activeWallet?.id === wallet.id && "bg-primary/15"
+                )}
               >
-                <div
-                  className="flex-1 min-w-0"
+                {/* Was a <div onClick>, so it could not be reached or activated
+                    from the keyboard. */}
+                <button
+                  type="button"
                   onClick={() => {
                     onSelect(wallet)
                     setIsOpen(false)
                   }}
+                  aria-current={activeWallet?.id === wallet.id || undefined}
+                  className={cn(
+                    "min-w-0 flex-1 px-4 py-3 text-left",
+                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                  )}
                 >
-                  <p className="font-semibold truncate">{wallet.label}</p>
-                  <p className="text-xs text-gray-400 font-mono truncate">
+                  <span className="block truncate font-semibold text-foreground">
+                    {wallet.label}
+                  </span>
+                  <span className="block truncate font-mono text-xs text-muted-foreground">
                     {wallet.address.slice(0, 10)}...{wallet.address.slice(-8)}
-                  </p>
-                </div>
+                  </span>
+                </button>
                 {wallets.length > 1 && (
-                  <button
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-11 w-11 hover:text-destructive"
                     onClick={(e) => {
                       e.stopPropagation()
                       onDelete(wallet.id)
                     }}
-                    className="text-red-400 hover:text-red-300 p-1 ml-2"
                     title="Remove wallet"
+                    aria-label={`Remove wallet ${wallet.label}`}
                   >
-                    <Trash2 size={16} />
-                  </button>
+                    <Trash2 size={16} aria-hidden="true" />
+                  </Button>
                 )}
               </div>
             ))}
           </div>
-          <div className="border-t border-white/10">
+          <div className="border-t border-border">
             <button
+              type="button"
               onClick={() => {
                 onAddNew()
                 setIsOpen(false)
               }}
-              className="w-full flex items-center gap-2 px-4 py-3 hover:bg-black/30 text-purple-400"
+              className={cn(
+                "flex min-h-[44px] w-full items-center gap-2 px-4 py-3 text-sm font-semibold text-primary",
+                "transition-colors hover:bg-secondary",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+              )}
             >
-              <Plus size={18} />
+              <Plus size={18} aria-hidden="true" />
               <span>Add Another Wallet</span>
             </button>
           </div>
@@ -328,10 +490,8 @@ export default function WalletCard() {
   const [inputValue, setInputValue] = useState("")
   const [walletLabel, setWalletLabel] = useState("")
   const [error, setError] = useState("")
-  const [isMasked, setIsMasked] = useState(true)
   const [showReceive, setShowReceive] = useState(false)
   const [sendFromNetwork, setSendFromNetwork] = useState<NetworkType | null>(null)
-  const [copied, setCopied] = useState(false)
   const [txSuccess, setTxSuccess] = useState<{ hash: string; network: NetworkType } | null>(null)
   const [showLogoutConfirmation, setShowLogoutConfirmation] = useState(false)
   const [isMounted, setIsMounted] = useState(false)
@@ -342,6 +502,39 @@ export default function WalletCard() {
   const [rpcHealth, setRpcHealth] = useState<RpcHealthIndicator>({})
   const [prices, setPrices] = useState<PriceMap>({})
   const [isLoadingPrices, setIsLoadingPrices] = useState(false)
+
+  // --- Request generation guards ---
+
+  /**
+   * Monotonic id for balance fetches.
+   *
+   * Bumped on every refresh, on hide, and on unmount. A response whose id no
+   * longer matches is dropped, which is what stops the real race this component
+   * had: switching mainnet↔testnet started a second fan-out while the first was
+   * still in flight, and whichever finished last won.
+   */
+  const balanceRequestId = useRef(0)
+
+  /**
+   * Aborts the in-flight balance batch.
+   *
+   * Complements {@link balanceRequestId}: the id stops a stale response from being
+   * written, while this stops the request from continuing to occupy a socket at
+   * all. Hiding the tab aborts, so nothing keeps running where nobody can see it.
+   */
+  const balanceAbort = useRef<AbortController | null>(null)
+
+  /** Monotonic id for price fetches. Same contract as {@link balanceRequestId}. */
+  const priceRequestId = useRef(0)
+
+  /**
+   * Mirrors `sendFromNetwork` for reads from inside timer callbacks.
+   *
+   * The idle teardown must not release RPC pools while a send dialog is open, and
+   * a callback created once per effect run would otherwise close over a stale
+   * value.
+   */
+  const sendFromNetworkRef = useRef<NetworkType | null>(null)
 
   // --- Derived ---
   const activeWallet = useMemo(
@@ -365,6 +558,20 @@ export default function WalletCard() {
     ][]
   }, [networkView, customNetworks])
 
+  /**
+   * Whether to render placeholders instead of rows.
+   *
+   * True only while a fetch is running *and* nothing is cached for the visible
+   * networks. Balances are keyed by network and never cleared on a view toggle, so
+   * switching tabs or hitting a 30-second refresh keeps the rows that are already
+   * correct on screen instead of blanking the list.
+   */
+  const showBalanceSkeleton = useMemo(
+    () =>
+      isLoadingBalances && displayedNetworks.every(([key]) => balances[key] === undefined),
+    [isLoadingBalances, displayedNetworks, balances]
+  )
+
   // --- Effects ---
   useEffect(() => {
     setIsMounted(true)
@@ -375,189 +582,332 @@ export default function WalletCard() {
     setCustomNetworks(getCustomNetworks())
   }, [isMounted])
 
-  useEffect(() => {
-    if (!isMounted) return
-    try {
-      const storedWalletsJSON = localStorage.getItem(WALLETS_STORAGE_KEY)
-      const storedActiveId = localStorage.getItem(ACTIVE_WALLET_KEY)
-
-      if (storedWalletsJSON) {
-        const storedWallets: ImportedWallet[] = JSON.parse(storedWalletsJSON)
-        if (Array.isArray(storedWallets) && storedWallets.length > 0) {
-          setWallets(storedWallets)
-          if (storedActiveId && storedWallets.some((w) => w.id === storedActiveId)) {
-            setActiveWalletId(storedActiveId)
-          } else {
-            setActiveWalletId(storedWallets[0].id)
-          }
-        }
-      }
-    } catch (e) {
-      console.error("Error reading wallets from localStorage:", e)
-      localStorage.removeItem(WALLETS_STORAGE_KEY)
-      localStorage.removeItem(ACTIVE_WALLET_KEY)
-    }
-  }, [isMounted])
-
-  // Listen for wallet data updates from backup import
-  useEffect(() => {
-    const handleWalletUpdate = () => {
-      try {
-        const storedWalletsJSON = localStorage.getItem(WALLETS_STORAGE_KEY)
-        if (storedWalletsJSON) {
-          const storedWallets: ImportedWallet[] = JSON.parse(storedWalletsJSON)
-          if (Array.isArray(storedWallets)) {
-            setWallets(storedWallets)
-            if (storedWallets.length > 0) {
-              const storedActiveId = localStorage.getItem(ACTIVE_WALLET_KEY)
-              if (storedActiveId && storedWallets.some((w) => w.id === storedActiveId)) {
-                setActiveWalletId(storedActiveId)
-              } else {
-                setActiveWalletId(storedWallets[0].id)
-              }
-            } else {
-              setActiveWalletId(null)
-            }
-          }
-        }
-      } catch (e) {
-        console.error("Error reloading wallets:", e)
-      }
-    }
-
-    window.addEventListener("walletDataUpdated", handleWalletUpdate)
-    return () => {
-      window.removeEventListener("walletDataUpdated", handleWalletUpdate)
-    }
-  }, [])
-
-  // Cleanup RPC pools on unmount
-  useEffect(() => {
-    return () => {
-      cleanupRpcPools()
-    }
-  }, [])
-
-  // Fetch RPC health status periodically
-  useEffect(() => {
-    if (!isUnlocked) return
-
-    const updateHealthStatus = () => {
-      const healthMap = getRpcHealthStatus()
-      const newHealth: RpcHealthIndicator = {}
-      for (const [network, statuses] of healthMap) {
-        const healthy = statuses.some((s) => s.healthy)
-        const avgResponseTime = statuses.reduce((sum, s) => sum + s.responseTime, 0) / statuses.length
-        newHealth[network] = { healthy, responseTime: avgResponseTime }
-      }
-      setRpcHealth(newHealth)
-    }
-
-    updateHealthStatus()
-    const interval = setInterval(updateHealthStatus, 30000)
-    return () => clearInterval(interval)
-  }, [isUnlocked])
-
-  // --- Price Feed ---
-  const fetchPrices = useCallback(async () => {
-    if (!isUnlocked || displayedNetworks.length === 0) return
-
-    // Only fetch prices for mainnet networks (testnet prices are not meaningful)
-    const mainnetNetworks = displayedNetworks
-      .filter(([, config]) => config.type === "mainnet")
-      .map(([key]) => key)
-
-    if (mainnetNetworks.length === 0) {
-      setPrices({})
+  /**
+   * Adopt a freshly read wallet list, keeping the active selection valid.
+   *
+   * Shared by the initial load and the backup-import listener so both paths agree
+   * on what happens when the previously active id is no longer present.
+   */
+  const adoptWallets = useCallback((storedWallets: ImportedWallet[]) => {
+    setWallets(storedWallets)
+    if (storedWallets.length === 0) {
+      setActiveWalletId(null)
+      removeKey(STORAGE_KEYS.ACTIVE_WALLET)
       return
     }
+    const storedActiveId = readRaw(STORAGE_KEYS.ACTIVE_WALLET)
+    const isKnown =
+      storedActiveId !== null && storedWallets.some((w) => w.id === storedActiveId)
+    setActiveWalletId(isKnown ? storedActiveId : storedWallets[0].id)
+  }, [])
 
+  useEffect(() => {
+    if (!isMounted) return
+    // Reads go through lib/storage: accessing localStorage throws outright in some
+    // privacy modes, and a corrupt value used to take the whole render down.
+    const storedWallets = readStoredWallets()
+    if (storedWallets.length > 0) adoptWallets(storedWallets)
+  }, [isMounted, adoptWallets])
+
+  /**
+   * Re-read everything cached from storage after a backup restore or an erase.
+   *
+   * Custom networks matter as much as wallets here: they are otherwise loaded
+   * only on mount, so a restored network stayed invisible until the user reloaded
+   * the page. The previous listener watched a `walletDataUpdated` event that no
+   * longer had a dispatcher, so neither refresh happened at all.
+   */
+  useEffect(() => {
+    const handleRestore = (): void => {
+      adoptWallets(readStoredWallets())
+      setCustomNetworks(getCustomNetworks())
+    }
+
+    return onAppEvent(APP_EVENTS.DATA_RESTORED, handleRestore)
+  }, [adoptWallets])
+
+  // --- Refresh primitives ---
+
+  // Keep the ref in step so timer callbacks read the current dialog state.
+  useEffect(() => {
+    sendFromNetworkRef.current = sendFromNetwork
+  }, [sendFromNetwork])
+
+  /**
+   * Discard cached balances when the active wallet changes.
+   *
+   * Balances belong to an address, so showing the previous wallet's figures under
+   * a newly selected one would be actively misleading. This is deliberately keyed
+   * on the address and nothing else: the old code cleared on every `networkView`
+   * change too, which threw away good data and blanked the list on each toggle.
+   */
+  useEffect(() => {
+    setBalances((prev) => (Object.keys(prev).length === 0 ? prev : {}))
+  }, [activeWallet?.address])
+
+  /**
+   * Read the RPC health snapshot.
+   *
+   * Local only: it inspects state `lib/multiRpc` already maintains from real
+   * request outcomes and issues no requests of its own. That is why there is no
+   * health timer any more — a dedicated 30-second poll across every network was
+   * roughly 50 requests a minute spent re-discovering what the balance refresh
+   * had just found out.
+   */
+  const refreshRpcHealth = useCallback(() => {
+    const healthMap = getRpcHealthStatus()
+    const newHealth: RpcHealthIndicator = {}
+    for (const [network, health] of healthMap) {
+      if (health.totalEndpoints === 0) continue
+      newHealth[network] = {
+        usable: health.usable,
+        bestLatencyMs: health.bestLatencyMs,
+        healthyEndpoints: health.healthyEndpoints,
+        totalEndpoints: health.totalEndpoints,
+      }
+    }
+    setRpcHealth(newHealth)
+  }, [])
+
+  /**
+   * Fetch fiat prices for the visible mainnet networks.
+   *
+   * Guarded by a request id so a response from a superseded request — a network
+   * switch, a wallet switch, or an unmount — cannot land on current state.
+   */
+  const refreshPrices = useCallback(async () => {
+    if (displayedNetworks.length === 0) return
+
+    // Prices are resolved from each network's native currency rather than its
+    // name. Keying by name previously priced every ETH-native L2 using its
+    // governance token — OP for Optimism, ARB for Arbitrum — which misstated the
+    // portfolio total by orders of magnitude. Testnets are excluded entirely, so
+    // test funds are never shown a real-money value.
+    const priceable = displayedNetworks.map(([key, config]) => ({
+      key,
+      currency: config.currency,
+      isTestnet: config.type === "testnet",
+    }))
+
+    if (priceable.every((entry) => entry.isTestnet)) return
+
+    const requestId = priceRequestId.current + 1
+    priceRequestId.current = requestId
     setIsLoadingPrices(true)
+
     try {
-      const priceMap = await getPricesForNetworks(mainnetNetworks, "usd")
+      const priceMap = await getPricesForNetworks(priceable, "usd")
+      if (priceRequestId.current !== requestId) return
       const newPrices: PriceMap = {}
       for (const [network, price] of priceMap) {
         newPrices[network] = price
       }
       setPrices((prev) => ({ ...prev, ...newPrices }))
     } catch (error) {
-      console.error("Failed to fetch prices:", error)
-      // Keep existing prices on error
+      // Keep the previous prices: a stale price is more useful than an em dash,
+      // and the raw error never reaches the UI.
+      logger.warn("Price refresh failed", { networks: priceable.length, error })
     } finally {
-      setIsLoadingPrices(false)
+      if (priceRequestId.current === requestId) setIsLoadingPrices(false)
     }
-  }, [isUnlocked, displayedNetworks])
+  }, [displayedNetworks])
 
-  // Auto-refresh prices periodically
-  useEffect(() => {
-    if (!isUnlocked) return
-    fetchPrices()
-    const interval = setInterval(fetchPrices, PRICE_REFRESH_INTERVAL)
-    return () => clearInterval(interval)
-  }, [isUnlocked, fetchPrices])
-
-  // --- Balance Fetching with Retry Logic ---
-
-  const fetchBalanceWithRetry = useCallback(
-    async (address: string, networkKey: string, retries: number = BALANCE_RETRY_COUNT): Promise<{
-      networkKey: string
-      balance: string | null
-      error: string | null
-    }> => {
-      let lastError: Error | null = null
-      for (let attempt = 0; attempt < retries; attempt++) {
-        try {
-          const balance = await getBalance(address, networkKey)
-          return { networkKey, balance, error: null }
-        } catch (e) {
-          lastError = e instanceof Error ? e : new Error("Unknown error")
-          console.warn(
-            `Balance fetch attempt ${attempt + 1}/${retries} failed for ${networkKey}:`,
-            lastError.message
-          )
-          if (attempt < retries - 1) {
-            const delay = BALANCE_RETRY_DELAY_MS * Math.pow(2, attempt)
-            await new Promise((resolve) => setTimeout(resolve, delay))
-          }
+  /**
+   * Read one network's balance. Never rejects.
+   *
+   * Exactly one attempt at this layer. Retries, per-request timeouts, and endpoint
+   * failover all live in the pool inside `lib/multiRpc`, and nesting a second
+   * retry loop here multiplied the worst-case latency by the retry count — a
+   * single dead network could hold the whole batch for the better part of a
+   * minute.
+   *
+   * Returns null when the request was aborted, which is not a failure to report:
+   * the tab was hidden or the view moved on, and writing "The request was
+   * cancelled" into twenty rows would be noise the user never asked about.
+   *
+   * @param address - Account to read.
+   * @param networkKey - Network to read it on.
+   * @param signal - Aborted when this batch is superseded.
+   */
+  const fetchBalanceOnce = useCallback(
+    async (
+      address: string,
+      networkKey: string,
+      signal: AbortSignal
+    ): Promise<BalanceEntry | null> => {
+      const decimals = getNativeDecimals(networkKey)
+      try {
+        // Exact base units, not the truncated display string: `getBalance` cuts to
+        // five decimals, and a "can send" decision taken on that refuses to spend
+        // real dust.
+        const wei = await getBalanceWei(address, networkKey, signal)
+        return { baseUnits: wei, decimals, error: null }
+      } catch (error) {
+        if (signal.aborted || (error instanceof RpcError && error.kind === "aborted")) {
+          return null
+        }
+        logger.warn("Balance fetch failed", { network: networkKey, error })
+        // `RpcError.userMessage` separates "rate limited, wait a moment" from
+        // "every endpoint failed", which is the difference between a user waiting
+        // and a user giving up. It is also the only message here guaranteed not to
+        // embed an endpoint URL — those can carry an API key.
+        return {
+          baseUnits: null,
+          decimals,
+          error:
+            error instanceof RpcError
+              ? error.userMessage
+              : describeError(error, "Could not load balance."),
         }
       }
-      const errorMsg = lastError?.message || "Failed to fetch balance"
-      return { networkKey, balance: null, error: errorMsg }
     },
     []
   )
 
-  const fetchAllBalances = useCallback(async () => {
-    if (!activeWallet?.address) return
+  /**
+   * Refresh balances for the visible networks.
+   *
+   * Each network is applied on its own as it resolves, so one slow or failing
+   * endpoint shows a per-row error instead of holding up — or failing — the whole
+   * batch. Every write is gated on the request id, which is what stops a response
+   * from a previous network view or wallet from overwriting current state.
+   */
+  const refreshBalances = useCallback(async () => {
+    const address = activeWallet?.address
+    if (address === undefined) return
+
+    const requestId = balanceRequestId.current + 1
+    balanceRequestId.current = requestId
+
+    // Abort the previous batch outright rather than merely ignoring its result.
+    // The id check alone stops a stale write, but the sockets stayed busy — on a
+    // fast tab switch that meant two full fan-outs in flight at once.
+    balanceAbort.current?.abort()
+    const controller = new AbortController()
+    balanceAbort.current = controller
     setIsLoadingBalances(true)
 
-    const address = activeWallet.address
-    const balancePromises = displayedNetworks.map(async ([key]) => {
-      const networkKey = key as NetworkType
-      return await fetchBalanceWithRetry(address, networkKey)
-    })
+    const networkKeys = displayedNetworks.map(([key]) => key)
+    await Promise.all(
+      networkKeys.map(async (networkKey) => {
+        const entry = await fetchBalanceOnce(address, networkKey, controller.signal)
+        if (entry === null || balanceRequestId.current !== requestId) return
+        setBalances((prev) => ({ ...prev, [networkKey]: entry }))
+      })
+    )
 
-    const results = await Promise.all(balancePromises)
-    const newBalances: Balances = {}
-    for (const result of results) {
-      newBalances[result.networkKey] = {
-        balance: result.balance,
-        error: result.error,
-      }
-    }
-    setBalances((prev) => ({ ...prev, ...newBalances }))
+    if (balanceRequestId.current !== requestId) return
     setIsLoadingBalances(false)
-  }, [activeWallet?.address, displayedNetworks, fetchBalanceWithRetry])
+    // The pool records each endpoint's outcome as these requests resolve, so this
+    // is the one moment the health snapshot can have changed. Reading it here is
+    // what makes the old 30-second health interval redundant.
+    refreshRpcHealth()
+  }, [activeWallet?.address, displayedNetworks, fetchBalanceOnce, refreshRpcHealth])
 
-  // Auto-refresh balances every 30 seconds
+  /**
+   * Single coordinated poller.
+   *
+   * Replaces three independent intervals (balances 30s, RPC health 30s, prices
+   * 120s), none of which paused while the tab was hidden. The health interval is
+   * gone entirely — the pool now derives health from real request outcomes, so
+   * that timer was pure overhead. One timer ticks only while the tab is visible;
+   * going hidden stops it, and coming back refreshes once immediately because
+   * anything cached is by then stale.
+   *
+   * After a sustained hidden period the RPC pools are released as well, so nothing
+   * of this component's survives in the background. The teardown is skipped while
+   * a send dialog is open so it can never interfere with a transaction the user is
+   * in the middle of.
+   */
   useEffect(() => {
-    if (activeWallet?.address && isUnlocked) {
-      setBalances({})
-      fetchAllBalances()
-      const interval = setInterval(fetchAllBalances, 30000)
-      return () => clearInterval(interval)
+    if (!isUnlocked) return
+
+    let tick = 0
+    let timer: ReturnType<typeof setInterval> | null = null
+    let teardownTimer: ReturnType<typeof setTimeout> | null = null
+
+    const stopTimer = () => {
+      if (timer === null) return
+      clearInterval(timer)
+      timer = null
     }
-  }, [activeWallet?.address, isUnlocked, fetchAllBalances])
+
+    const cancelTeardown = () => {
+      if (teardownTimer === null) return
+      clearTimeout(teardownTimer)
+      teardownTimer = null
+    }
+
+    const startTimer = () => {
+      if (timer !== null) return
+      timer = setInterval(() => {
+        tick += 1
+        // Health rides along inside refreshBalances; it has no timer of its own.
+        void refreshBalances()
+        if (tick % PRICE_REFRESH_TICKS === 0) void refreshPrices()
+      }, POLL_INTERVAL_MS)
+    }
+
+    const refreshEverything = () => {
+      tick = 0
+      void refreshBalances()
+      void refreshPrices()
+    }
+
+    const handleVisibilityChange = () => {
+      if (isDocumentHidden()) {
+        stopTimer()
+        // Abandon anything in flight: its response would be written into a view
+        // the user is no longer looking at, and the request itself would keep a
+        // socket busy in a tab nobody is watching.
+        balanceRequestId.current += 1
+        priceRequestId.current += 1
+        balanceAbort.current?.abort()
+        setIsLoadingBalances(false)
+        setIsLoadingPrices(false)
+        cancelTeardown()
+        teardownTimer = setTimeout(() => {
+          if (!isDocumentHidden() || sendFromNetworkRef.current !== null) return
+          cleanupRpcPools()
+        }, IDLE_TEARDOWN_MS)
+        return
+      }
+
+      cancelTeardown()
+      refreshEverything()
+      startTimer()
+    }
+
+    if (isDocumentHidden()) {
+      // Mounted in a background tab: issue nothing and wait for the tab to be
+      // looked at rather than firing a fan-out nobody can see. Reading health is
+      // free — it only reflects pools that already exist.
+      refreshRpcHealth()
+    } else {
+      refreshEverything()
+      startTimer()
+    }
+
+    document.addEventListener("visibilitychange", handleVisibilityChange)
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange)
+      stopTimer()
+      cancelTeardown()
+      // Invalidate in-flight work so a late response cannot call setState after
+      // this effect — or the component — has gone away, and abort it so it stops
+      // consuming the network too.
+      balanceRequestId.current += 1
+      priceRequestId.current += 1
+      balanceAbort.current?.abort()
+    }
+  }, [isUnlocked, refreshBalances, refreshPrices, refreshRpcHealth])
+
+  // Release RPC pools when the component goes away for good.
+  useEffect(() => {
+    return () => {
+      cleanupRpcPools()
+    }
+  }, [])
 
   // --- Handlers ---
   const handleAddCustomNetwork = (key: string, network: CustomNetwork) => {
@@ -613,103 +963,125 @@ export default function WalletCard() {
       }
 
       const updatedWallets = [...wallets, newWallet]
+      // Persisted through lib/storage: a bare setItem throws when the quota is
+      // full, which used to abort the import after the wallet was already in
+      // state, leaving the two out of step until the next reload.
+      const write = writeJson(STORAGE_KEYS.LEGACY_WALLETS, updatedWallets)
+      if (!write.ok) {
+        logger.error("Could not persist the imported wallet", { reason: write.reason })
+        setError(write.error)
+        return
+      }
+      writeRaw(STORAGE_KEYS.ACTIVE_WALLET, newWallet.id)
+
       setWallets(updatedWallets)
       setActiveWalletId(newWallet.id)
-      localStorage.setItem(WALLETS_STORAGE_KEY, JSON.stringify(updatedWallets))
-      localStorage.setItem(ACTIVE_WALLET_KEY, newWallet.id)
       setInputValue("")
       setWalletLabel("")
       setIsAddingWallet(false)
     } catch (e) {
       if (isError(e, "INVALID_ARGUMENT")) {
         setError("Invalid mnemonic phrase or private key.")
-      } else if (e instanceof Error) {
-        setError(e.message)
       } else {
-        setError("An unknown error occurred during import.")
+        // Never the raw message: an ethers error routinely embeds the offending
+        // argument, which here is a mnemonic or a private key.
+        logger.warn("Wallet import failed")
+        setError("Invalid mnemonic phrase or private key.")
       }
     }
   }
 
   const handleSelectWallet = (wallet: ImportedWallet) => {
     setActiveWalletId(wallet.id)
-    localStorage.setItem(ACTIVE_WALLET_KEY, wallet.id)
+    writeRaw(STORAGE_KEYS.ACTIVE_WALLET, wallet.id)
   }
 
   const handleDeleteWallet = (walletId: string) => {
     const updatedWallets = wallets.filter((w) => w.id !== walletId)
+    const write = writeJson(STORAGE_KEYS.LEGACY_WALLETS, updatedWallets)
+    if (!write.ok) {
+      logger.error("Could not persist the wallet removal", { reason: write.reason })
+      setError(write.error)
+      return
+    }
     setWallets(updatedWallets)
-    localStorage.setItem(WALLETS_STORAGE_KEY, JSON.stringify(updatedWallets))
 
     if (activeWalletId === walletId) {
       if (updatedWallets.length > 0) {
         setActiveWalletId(updatedWallets[0].id)
-        localStorage.setItem(ACTIVE_WALLET_KEY, updatedWallets[0].id)
+        writeRaw(STORAGE_KEYS.ACTIVE_WALLET, updatedWallets[0].id)
       } else {
         setActiveWalletId(null)
-        localStorage.removeItem(ACTIVE_WALLET_KEY)
+        removeKey(STORAGE_KEYS.ACTIVE_WALLET)
       }
     }
   }
 
   const handleLogout = () => {
-    localStorage.removeItem(WALLETS_STORAGE_KEY)
-    localStorage.removeItem(ACTIVE_WALLET_KEY)
+    removeKey(STORAGE_KEYS.LEGACY_WALLETS)
+    removeKey(STORAGE_KEYS.ACTIVE_WALLET)
     setWallets([])
     setActiveWalletId(null)
     setError("")
     setBalances({})
     setPrices({})
+    // Cancel in-flight work here rather than relying on the scheduler's cleanup.
+    // That cleanup does bump these ids, but it runs as a passive effect, so a
+    // balance response that resolves between this click and the next commit would
+    // still pass its id check and repopulate balances for a wallet that no longer
+    // exists on this device.
+    balanceRequestId.current += 1
+    priceRequestId.current += 1
+    balanceAbort.current?.abort()
+    setIsLoadingBalances(false)
+    setIsLoadingPrices(false)
     setShowLogoutConfirmation(false)
     cleanupRpcPools()
-  }
-
-  const handleCopy = (text: string) => {
-    navigator.clipboard.writeText(text).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 1500)
-    })
   }
 
   const handleSendSuccess = (hash: string) => {
     if (sendFromNetwork) {
       setTxSuccess({ hash, network: sendFromNetwork })
       setSendFromNetwork(null)
-      fetchAllBalances()
+      void refreshBalances()
     }
   }
 
-  // Helper to format USD value
-  const formatUsd = (value: number | null): string => {
-    if (value === null || value === undefined) return "—"
-    if (value >= 1) return `$${value.toFixed(2)}`
-    if (value >= 0.01) return `$${value.toFixed(4)}`
-    return `$${value.toFixed(6)}`
-  }
-
-  // Calculate USD value from balance
-  const getUsdValue = (networkKey: string, balance: string | null): string => {
-    if (!balance) return "—"
+  /**
+   * Fiat value of a balance.
+   *
+   * Converted from exact base units, never from the rounded display string: a
+   * `parseFloat` of "0.00000" reported $0.00 for an account holding dust.
+   *
+   * @param networkKey - Network the balance belongs to.
+   * @param baseUnits - Exact balance in base units, or null when unknown.
+   * @param decimals - Decimals of this network's native unit.
+   */
+  const getFiatValue = (
+    networkKey: string,
+    baseUnits: bigint | null,
+    decimals: number
+  ): string => {
+    if (baseUnits === null) return UNKNOWN_VALUE
     const price = prices[networkKey]
-    if (price === null || price === undefined) return "—"
-    const balanceNum = Number.parseFloat(balance)
-    if (isNaN(balanceNum) || balanceNum === 0) return "$0.00"
-    const usd = balanceNum * price
-    return formatUsd(usd)
+    if (price === null || price === undefined) return UNKNOWN_VALUE
+    return formatFiat(toFiatValue(baseUnits, decimals, price))
   }
 
   // --- Render ---
   if (!isMounted) {
     return (
-      <div className="w-full max-w-lg p-6 bg-white/10 backdrop-blur-md rounded-xl shadow-glass border border-white/20 text-white">
-        <div className="text-center py-8 text-gray-300">Loading wallet...</div>
-      </div>
+      <Card className="w-full max-w-lg">
+        <p className="py-8 text-center text-muted-foreground">Loading wallet...</p>
+      </Card>
     )
   }
 
   if (isUnlocked && activeWallet) {
+    const txExplorerUrl = txSuccess ? getRoutescanUrl(txSuccess.hash, txSuccess.network) : ""
+
     return (
-      <div className="w-full max-w-lg p-6 bg-white/10 backdrop-blur-md rounded-xl shadow-glass border border-white/20 text-white">
+      <Card className="w-full max-w-lg">
         <div className="mb-4">
           <WalletSelector
             wallets={wallets}
@@ -720,186 +1092,220 @@ export default function WalletCard() {
           />
         </div>
 
-        <div className="flex justify-between items-center mb-4">
-          <h2 className="text-xl font-bold">Wallet Dashboard</h2>
-          <div className="flex items-center gap-2">
-            <button
+        <CardHeader className="items-center">
+          <CardTitle>Wallet Dashboard</CardTitle>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-11 w-11"
               onClick={() => setShowBookmarkManager(true)}
-              className="text-gray-400 hover:text-white transition-colors p-1"
               title="Manage Address Bookmarks"
+              aria-label="Manage address bookmarks"
             >
-              <BookmarkIcon size={20} />
-            </button>
-            <button
+              <BookmarkIcon size={20} aria-hidden="true" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-11 w-11"
               onClick={() => setShowBackupManager(true)}
-              className="text-gray-400 hover:text-white transition-colors p-1"
               title="Backup & Restore Data"
+              aria-label="Backup and restore data"
             >
-              <FileJson size={20} />
-            </button>
-            <div className="flex items-center bg-black/20 p-1 rounded-lg text-sm font-semibold">
-              <button
-                onClick={() => setNetworkView("mainnet")}
-                className={`px-4 py-1 rounded-md transition-colors ${
-                  networkView === "mainnet" ? "bg-purple-600" : ""
-                }`}
-              >
-                Mainnets
-              </button>
-              <button
-                onClick={() => setNetworkView("testnet")}
-                className={`px-4 py-1 rounded-md transition-colors ${
-                  networkView === "testnet" ? "bg-purple-600" : ""
-                }`}
-              >
-                Testnets
-              </button>
-            </div>
+              <FileJson size={20} aria-hidden="true" />
+            </Button>
           </div>
-        </div>
+        </CardHeader>
 
-        <div className="bg-black/25 p-4 rounded-lg mb-4">
-          <div className="flex justify-between items-center mb-2">
-            <h3 className="text-lg font-bold capitalize">{networkView} Balances</h3>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => setShowAddRpc(true)}
-                className="text-gray-400 hover:text-white transition-colors"
-                title="Add Custom RPC"
-              >
-                <Plus size={20} />
-              </button>
-              <button
-                onClick={() => {
-                  fetchAllBalances()
-                  fetchPrices()
-                }}
-                disabled={isLoadingBalances || isLoadingPrices}
-                className="text-gray-400 hover:text-white transition-colors disabled:opacity-50"
-                title="Refresh balances and prices"
-              >
-                <RefreshCw size={20} className={(isLoadingBalances || isLoadingPrices) ? "animate-spin" : ""} />
-              </button>
-            </div>
-          </div>
-          <div className="space-y-2 max-h-80 overflow-y-auto">
-            {isLoadingBalances && (
-              <div className="flex justify-center py-4">
-                <Loader2 className="animate-spin text-purple-400" size={24} />
+        {/* Was a pair of plain buttons with no roving tabindex and no arrow-key
+            support; Tabs implements the WAI-ARIA pattern. */}
+        <Tabs
+          items={NETWORK_TABS}
+          value={networkView}
+          onChange={setNetworkView}
+          label="Network type"
+          layoutGroupId="wallet-networks"
+          className="mb-4"
+        />
+
+        <TabPanel id={networkView}>
+          <Card variant="inset" padding="sm" className="mb-4">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <h3 className="text-base font-semibold capitalize">{networkView} Balances</h3>
+              <div className="flex shrink-0 items-center gap-1">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-11 w-11"
+                  onClick={() => setShowAddRpc(true)}
+                  title="Add Custom RPC"
+                  aria-label="Add custom RPC network"
+                >
+                  <Plus size={20} aria-hidden="true" />
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-11 w-11"
+                  onClick={() => {
+                    void refreshBalances()
+                    void refreshPrices()
+                  }}
+                  disabled={isLoadingBalances || isLoadingPrices}
+                  title="Refresh balances and prices"
+                  aria-label="Refresh balances and prices"
+                >
+                  <RefreshCw
+                    size={20}
+                    aria-hidden="true"
+                    className={isLoadingBalances || isLoadingPrices ? "animate-spin" : ""}
+                  />
+                </Button>
               </div>
-            )}
-            {!isLoadingBalances &&
-              displayedNetworks.map(([key, networkInfo]) => {
-                const networkKey = key as NetworkType
-                const balanceInfo = balances[networkKey]
-                const canSend = balanceInfo?.balance && Number.parseFloat(balanceInfo.balance) > 0
-                const isCustom = "isCustom" in networkInfo && networkInfo.isCustom
-                const health = rpcHealth[networkKey]
-                const isHealthy = health?.healthy ?? true
-                const isMainnet = networkInfo.type === "mainnet"
-                const usdValue = isMainnet ? getUsdValue(networkKey, balanceInfo?.balance ?? null) : null
+            </div>
+            <div className="max-h-80 space-y-2 overflow-y-auto">
+              {/* Skeletons only while there is genuinely nothing cached. Swapping
+                  the whole list for placeholders on every 30-second refresh blanked
+                  out data that was already on screen and correct. */}
+              {showBalanceSkeleton ? (
+                <SkeletonList rows={5} label="Loading balances" />
+              ) : (
+                displayedNetworks.map(([key, networkInfo]) => {
+                  const networkKey = key as NetworkType
+                  const balanceInfo = balances[networkKey]
+                  const baseUnits = balanceInfo?.baseUnits ?? null
+                  // Decided on exact base units, never on the display string.
+                  const canSend = baseUnits !== null && isNonZeroAmount(baseUnits)
+                  const isCustom = "isCustom" in networkInfo && networkInfo.isCustom
+                  const health = rpcHealth[networkKey]
+                  // Optimistic until the pool has actually reported: a network with
+                  // no recorded request outcome yet is not known to be down.
+                  const isHealthy = health?.usable ?? true
+                  // An em dash, never "0ms": null means never measured, and a
+                  // rendered zero would read as an impossibly fast endpoint.
+                  const latencyLabel =
+                    health === undefined
+                      ? null
+                      : health.bestLatencyMs === null
+                        ? UNKNOWN_VALUE
+                        : `${Math.round(health.bestLatencyMs)}ms`
+                  const isMainnet = networkInfo.type === "mainnet"
+                  // Per-network decimals: Arc's native unit is USDC at 6, so a
+                  // hardcoded 18 understated it by a factor of a trillion.
+                  const decimals = balanceInfo?.decimals ?? getNativeDecimals(networkKey)
+                  const fiatValue = isMainnet
+                    ? getFiatValue(networkKey, baseUnits, decimals)
+                    : null
+                  const displayBalance =
+                    baseUnits !== null
+                      ? formatBalanceForDisplay(baseUnits, decimals)
+                      : UNKNOWN_VALUE
 
-                return (
-                  <div key={key} className="flex justify-between items-center bg-black/20 p-3 rounded-md">
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <Circle
-                          size={10}
-                          className={`${isHealthy ? "text-green-400 fill-green-400" : "text-red-400 fill-red-400"}`}
-                          aria-label={isHealthy ? "RPC healthy" : "RPC unhealthy"}
-                          role="img"
-                        />
-                        <span className="font-semibold truncate">{networkInfo.name}</span>
-                        {isCustom && <span className="text-xs bg-purple-600/50 px-1.5 py-0.5 rounded">Custom</span>}
-                      </div>
-                      {balanceInfo?.error ? (
-                        <p className="text-red-400 text-xs">Error: {balanceInfo.error}</p>
-                      ) : (
-                        <div>
-                          <p className="font-mono text-sm">
-                            {balanceInfo?.balance ?? "0.00000"} {networkInfo.currency}
-                          </p>
-                          {isMainnet && (
-                            <p className="text-xs text-gray-400">
-                              {isLoadingPrices ? "Loading price..." : usdValue}
-                            </p>
-                          )}
+                  return (
+                    <div
+                      key={key}
+                      className="flex items-center justify-between gap-2 rounded-md bg-muted/40 p-3"
+                    >
+                      <div className="min-w-0 flex-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="truncate font-semibold">{networkInfo.name}</span>
+                          {/* Colour alone conveyed RPC health before, which is
+                              invisible to a colourblind or screen-reader user. */}
+                          <Badge tone={isHealthy ? "success" : "danger"} dot>
+                            {isHealthy ? "Live" : "Down"}
+                            <span className="sr-only"> RPC</span>
+                            {latencyLabel !== null && (
+                              <span className="font-normal opacity-80">
+                                <span className="sr-only">, best latency </span>
+                                {latencyLabel}
+                              </span>
+                            )}
+                          </Badge>
+                          {isCustom && <Badge tone="primary">Custom</Badge>}
                         </div>
-                      )}
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {isCustom && (
-                        <button
-                          onClick={() => handleRemoveCustomNetwork(key)}
-                          className="text-red-400 hover:text-red-300 transition-colors p-1"
-                          title="Remove network"
+                        {balanceInfo?.error ? (
+                          // Per-row failure: one unreachable network no longer
+                          // takes the whole batch, and the next tick retries it.
+                          // Not a live region — with twenty rows refreshing on a
+                          // timer, that would announce continuously.
+                          <p className="text-xs text-destructive">{balanceInfo.error}</p>
+                        ) : (
+                          <div>
+                            {/* An em dash, not a zero: an unloaded balance must not
+                                look like an empty account. */}
+                            <p className="break-all font-mono text-sm">
+                              {displayBalance} {networkInfo.currency}
+                            </p>
+                            {isMainnet && (
+                              <p className="text-xs text-muted-foreground">
+                                {isLoadingPrices ? "Loading price..." : fiatValue}
+                              </p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex shrink-0 items-center gap-1">
+                        {isCustom && (
+                          <Button
+                            variant="ghost"
+                            size="icon"
+                            className="h-11 w-11 hover:text-destructive"
+                            onClick={() => handleRemoveCustomNetwork(key)}
+                            title="Remove network"
+                            aria-label={`Remove network ${networkInfo.name}`}
+                          >
+                            <Trash2 size={16} aria-hidden="true" />
+                          </Button>
+                        )}
+                        <Button
+                          variant="success"
+                          size="sm"
+                          onClick={() => setSendFromNetwork(networkKey)}
+                          disabled={!canSend}
+                          icon={<Send size={14} aria-hidden="true" />}
+                          aria-label={`Send ${networkInfo.currency} on ${networkInfo.name}`}
                         >
-                          <Trash2 size={16} />
-                        </button>
-                      )}
-                      <button
-                        onClick={() => setSendFromNetwork(networkKey)}
-                        disabled={!canSend}
-                        className="bg-green-600 text-white font-bold py-1 px-3 rounded-lg hover:bg-green-700 transition-colors disabled:bg-gray-500 disabled:cursor-not-allowed flex items-center text-sm"
-                      >
-                        <Send size={14} className="mr-1.5" /> Send
-                      </button>
+                          Send
+                        </Button>
+                      </div>
                     </div>
-                  </div>
-                )
-              })}
-          </div>
-        </div>
+                  )
+                })
+              )}
+            </div>
+          </Card>
+        </TabPanel>
 
         {/* Buttons */}
-        <div className="grid grid-cols-2 gap-4 mb-6">
-          <button
-            onClick={() => setShowReceive(true)}
-            className="bg-blue-600 w-full font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-colors"
-          >
+        <div className="mb-6 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Button onClick={() => setShowReceive(true)} fullWidth>
             Receive
-          </button>
-          <button
-            onClick={() => setShowLogoutConfirmation(true)}
-            className="bg-red-600 w-full font-bold py-3 px-4 rounded-lg hover:bg-red-700 transition-colors"
-          >
+          </Button>
+          <Button variant="danger" onClick={() => setShowLogoutConfirmation(true)} fullWidth>
             Logout All
-          </button>
+          </Button>
         </div>
 
         {/* Wallet Info */}
-        <div className="space-y-3 mt-4">
-          <div>
-            <label className="text-sm font-bold text-gray-300 flex items-center">
-              Address{" "}
-              <Copy
-                onClick={() => handleCopy(activeWallet.address)}
-                size={16}
-                className="ml-2 cursor-pointer hover:text-white"
+        <div className="mt-4 space-y-4">
+          <div className="space-y-1.5">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-sm font-medium text-foreground">Address</span>
+              <CopyButton
+                value={activeWallet.address}
+                label="address"
+                className="h-11 w-11 justify-center"
               />
-            </label>
-            <p className="text-sm text-green-400 break-all bg-black/20 p-2 rounded-lg font-mono">
+            </div>
+            <p className="break-all rounded-lg border border-border bg-muted/40 p-3 font-mono text-sm">
               {activeWallet.address}
             </p>
           </div>
-          <div>
-            <label className="text-sm font-bold text-gray-300">Private Key</label>
-            <div className="relative">
-              <p
-                className={`text-sm text-orange-400 break-all bg-black/20 p-2 rounded-lg font-mono ${
-                  isMasked ? "blur-sm" : ""
-                }`}
-              >
-                {activeWallet.privateKey}
-              </p>
-              <button
-                onClick={() => setIsMasked(!isMasked)}
-                className="absolute top-1/2 right-2 -translate-y-1/2 text-gray-400 hover:text-white"
-              >
-                {isMasked ? <Eye size={18} /> : <EyeOff size={18} />}
-              </button>
-            </div>
-          </div>
+
+          {/* Was plaintext under a `blur-sm` filter, so the key stayed in the DOM
+              and was readable via DevTools, select-all, or a screen reader. */}
+          <SecretField label="Private key" value={activeWallet.privateKey} allowCopy />
         </div>
 
         {/* Modals */}
@@ -921,28 +1327,27 @@ export default function WalletCard() {
           onClose={() => setShowBackupManager(false)}
         />
 
-        {showLogoutConfirmation && (
-          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
-            <div className="bg-gray-800 p-6 rounded-2xl shadow-lg text-center w-full max-w-sm mx-4">
-              <h3 className="text-lg font-bold mb-4">Confirm Logout</h3>
-              <p className="text-gray-300 mb-6">
-                Are you sure? This will remove all {wallets.length} wallet{wallets.length > 1 ? "s" : ""} from this
-                device.
-              </p>
-              <div className="flex justify-center gap-4">
-                <button
-                  onClick={() => setShowLogoutConfirmation(false)}
-                  className="bg-gray-600 font-bold py-2 px-6 rounded-lg hover:bg-gray-700"
-                >
-                  Cancel
-                </button>
-                <button onClick={handleLogout} className="bg-red-600 font-bold py-2 px-6 rounded-lg hover:bg-red-700">
-                  Logout All
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
+        <ResponsiveDialog
+          isOpen={showLogoutConfirmation}
+          onClose={() => setShowLogoutConfirmation(false)}
+          title="Confirm Logout"
+          size="sm"
+          footer={
+            <>
+              <Button variant="secondary" onClick={() => setShowLogoutConfirmation(false)}>
+                Cancel
+              </Button>
+              <Button variant="danger" onClick={handleLogout}>
+                Logout All
+              </Button>
+            </>
+          }
+        >
+          <p className="text-sm text-muted-foreground">
+            Are you sure? This will remove all {wallets.length} wallet
+            {wallets.length > 1 ? "s" : ""} from this device.
+          </p>
+        </ResponsiveDialog>
 
         {sendFromNetwork && (
           <SendForm
@@ -954,130 +1359,157 @@ export default function WalletCard() {
         )}
 
         {txSuccess && (
-          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
-            <div className="bg-gray-800 p-6 rounded-2xl shadow-lg text-center w-full max-w-sm mx-4">
-              <h3 className="text-lg font-bold mb-2 text-green-400">Transaction Sent!</h3>
-              <p className="text-sm font-mono break-all bg-black/30 p-2 rounded-lg mb-4">{txSuccess.hash}</p>
+          <ResponsiveDialog
+            isOpen
+            onClose={() => setTxSuccess(null)}
+            title="Transaction Sent!"
+            size="sm"
+            footer={
+              <Button variant="secondary" onClick={() => setTxSuccess(null)} fullWidth>
+                Close
+              </Button>
+            }
+          >
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-sm font-medium text-foreground">Transaction hash</span>
+                <CopyButton
+                  value={txSuccess.hash}
+                  label="transaction hash"
+                  className="h-11 w-11 justify-center"
+                />
+              </div>
+              <p className="break-all rounded-lg border border-border bg-muted/40 p-3 font-mono text-sm">
+                {txSuccess.hash}
+              </p>
+            </div>
+
+            {/* An <a href=""> reloads the page, so the link is only rendered when
+                the network actually has an explorer configured. */}
+            {txExplorerUrl ? (
               <a
-                href={getRoutescanUrl(txSuccess.hash, txSuccess.network)}
+                href={txExplorerUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="text-blue-400 hover:underline mb-4 block"
+                className="inline-flex min-h-[44px] items-center text-sm font-semibold text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
               >
                 View on Explorer
               </a>
-              <button
-                onClick={() => setTxSuccess(null)}
-                className="bg-gray-600 w-full font-bold py-2 px-4 rounded-lg hover:bg-gray-700"
-              >
-                Close
-              </button>
-            </div>
-          </div>
+            ) : (
+              <p className="text-sm text-muted-foreground">
+                This network has no explorer configured, so there is no link to open.
+              </p>
+            )}
+          </ResponsiveDialog>
         )}
 
-        {showReceive && (
-          <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
-            <div className="bg-gray-800 p-6 rounded-2xl shadow-lg text-center w-full max-w-sm mx-4">
-              <h3 className="text-lg font-bold mb-2">Your Wallet Address</h3>
-              <p className="text-sm text-gray-400 mb-2">{activeWallet.label}</p>
-              <div className="bg-white p-4 rounded-lg mb-4 inline-block">
-                <QRCodeSVG value={activeWallet.address} size={160} />
-              </div>
-              <p className="text-sm font-mono break-all bg-black/30 p-2 rounded-lg mb-4">{activeWallet.address}</p>
-              <button
-                onClick={() => handleCopy(activeWallet.address)}
-                className="w-full bg-blue-600 font-bold py-2 px-4 rounded-lg hover:bg-blue-700 mb-2 flex items-center justify-center"
-              >
-                {copied ? (
-                  <>
-                    <Check size={20} className="mr-2" /> Copied
-                  </>
-                ) : (
-                  <>
-                    <Copy size={20} className="mr-2" /> Copy Address
-                  </>
-                )}
-              </button>
-              <button
-                onClick={() => setShowReceive(false)}
-                className="bg-gray-600 w-full font-bold py-2 px-4 rounded-lg hover:bg-gray-700"
-              >
-                Close
-              </button>
+        <ResponsiveDialog
+          isOpen={showReceive}
+          onClose={() => setShowReceive(false)}
+          title="Your Wallet Address"
+          description={activeWallet.label}
+          size="sm"
+          footer={
+            <Button variant="secondary" onClick={() => setShowReceive(false)} fullWidth>
+              Close
+            </Button>
+          }
+        >
+          <div className="flex flex-col items-center gap-4">
+            {/* Fixed light plate: QR scanners expect dark-on-light, so this one
+                surface must not follow the theme. */}
+            <div className="rounded-lg bg-white p-4">
+              <QRCodeSVG value={activeWallet.address} size={160} />
             </div>
+            <p className="w-full break-all rounded-lg border border-border bg-muted/40 p-3 text-center font-mono text-sm">
+              {activeWallet.address}
+            </p>
+            <CopyButton
+              value={activeWallet.address}
+              label="address"
+              showText
+              className="min-h-[44px] px-3"
+            />
           </div>
-        )}
-      </div>
+        </ResponsiveDialog>
+      </Card>
     )
   }
 
   // --- Import View ---
   return (
-    <div className="w-full max-w-lg p-6 bg-white/10 backdrop-blur-md rounded-xl shadow-glass border border-white/20 text-white">
-      <h2 className="text-xl font-bold text-center mb-2">
+    <Card className="w-full max-w-lg">
+      <CardTitle className="text-center">
         {wallets.length > 0 ? "Add Another Wallet" : "Import Existing Wallet"}
-      </h2>
-      <p className="text-sm text-gray-400 text-center mb-4">Use a 12, 18, 24-word mnemonic or a private key.</p>
+      </CardTitle>
+      <p className="mb-4 mt-1 text-center text-sm text-muted-foreground">
+        Use a 12, 18, 24-word mnemonic or a private key.
+      </p>
 
-      <div className="mb-4">
-        <label className="text-sm text-gray-300 block mb-1">Wallet Label (optional)</label>
-        <input
-          type="text"
-          value={walletLabel}
-          onChange={(e) => setWalletLabel(e.target.value)}
-          placeholder={`Wallet ${wallets.length + 1}`}
-          className="w-full p-3 bg-black/20 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 transition-shadow"
-        />
-      </div>
+      <div className="space-y-4">
+        <Field label="Wallet Label" hint="Optional.">
+          {(props) => (
+            <input
+              {...props}
+              type="text"
+              value={walletLabel}
+              onChange={(e) => setWalletLabel(e.target.value)}
+              placeholder={`Wallet ${wallets.length + 1}`}
+              className={inputClassName}
+            />
+          )}
+        </Field>
 
-      <div className="relative mb-4">
-        <textarea
-          value={inputValue}
-          onChange={(e) => setInputValue(e.target.value)}
-          placeholder="Enter your mnemonic phrase or private key..."
-          className="w-full h-28 p-3 bg-black/20 rounded-lg text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-purple-500 transition-shadow resize-none"
-        />
-        <div className="absolute bottom-3 right-3 text-xs text-gray-400">
-          {inputValue.trim() &&
-            (isMnemonic ? (
-              <span className="text-green-400">{wordCount} words (Mnemonic)</span>
-            ) : (
-              <span className="text-yellow-400">Private Key</span>
-            ))}
-        </div>
-      </div>
-      {error && <p className="text-red-400 text-sm mt-2 mb-2 text-center">{error}</p>}
-
-      <div className="flex gap-3">
-        {wallets.length > 0 && (
-          <button
-            onClick={() => {
-              setIsAddingWallet(false)
-              setInputValue("")
-              setWalletLabel("")
-              setError("")
-            }}
-            className="flex-1 bg-gray-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-gray-700 transition-colors"
-          >
-            Cancel
-          </button>
-        )}
-        <button
-          onClick={handleImport}
-          className="flex-1 bg-purple-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-purple-700 transition-colors"
+        <Field
+          label="Mnemonic phrase or private key"
+          required
+          action={
+            inputValue.trim() ? (
+              <Badge tone={isMnemonic ? "success" : "warning"}>
+                {isMnemonic ? `${wordCount} words (Mnemonic)` : "Private Key"}
+              </Badge>
+            ) : undefined
+          }
         >
-          Import Wallet
-        </button>
-      </div>
+          {(props) => (
+            <textarea
+              {...props}
+              {...secretInputProps}
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              placeholder="Enter your mnemonic phrase or private key..."
+              className={cn(monoInputClassName, "h-28 resize-none")}
+            />
+          )}
+        </Field>
 
-      <div className="bg-yellow-500/10 border border-yellow-500 text-yellow-300 text-sm p-3 rounded-lg mt-4 flex">
-        <AlertTriangle size={42} className="mr-3 flex-shrink-0" />
-        <p>
-          <strong>Security Warning:</strong> This tool is intended for development and testing. Do not use a wallet
-          containing substantial funds.
-        </p>
+        {error && <Alert tone="danger">{error}</Alert>}
+
+        <div className="flex flex-col gap-3 sm:flex-row">
+          {wallets.length > 0 && (
+            <Button
+              variant="secondary"
+              fullWidth
+              onClick={() => {
+                setIsAddingWallet(false)
+                setInputValue("")
+                setWalletLabel("")
+                setError("")
+              }}
+            >
+              Cancel
+            </Button>
+          )}
+          <Button fullWidth onClick={handleImport}>
+            Import Wallet
+          </Button>
+        </div>
+
+        <Alert tone="warning" title="Security warning">
+          This tool is intended for development and testing. Do not use a wallet containing
+          substantial funds.
+        </Alert>
       </div>
-    </div>
+    </Card>
   )
 }

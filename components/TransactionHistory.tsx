@@ -3,16 +3,47 @@
 import { useState, useEffect, useCallback, useMemo } from "react"
 import {
   getTransactionHistory,
-  getTransactionHistoryData,
-  deleteTransactionByHash,
+  deleteTransactionById,
   type Transaction,
+  type TransactionStatus,
 } from "@/lib/transactionHistory"
 import { getRoutescanUrl } from "@/lib/ethers"
-import { ChevronLeft, ChevronRight, Trash2, ExternalLink } from "lucide-react"
+import { APP_EVENTS, onAppEvent } from "@/lib/appEvents"
+import { STORAGE_KEYS } from "@/lib/storage"
+import { formatTimestamp, truncateHex } from "@/lib/format"
+import { ChevronLeft, ChevronRight, Trash2, ExternalLink, Receipt } from "lucide-react"
+import Card, { CardHeader, CardTitle } from "./ui/Card"
+import Button from "./ui/Button"
+import Badge, { type BadgeTone } from "./ui/Badge"
+import { EmptyState } from "./ui/Feedback"
+import { SkeletonList } from "./ui/Skeleton"
+import { confirmAction, notify } from "./ui/Toast"
+import { cn } from "@/lib/utils"
 
 interface TransactionHistoryProps {
   /** Optional filter by network */
   network?: string
+}
+
+/** Records rendered per page. Only this many rows ever reach the DOM. */
+const PAGE_SIZE = 10
+
+/**
+ * Status tone lookup.
+ *
+ * A status was previously conveyed by a hardcoded colour pair, so it inverted
+ * badly in a light theme and read as nothing at all to a colourblind user. The
+ * badge pairs the tone with the status text.
+ *
+ * `"unknown"` is a real state, not a fallback: it means the transaction was
+ * broadcast but no receipt could be obtained. Rendering it as success would
+ * claim more than the app knows, so it gets its own neutral tone.
+ */
+const STATUS_TONE: Record<TransactionStatus, BadgeTone> = {
+  success: "success",
+  pending: "warning",
+  failed: "danger",
+  unknown: "neutral",
 }
 
 export default function TransactionHistory({ network }: TransactionHistoryProps = {}) {
@@ -21,49 +52,57 @@ export default function TransactionHistory({ network }: TransactionHistoryProps 
   const [totalPages, setTotalPages] = useState(1)
   const [totalItems, setTotalItems] = useState(0)
   const [isLoading, setIsLoading] = useState(true)
-  const [limit] = useState(10) // Items per page
 
-  // Load transactions function
+  /**
+   * Load one page.
+   *
+   * The network filter is applied inside `getTransactionHistory`, before the
+   * slice. Filtering the slice afterwards — as this component used to — made the
+   * header read "5 transactions" above an empty list, because the totals came
+   * from the filtered set while the rows came from an unfiltered page.
+   */
   const loadTransactions = useCallback(() => {
     setIsLoading(true)
-    const { data, totalItems, totalPages } = getTransactionHistory(currentPage, limit)
-    // If network filter is provided, filter the data client-side
-    const filteredData = network
-      ? data.filter((tx) => tx.network === network)
-      : data
-    setTransactions(filteredData)
-    // If filtering, we need to recalc total pages from all data
-    if (network) {
-      const all = getTransactionHistoryData()
-      const filteredAll = all.filter((tx) => tx.network === network)
-      const filteredTotalPages = Math.ceil(filteredAll.length / limit) || 1
-      setTotalPages(filteredTotalPages)
-      setTotalItems(filteredAll.length)
-    } else {
-      setTotalPages(totalPages)
-      setTotalItems(totalItems)
-    }
+    const page = getTransactionHistory(currentPage, PAGE_SIZE, network)
+    setTransactions(page.data)
+    setTotalPages(page.totalPages)
+    setTotalItems(page.totalItems)
+    // The library clamps the requested page into range. Adopting the clamped
+    // value is what stops a deletion that shrinks the list from leaving the user
+    // on a blank page with a disabled Next button.
+    if (page.page !== currentPage) setCurrentPage(page.page)
     setIsLoading(false)
-  }, [currentPage, limit, network])
+  }, [currentPage, network])
 
   // Initial load
   useEffect(() => {
     loadTransactions()
   }, [loadTransactions])
 
-  // Listen for custom event when transaction history is updated
+  // Reload when history changes in this tab, when a backup is restored, or when
+  // another tab writes to storage.
   useEffect(() => {
-    const handleUpdate = () => {
+    const handleUpdate = (): void => {
       loadTransactions()
     }
-    // Listen for custom event
-    window.addEventListener("transactionHistoryUpdated", handleUpdate)
-    // Also listen for storage events from other tabs
-    window.addEventListener("storage", handleUpdate)
+
+    const unsubscribeHistory = onAppEvent(APP_EVENTS.TRANSACTIONS_CHANGED, handleUpdate)
+    const unsubscribeRestore = onAppEvent(APP_EVENTS.DATA_RESTORED, handleUpdate)
+
+    // `storage` fires only in other tabs, so this is the cross-tab path.
+    const handleStorage = (event: StorageEvent): void => {
+      // Ignore writes to unrelated keys; the handler otherwise runs on every
+      // storage mutation the origin makes.
+      if (event.key === null || event.key === STORAGE_KEYS.TRANSACTION_HISTORY) {
+        loadTransactions()
+      }
+    }
+    window.addEventListener("storage", handleStorage)
 
     return () => {
-      window.removeEventListener("transactionHistoryUpdated", handleUpdate)
-      window.removeEventListener("storage", handleUpdate)
+      unsubscribeHistory()
+      unsubscribeRestore()
+      window.removeEventListener("storage", handleStorage)
     }
   }, [loadTransactions])
 
@@ -73,38 +112,33 @@ export default function TransactionHistory({ network }: TransactionHistoryProps 
     setCurrentPage(page)
   }
 
-  // Handle delete transaction
-  const handleDelete = (hash: string) => {
-    if (confirm("Are you sure you want to delete this transaction record?")) {
-      deleteTransactionByHash(hash)
-      // The event will trigger reload, but we also call load to update immediately
-      loadTransactions()
-    }
-  }
+  /**
+   * Delete one record.
+   *
+   * Keyed by id, not hash: duplicate hashes are possible, and the hash-based
+   * delete removed every record that shared one.
+   */
+  const handleDelete = async (id: string) => {
+    const confirmed = await confirmAction({
+      message: "Are you sure you want to delete this transaction record?",
+      confirmLabel: "Delete",
+    })
+    if (!confirmed) return
 
-  // Format timestamp
-  const formatTimestamp = (ts: number) => {
-    const date = new Date(ts)
-    return date.toLocaleString()
-  }
-
-  // Get status badge class
-  const getStatusBadgeClass = (status: Transaction["status"]) => {
-    switch (status) {
-      case "success":
-        return "bg-green-500/20 text-green-400"
-      case "pending":
-        return "bg-yellow-500/20 text-yellow-400"
-      case "failed":
-        return "bg-red-500/20 text-red-400"
-      default:
-        return "bg-gray-500/20 text-gray-400"
+    const result = deleteTransactionById(id)
+    if (!result.ok) {
+      // Storage can refuse a write when the quota is full, so a delete is not
+      // guaranteed to land. Saying so beats a row that silently reappears.
+      notify.error("Could not delete that record", result.error)
     }
+    // The library dispatches an update event on success, but reload regardless so
+    // a failed delete still re-syncs the list with what is actually stored.
+    loadTransactions()
   }
 
   // Generate page numbers for pagination (with ellipsis for large sets)
   const pageNumbers = useMemo(() => {
-    const pages = []
+    const pages: (number | string)[] = []
     const total = totalPages
     if (total <= 7) {
       for (let i = 1; i <= total; i++) {
@@ -129,123 +163,156 @@ export default function TransactionHistory({ network }: TransactionHistoryProps 
   }, [currentPage, totalPages])
 
   return (
-    <div className="w-full max-w-4xl mx-auto mt-6 p-4 bg-white/5 backdrop-blur-sm rounded-xl border border-white/10">
-      <div className="flex justify-between items-center mb-4">
-        <h3 className="text-lg font-bold text-white">Transaction History</h3>
-        <span className="text-sm text-gray-400">
+    <Card className="mx-auto mt-6 w-full max-w-4xl">
+      <CardHeader className="items-center">
+        <CardTitle as="h3">Transaction History</CardTitle>
+        <span className="shrink-0 text-sm text-muted-foreground">
           {totalItems} transaction{totalItems !== 1 ? "s" : ""}
         </span>
-      </div>
+      </CardHeader>
 
       {isLoading ? (
-        <div className="flex justify-center py-8">
-          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-purple-400"></div>
-        </div>
+        <SkeletonList rows={4} label="Loading transaction history" />
       ) : transactions.length === 0 ? (
-        <div className="text-center py-8 text-gray-400">
-          No transactions found. Send some funds to start tracking history.
-        </div>
+        <EmptyState
+          title="No transactions found"
+          description="Send some funds to start tracking history."
+          icon={<Receipt size={20} aria-hidden="true" />}
+        />
       ) : (
         <>
-          {/* Transaction List */}
-          <div className="space-y-2 mb-4 max-h-96 overflow-y-auto">
-            {transactions.map((tx) => (
-              <div
-                key={tx.hash}
-                className="flex flex-col sm:flex-row sm:items-center justify-between p-3 bg-black/20 rounded-lg hover:bg-black/30 transition-colors"
-              >
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <span className="text-sm font-mono text-gray-300 truncate">
-                      {tx.hash.slice(0, 10)}...{tx.hash.slice(-8)}
-                    </span>
-                    <span
-                      className={`text-xs px-2 py-0.5 rounded-full ${getStatusBadgeClass(
-                        tx.status
-                      )}`}
+          {/* One page of records, never the whole retained history. */}
+          <ul className="mb-4 max-h-96 space-y-2 overflow-y-auto">
+            {transactions.map((tx) => {
+              // Can be "" when the network has no configured explorer, and an
+              // <a href=""> reloads the current page instead of navigating.
+              const explorerUrl = getRoutescanUrl(tx.hash, tx.network)
+
+              return (
+                // Keyed by id, not hash: two records can share a hash, and
+                // duplicate React keys drop rows from the rendered list.
+                <li
+                  key={tx.id}
+                  className="flex flex-col justify-between gap-2 rounded-lg bg-muted/40 p-3 transition-colors hover:bg-muted/60 sm:flex-row sm:items-center"
+                >
+                  <div className="min-w-0 flex-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="break-all font-mono text-sm text-foreground">
+                        {truncateHex(tx.hash, 10, 8)}
+                      </span>
+                      <Badge tone={STATUS_TONE[tx.status]} dot pulse={tx.status === "pending"}>
+                        {tx.status}
+                      </Badge>
+                    </div>
+                    <div className="mt-1 flex flex-wrap items-center gap-x-4 text-xs text-muted-foreground">
+                      <span>{truncateHex(tx.from)}</span>
+                      <span aria-hidden="true">→</span>
+                      <span>{truncateHex(tx.to)}</span>
+                      <span>
+                        {tx.amount} {tx.currency}
+                      </span>
+                      <span>on {tx.network}</span>
+                      <span>{formatTimestamp(tx.timestamp)}</span>
+                    </div>
+                  </div>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {explorerUrl ? (
+                      <a
+                        href={explorerUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className={cn(
+                          "inline-flex h-11 w-11 items-center justify-center rounded-lg",
+                          "text-info transition-colors hover:bg-secondary",
+                          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                        )}
+                        title="View on explorer"
+                      >
+                        <ExternalLink size={16} aria-hidden="true" />
+                        <span className="sr-only">View transaction on explorer</span>
+                      </a>
+                    ) : (
+                      <span
+                        className="inline-flex h-11 w-11 items-center justify-center rounded-lg text-muted-foreground/40"
+                        title="No explorer is configured for this network"
+                      >
+                        <ExternalLink size={16} aria-hidden="true" />
+                        <span className="sr-only">
+                          Explorer unavailable for {tx.network}
+                        </span>
+                      </span>
+                    )}
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-11 w-11 hover:text-destructive"
+                      onClick={() => handleDelete(tx.id)}
+                      title="Delete record"
+                      aria-label={`Delete record for transaction ${tx.hash}`}
                     >
-                      {tx.status}
-                    </span>
+                      <Trash2 size={16} aria-hidden="true" />
+                    </Button>
                   </div>
-                  <div className="flex flex-wrap items-center gap-x-4 text-xs text-gray-400 mt-1">
-                    <span>
-                      {tx.from.slice(0, 6)}...{tx.from.slice(-4)}
-                    </span>
-                    <span>→</span>
-                    <span>
-                      {tx.to.slice(0, 6)}...{tx.to.slice(-4)}
-                    </span>
-                    <span>
-                      {tx.amount} {tx.currency}
-                    </span>
-                    <span>on {tx.network}</span>
-                    <span>{formatTimestamp(tx.timestamp)}</span>
-                  </div>
-                </div>
-                <div className="flex items-center gap-2 mt-2 sm:mt-0">
-                  <a
-                    href={getRoutescanUrl(tx.hash, tx.network)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-blue-400 hover:text-blue-300 p-1"
-                    title="View on explorer"
-                  >
-                    <ExternalLink size={16} />
-                  </a>
-                  <button
-                    onClick={() => handleDelete(tx.hash)}
-                    className="text-red-400 hover:text-red-300 p-1"
-                    title="Delete record"
-                  >
-                    <Trash2 size={16} />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
+                </li>
+              )
+            })}
+          </ul>
 
           {/* Pagination */}
           {totalPages > 1 && (
-            <div className="flex items-center justify-center gap-1 flex-wrap">
-              <button
+            <nav
+              aria-label="Transaction history pages"
+              className="flex flex-wrap items-center justify-center gap-1"
+            >
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-11 w-11"
                 onClick={() => handlePageChange(currentPage - 1)}
                 disabled={currentPage === 1}
-                className="p-2 rounded-lg bg-black/20 text-gray-300 hover:bg-black/40 disabled:opacity-50 disabled:cursor-not-allowed"
+                aria-label="Previous page"
               >
-                <ChevronLeft size={18} />
-              </button>
+                <ChevronLeft size={18} aria-hidden="true" />
+              </Button>
 
               {pageNumbers.map((page, index) =>
                 typeof page === "number" ? (
-                  <button
+                  <Button
                     key={index}
+                    variant={currentPage === page ? "primary" : "ghost"}
+                    size="icon"
+                    className="h-11 w-11"
                     onClick={() => handlePageChange(page)}
-                    className={`w-9 h-9 rounded-lg text-sm font-medium transition-colors ${
-                      currentPage === page
-                        ? "bg-purple-600 text-white"
-                        : "bg-black/20 text-gray-300 hover:bg-black/40"
-                    }`}
+                    aria-label={`Page ${page}`}
+                    aria-current={currentPage === page ? "page" : undefined}
                   >
                     {page}
-                  </button>
+                  </Button>
                 ) : (
-                  <span key={index} className="w-9 h-9 flex items-center justify-center text-gray-500">
+                  <span
+                    key={index}
+                    aria-hidden="true"
+                    className="flex h-11 w-11 items-center justify-center text-muted-foreground"
+                  >
                     …
                   </span>
                 )
               )}
 
-              <button
+              <Button
+                variant="ghost"
+                size="icon"
+                className="h-11 w-11"
                 onClick={() => handlePageChange(currentPage + 1)}
                 disabled={currentPage === totalPages}
-                className="p-2 rounded-lg bg-black/20 text-gray-300 hover:bg-black/40 disabled:opacity-50 disabled:cursor-not-allowed"
+                aria-label="Next page"
               >
-                <ChevronRight size={18} />
-              </button>
-            </div>
+                <ChevronRight size={18} aria-hidden="true" />
+              </Button>
+            </nav>
           )}
         </>
       )}
-    </div>
+    </Card>
   )
 }

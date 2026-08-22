@@ -1,366 +1,531 @@
-import { JsonRpcProvider } from "ethers"
-
 /**
- * Represents a single RPC endpoint configuration.
+ * Multi-endpoint RPC access with real failover.
+ *
+ * The previous implementation had a structural flaw: `getProvider()` tested one
+ * endpoint, then returned a bare single-URL `JsonRpcProvider`. Every subsequent
+ * call on that object — `getBalance`, `estimateGas`, `sendTransaction` — went to
+ * that one URL with no retry and no failover. Only the initial handshake was
+ * protected, which is the part that matters least.
+ *
+ * This version inverts the model. Callers do not hold a provider; they hand a
+ * unit of work to {@link RpcPool.execute}, which runs it against a healthy
+ * endpoint and re-runs it elsewhere on failure. Failover therefore applies to
+ * every request, which is the only place it is useful.
+ *
+ * Three further defects are fixed:
+ * - The old health checker could never mark an endpoint unhealthy: it set
+ *   `healthy = false` and then, in the same `catch`, reverted it to `true`,
+ *   because the revive cooldown compared against a `lastCheck` that was only
+ *   refreshed on success.
+ * - `retryCount` was dead configuration; the tried-endpoint set was exhausted
+ *   before the attempt budget could be reached, so each endpoint was tried once.
+ * - Providers were constructed at three sites and never destroyed, leaking a
+ *   polling provider per health check, per minute, indefinitely.
  */
+
+import { JsonRpcProvider, type Networkish } from "ethers"
+import { logger } from "./logger"
+
+/** A single RPC endpoint. */
 export interface RpcEndpoint {
-  /** The RPC URL (e.g., https://eth-mainnet.g.alchemy.com/v2/...) */
+  /** Endpoint URL. Must be `https:`. */
   url: string
-  /** Priority (lower = higher priority); defaults to 1 if not set */
+  /** Lower sorts first. Defaults to 1. */
   priority?: number
-  /** Timeout in milliseconds for requests to this endpoint; default 15000ms */
-  timeout?: number
 }
 
-/**
- * Configuration options for the RpcPool.
- */
+/** Tuning for a pool. */
 export interface RpcPoolOptions {
-  /** Number of retry attempts per endpoint before failing over; default 3 */
-  retryCount?: number
-  /** Initial delay in ms between retries; default 1000ms */
-  retryDelay?: number
-  /** Strategy for selecting the next endpoint: 'sequential' (round-robin), 'random', or 'weighted' (by response time); default 'sequential' */
-  failoverStrategy?: "sequential" | "random" | "weighted"
-  /** Interval in ms for periodic health checks; default 60000ms (1 minute) */
-  healthCheckInterval?: number
-  /** Timeout in ms for individual RPC requests; default 15000ms */
-  requestTimeout?: number
-  /** Maximum backoff delay in ms; default 30000ms */
-  maxBackoffDelay?: number
+  /** Attempts per endpoint before moving on. Default 2. */
+  attemptsPerEndpoint?: number
+  /** Per-request timeout in ms. Default 12000. */
+  requestTimeoutMs?: number
+  /** Base backoff in ms; doubles per attempt. Default 400. */
+  retryBackoffMs?: number
+  /** Backoff ceiling in ms. Default 4000. */
+  maxBackoffMs?: number
+  /** How long an endpoint stays benched after tripping. Default 60000. */
+  cooldownMs?: number
+  /** Consecutive failures that bench an endpoint. Default 2. */
+  failureThreshold?: number
+  /** Chain id assertion passed to ethers, when known. */
+  network?: Networkish
 }
 
-/** Internal health status for an endpoint */
-interface EndpointHealth {
-  healthy: boolean
-  lastCheck: number
+type ResolvedOptions = Required<Omit<RpcPoolOptions, "network">> &
+  Pick<RpcPoolOptions, "network">
+
+/** Live state for one endpoint. */
+interface EndpointState {
+  url: string
+  priority: number
   consecutiveFailures: number
-  responseTime: number // in ms, used for weighted strategy
+  /** Epoch ms until which the endpoint is benched. 0 means available. */
+  benchedUntil: number
+  /** Last observed round-trip in ms, or null if never measured. */
+  latencyMs: number | null
+  successes: number
+  failures: number
 }
 
-/** Public health status for UI monitoring */
+/** Endpoint health for display. */
 export interface EndpointHealthStatus {
   url: string
   healthy: boolean
-  responseTime: number
-  lastCheck: number
+  /** Milliseconds until the endpoint leaves the bench. 0 when available. */
+  cooldownRemainingMs: number
+  latencyMs: number | null
   consecutiveFailures: number
+  successes: number
+  failures: number
+}
+
+/** Aggregate health for one network, shaped for a status indicator. */
+export interface PoolHealth {
+  /** True when at least one endpoint is currently usable. */
+  usable: boolean
+  totalEndpoints: number
+  healthyEndpoints: number
+  /** Best observed latency across healthy endpoints, or null. */
+  bestLatencyMs: number | null
+  endpoints: EndpointHealthStatus[]
+}
+
+/** Why a pool operation ultimately failed. */
+export type RpcFailureKind =
+  | "no-endpoints"
+  | "all-endpoints-failed"
+  | "timeout"
+  | "rate-limited"
+  | "aborted"
+  | "destroyed"
+
+/** Error carrying enough detail for the UI to say something useful. */
+export class RpcError extends Error {
+  readonly kind: RpcFailureKind
+  /** Number of endpoint attempts made before giving up. */
+  readonly attempted: number
+
+  constructor(kind: RpcFailureKind, message: string, attempted = 0) {
+    super(message)
+    this.name = "RpcError"
+    this.kind = kind
+    this.attempted = attempted
+  }
+
+  /** A sentence safe to show a user; never embeds a URL or an argument value. */
+  get userMessage(): string {
+    switch (this.kind) {
+      case "no-endpoints":
+        return "This network has no usable RPC endpoints configured."
+      case "rate-limited":
+        return "The network is rate limiting requests. Wait a moment and try again."
+      case "timeout":
+        return "The network did not respond in time. It may be congested."
+      case "aborted":
+        return "The request was cancelled."
+      case "destroyed":
+        return "The connection was closed."
+      case "all-endpoints-failed":
+      default:
+        return "Could not reach this network. Every configured endpoint failed."
+    }
+  }
+}
+
+const DEFAULTS: Omit<ResolvedOptions, "network"> = {
+  attemptsPerEndpoint: 2,
+  requestTimeoutMs: 12_000,
+  retryBackoffMs: 400,
+  maxBackoffMs: 4_000,
+  cooldownMs: 60_000,
+  failureThreshold: 2,
 }
 
 /**
- * RpcPool manages a pool of RPC endpoints for a single blockchain network.
- * It provides automatic failover, health checks, exponential backoff, and request load balancing.
+ * Classify a provider rejection so retry behaviour can differ by cause.
+ *
+ * @param error - Value thrown by a provider call.
+ */
+function classifyError(error: unknown): { rateLimited: boolean; retryable: boolean } {
+  const text = error instanceof Error ? `${error.message} ${error.name}` : String(error)
+  const lowered = text.toLowerCase()
+
+  if (
+    lowered.includes("429") ||
+    lowered.includes("rate limit") ||
+    lowered.includes("too many requests") ||
+    lowered.includes("quota")
+  ) {
+    return { rateLimited: true, retryable: true }
+  }
+
+  // A revert, a bad argument, or a nonce conflict is deterministic: retrying
+  // elsewhere returns the same answer and only wastes the user's time.
+  if (
+    lowered.includes("call_exception") ||
+    lowered.includes("invalid_argument") ||
+    lowered.includes("insufficient funds") ||
+    lowered.includes("nonce too low") ||
+    lowered.includes("already known") ||
+    lowered.includes("replacement transaction underpriced")
+  ) {
+    return { rateLimited: false, retryable: false }
+  }
+
+  return { rateLimited: false, retryable: true }
+}
+
+/** Sleep that rejects promptly if the signal aborts. */
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new RpcError("aborted", "Aborted"))
+      return
+    }
+    const onAbort = (): void => {
+      clearTimeout(timer)
+      reject(new RpcError("aborted", "Aborted"))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
+}
+
+/**
+ * Race work against a timeout, always clearing the timer.
+ *
+ * The previous implementation left its `setTimeout` pending after the work won
+ * the race, holding the closure alive for the full timeout window on every call.
+ *
+ * @param work - Receives a signal that aborts when the timeout fires.
+ * @param timeoutMs - Deadline in milliseconds.
+ * @param outer - Optional caller signal that also aborts the work.
+ */
+async function withTimeout<T>(
+  work: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  outer?: AbortSignal
+): Promise<T> {
+  const controller = new AbortController()
+  const onOuterAbort = (): void => controller.abort()
+  outer?.addEventListener("abort", onOuterAbort, { once: true })
+
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      work(controller.signal),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          controller.abort()
+          reject(new RpcError("timeout", `Request exceeded ${timeoutMs}ms`))
+        }, timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    outer?.removeEventListener("abort", onOuterAbort)
+  }
+}
+
+/**
+ * A pool of interchangeable RPC endpoints for one network.
+ *
+ * Work is submitted through {@link execute}. Providers are created lazily, cached
+ * per endpoint, and destroyed together in {@link destroy}.
  */
 export class RpcPool {
-  private endpoints: RpcEndpoint[]
-  private options: Required<RpcPoolOptions>
-  private health: Map<string, EndpointHealth> = new Map()
-  private currentIndex: number = 0
-  private healthCheckTimer: NodeJS.Timeout | null = null
-  private isHealthChecking: boolean = false
-  private isDestroyed: boolean = false
+  private readonly endpoints: EndpointState[]
+  private readonly options: ResolvedOptions
+  private readonly providers = new Map<string, JsonRpcProvider>()
+  private cursor = 0
+  private destroyed = false
 
   /**
-   * Create a new RpcPool.
-   * @param endpoints - List of RPC endpoints (at least one required)
-   * @param options - Optional configuration
-   * @throws {Error} If endpoints array is empty
+   * @param endpoints - At least one endpoint. Non-`https:` entries are dropped.
+   * @param options - Optional tuning.
+   * @throws {RpcError} If no usable endpoint remains after filtering.
    */
-  constructor(endpoints: RpcEndpoint[], options: RpcPoolOptions = {}) {
-    if (endpoints.length === 0) {
-      throw new Error("RpcPool requires at least one endpoint")
-    }
-    // Sort by priority (lowest number first)
-    this.endpoints = endpoints.sort((a, b) => (a.priority ?? 1) - (b.priority ?? 1))
-    this.options = {
-      retryCount: options.retryCount ?? 3,
-      retryDelay: options.retryDelay ?? 1000,
-      failoverStrategy: options.failoverStrategy ?? "sequential",
-      healthCheckInterval: options.healthCheckInterval ?? 60000,
-      requestTimeout: options.requestTimeout ?? 15000,
-      maxBackoffDelay: options.maxBackoffDelay ?? 30000,
-    }
-
-    // Initialize health status for all endpoints
-    for (const endpoint of this.endpoints) {
-      this.health.set(endpoint.url, {
-        healthy: true,
-        lastCheck: Date.now(),
-        consecutiveFailures: 0,
-        responseTime: 0,
-      })
-    }
-
-    // Start periodic health checks
-    this.startHealthCheck()
-  }
-
-  /**
-   * Get a JsonRpcProvider that automatically handles failover with exponential backoff.
-   * The provider will try endpoints in order, retrying on failure with increasing delays.
-   * @returns Promise that resolves to a working JsonRpcProvider
-   * @throws {Error} If no healthy endpoint is available after all retries
-   */
-  async getProvider(): Promise<JsonRpcProvider> {
-    if (this.isDestroyed) {
-      throw new Error("RpcPool has been destroyed")
-    }
-
-    const maxAttempts = this.options.retryCount * this.endpoints.length
-    let attempts = 0
-    const triedEndpoints = new Set<string>()
-
-    while (attempts < maxAttempts) {
-      const endpoint = this.selectEndpoint(triedEndpoints)
-      if (!endpoint) {
-        throw new Error("No healthy RPC endpoints available")
-      }
-
+  constructor(endpoints: readonly RpcEndpoint[], options: RpcPoolOptions = {}) {
+    const usable = endpoints.filter((endpoint) => {
       try {
-        const provider = new JsonRpcProvider(endpoint.url)
-        await this.testProvider(provider)
-        this.markHealthy(endpoint.url)
-        return provider
-      } catch (error) {
-        console.warn(`RPC ${endpoint.url} failed on attempt ${attempts + 1}:`,
-          error instanceof Error ? error.message : error)
-        this.markUnhealthy(endpoint.url, error)
-        triedEndpoints.add(endpoint.url)
-        attempts++
-        // Use exponential backoff before retrying
-        await this.delayWithBackoff(attempts)
+        // Reject non-https: an http endpoint is blocked as mixed content on an
+        // HTTPS page, and would expose RPC traffic in cleartext regardless.
+        return new URL(endpoint.url).protocol === "https:"
+      } catch {
+        return false
       }
+    })
+
+    if (usable.length === 0) {
+      throw new RpcError("no-endpoints", "RpcPool requires at least one https endpoint")
     }
 
-    throw new Error("All RPC endpoints failed after maximum retries")
-  }
-
-  /**
-   * Perform an immediate health check on all endpoints and update status.
-   * @returns A report with the health status of each endpoint
-   */
-  async healthCheck(): Promise<Record<string, boolean>> {
-    if (this.isDestroyed) {
-      return {}
-    }
-
-    const results: Record<string, boolean> = {}
-    for (const endpoint of this.endpoints) {
-      try {
-        const provider = new JsonRpcProvider(endpoint.url)
-        await this.testProvider(provider)
-        this.markHealthy(endpoint.url)
-        results[endpoint.url] = true
-      } catch (error) {
-        console.warn(`Health check failed for ${endpoint.url}:`, error)
-        this.markUnhealthy(endpoint.url, error)
-        results[endpoint.url] = false
-      }
-    }
-    return results
-  }
-
-  /**
-   * Get the current health status of all endpoints for UI monitoring.
-   * @returns Array of endpoint health status objects
-   */
-  getHealthStatus(): EndpointHealthStatus[] {
-    return this.endpoints.map((endpoint) => {
-      const health = this.health.get(endpoint.url)
-      return {
+    // Copy before sorting: the old constructor sorted the caller's array in place.
+    this.endpoints = usable
+      .map((endpoint) => ({
         url: endpoint.url,
-        healthy: health?.healthy ?? false,
-        responseTime: health?.responseTime ?? 0,
-        lastCheck: health?.lastCheck ?? 0,
-        consecutiveFailures: health?.consecutiveFailures ?? 0,
-      }
-    })
+        priority: endpoint.priority ?? 1,
+        consecutiveFailures: 0,
+        benchedUntil: 0,
+        latencyMs: null,
+        successes: 0,
+        failures: 0,
+      }))
+      .sort((a, b) => a.priority - b.priority)
+
+    this.options = { ...DEFAULTS, ...options }
+  }
+
+  /** Whether the pool has been torn down. */
+  get isDestroyed(): boolean {
+    return this.destroyed
+  }
+
+  /** Number of endpoints retained after https filtering. */
+  get size(): number {
+    return this.endpoints.length
   }
 
   /**
-   * Check if the pool has been destroyed.
+   * Run a unit of work against a healthy endpoint, failing over on error.
+   *
+   * The callback may be invoked more than once, against different endpoints, so
+   * it must be **idempotent**. Use it for reads and gas estimation, never to
+   * broadcast a transaction — a retry could submit twice. Use {@link executeOnce}
+   * for anything that mutates chain state.
+   *
+   * @param work - Idempotent operation to perform.
+   * @param signal - Optional cancellation signal.
+   * @returns The operation's result.
+   * @throws {RpcError} When every endpoint fails, or on cancellation.
    */
-  isDestroyedPool(): boolean {
-    return this.isDestroyed
-  }
+  async execute<T>(
+    work: (provider: JsonRpcProvider) => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T> {
+    if (this.destroyed) throw new RpcError("destroyed", "Pool has been destroyed")
 
-  /**
-   * Stop all periodic health checks and clean up resources.
-   */
-  destroy(): void {
-    if (this.healthCheckTimer) {
-      clearInterval(this.healthCheckTimer)
-      this.healthCheckTimer = null
+    const order = this.selectionOrder()
+    if (order.length === 0) {
+      // Everything is benched. Give the endpoint whose cooldown expires soonest
+      // one chance: a blanket cooldown must not hard-fail the application.
+      const revived = this.leastRecentlyBenched()
+      if (!revived) throw new RpcError("no-endpoints", "No endpoints available")
+      order.push(revived)
     }
-    this.isDestroyed = true
-  }
 
-  // ---------- Private helper methods ----------
+    let lastError: unknown
+    let sawRateLimit = false
+    let attempted = 0
 
-  /**
-   * Select an endpoint based on the current failover strategy, excluding already tried endpoints.
-   */
-  private selectEndpoint(tried: Set<string>): RpcEndpoint | null {
-    const healthyEndpoints = this.endpoints.filter(
-      (e) => this.health.get(e.url)?.healthy !== false && !tried.has(e.url)
+    for (const endpoint of order) {
+      for (let attempt = 0; attempt < this.options.attemptsPerEndpoint; attempt++) {
+        if (signal?.aborted) throw new RpcError("aborted", "Request cancelled")
+        if (this.destroyed) throw new RpcError("destroyed", "Pool has been destroyed")
+
+        attempted++
+        const started = Date.now()
+
+        try {
+          const provider = this.providerFor(endpoint.url)
+          const result = await withTimeout(
+            () => work(provider),
+            this.options.requestTimeoutMs,
+            signal
+          )
+          this.recordSuccess(endpoint, Date.now() - started)
+          return result
+        } catch (error) {
+          if (error instanceof RpcError && error.kind === "aborted") throw error
+
+          lastError = error
+          const { rateLimited, retryable } = classifyError(error)
+          if (rateLimited) sawRateLimit = true
+
+          // A deterministic failure is the real answer; surfacing it immediately
+          // beats walking every endpoint to receive it twenty more times.
+          if (!retryable) throw error
+
+          this.recordFailure(endpoint)
+          logger.warn("RPC endpoint failed", {
+            // May embed an API key; the logger redacts it.
+            url: endpoint.url,
+            attempt: attempt + 1,
+            error,
+          })
+
+          const isLastAttemptHere = attempt === this.options.attemptsPerEndpoint - 1
+          if (!isLastAttemptHere) {
+            const backoff = Math.min(
+              this.options.retryBackoffMs * 2 ** attempt,
+              this.options.maxBackoffMs
+            )
+            // Jitter stops every open tab retrying in lockstep.
+            await delay(backoff + Math.random() * 100, signal)
+          }
+        }
+      }
+    }
+
+    throw new RpcError(
+      sawRateLimit ? "rate-limited" : "all-endpoints-failed",
+      lastError instanceof Error ? lastError.message : "All RPC endpoints failed",
+      attempted
     )
-    if (healthyEndpoints.length === 0) return null
-
-    switch (this.options.failoverStrategy) {
-      case "sequential":
-        return this.selectSequential(healthyEndpoints)
-      case "random":
-        return healthyEndpoints[Math.floor(Math.random() * healthyEndpoints.length)]
-      case "weighted":
-        return this.selectWeighted(healthyEndpoints)
-      default:
-        return healthyEndpoints[0]
-    }
   }
 
   /**
-   * Round-robin selection from the healthy endpoints.
+   * Run work against exactly one endpoint, with no failover.
+   *
+   * Use for anything that must not be retried, above all broadcasting a signed
+   * transaction: retrying after an ambiguous timeout risks submitting twice.
+   *
+   * @param work - Non-idempotent operation.
+   * @param signal - Optional cancellation signal.
    */
-  private selectSequential(endpoints: RpcEndpoint[]): RpcEndpoint {
-    const idx = this.currentIndex % endpoints.length
-    this.currentIndex++
-    return endpoints[idx]
-  }
+  async executeOnce<T>(
+    work: (provider: JsonRpcProvider) => Promise<T>,
+    signal?: AbortSignal
+  ): Promise<T> {
+    if (this.destroyed) throw new RpcError("destroyed", "Pool has been destroyed")
 
-  /**
-   * Weighted selection based on response time (faster endpoints get higher weight).
-   */
-  private selectWeighted(endpoints: RpcEndpoint[]): RpcEndpoint {
-    const totalWeight = endpoints.reduce((sum, e) => {
-      const health = this.health.get(e.url)!
-      // Use a base weight of 1 if responseTime is 0 (unknown)
-      const weight = health.responseTime > 0 ? 1000 / health.responseTime : 1
-      return sum + weight
-    }, 0)
+    const endpoint = this.selectionOrder()[0] ?? this.leastRecentlyBenched()
+    if (!endpoint) throw new RpcError("no-endpoints", "No endpoints available")
 
-    let random = Math.random() * totalWeight
-    for (const endpoint of endpoints) {
-      const health = this.health.get(endpoint.url)!
-      const weight = health.responseTime > 0 ? 1000 / health.responseTime : 1
-      random -= weight
-      if (random <= 0) return endpoint
-    }
-    return endpoints[0]
-  }
-
-  /**
-   * Test a provider by fetching the latest block number with a timeout.
-   */
-  private async testProvider(provider: JsonRpcProvider): Promise<void> {
-    const startTime = Date.now()
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error("RPC request timeout")), this.options.requestTimeout)
-    })
-
+    const started = Date.now()
     try {
-      await Promise.race([
-        provider.getBlockNumber(),
-        timeoutPromise,
-      ])
-      const responseTime = Date.now() - startTime
-      const health = this.health.get(provider._getConnection().url)
-      if (health) {
-        health.responseTime = responseTime
-        health.lastCheck = Date.now()
-      }
+      const result = await withTimeout(
+        () => work(this.providerFor(endpoint.url)),
+        this.options.requestTimeoutMs,
+        signal
+      )
+      this.recordSuccess(endpoint, Date.now() - started)
+      return result
     } catch (error) {
-      console.error(`testProvider failed for ${provider._getConnection().url}:`, error)
+      if (!(error instanceof RpcError && error.kind === "aborted")) {
+        this.recordFailure(endpoint)
+      }
       throw error
     }
   }
 
   /**
-   * Mark an endpoint as healthy (reset failure counter).
+   * Health snapshot for display.
+   *
+   * Derived entirely from observed request outcomes. There is deliberately no
+   * background polling: a separate health loop is pure overhead when every real
+   * request already reports whether its endpoint worked.
    */
-  private markHealthy(url: string): void {
-    const health = this.health.get(url)
-    if (health) {
-      health.healthy = true
-      health.consecutiveFailures = 0
+  getHealth(): PoolHealth {
+    const now = Date.now()
+    const endpoints = this.endpoints.map<EndpointHealthStatus>((endpoint) => ({
+      url: endpoint.url,
+      healthy: endpoint.benchedUntil <= now,
+      cooldownRemainingMs: Math.max(0, endpoint.benchedUntil - now),
+      latencyMs: endpoint.latencyMs,
+      consecutiveFailures: endpoint.consecutiveFailures,
+      successes: endpoint.successes,
+      failures: endpoint.failures,
+    }))
+
+    const healthy = endpoints.filter((endpoint) => endpoint.healthy)
+    const latencies = healthy
+      .map((endpoint) => endpoint.latencyMs)
+      .filter((value): value is number => value !== null)
+
+    return {
+      usable: healthy.length > 0,
+      totalEndpoints: endpoints.length,
+      healthyEndpoints: healthy.length,
+      bestLatencyMs: latencies.length > 0 ? Math.min(...latencies) : null,
+      endpoints,
     }
   }
 
   /**
-   * Mark an endpoint as unhealthy if it has consecutive failures.
+   * Destroy every cached provider and mark the pool unusable.
+   *
+   * Must be called when a pool is discarded. An ethers provider holds an internal
+   * event loop, so dropping the reference without destroying it leaks.
    */
-  private markUnhealthy(url: string, _error: unknown): void {
-    const health = this.health.get(url)
-    if (health) {
-      health.consecutiveFailures++
-      // Mark unhealthy after 2 consecutive failures (reduced from 3 for faster failover)
-      if (health.consecutiveFailures >= 2) {
-        health.healthy = false
-        health.lastCheck = Date.now()
-      }
-    }
-  }
-
-  /**
-   * Start periodic health checks.
-   */
-  private startHealthCheck(): void {
-    if (this.healthCheckTimer) {
-      clearInterval(this.healthCheckTimer)
-    }
-    this.healthCheckTimer = setInterval(() => {
-      this.performHealthCheck()
-    }, this.options.healthCheckInterval)
-  }
-
-  /**
-   * Perform a health check on all endpoints, attempting to revive unhealthy ones after a cooldown.
-   */
-  private async performHealthCheck(): Promise<void> {
-    if (this.isHealthChecking || this.isDestroyed) return
-    this.isHealthChecking = true
-
-    for (const endpoint of this.endpoints) {
-      const health = this.health.get(endpoint.url)
-      if (!health) continue
-
+  destroy(): void {
+    if (this.destroyed) return
+    this.destroyed = true
+    for (const provider of this.providers.values()) {
       try {
-        const provider = new JsonRpcProvider(endpoint.url)
-        await this.testProvider(provider)
-        health.healthy = true
-        health.consecutiveFailures = 0
-      } catch {
-        health.consecutiveFailures++
-        if (health.consecutiveFailures >= 2) {
-          health.healthy = false
-        }
-        // Attempt to revive after 30 seconds cooldown
-        if (!health.healthy && Date.now() - health.lastCheck > 30000) {
-          health.healthy = true // give it another chance
-        }
+        provider.destroy()
+      } catch (error) {
+        logger.debug("Provider destroy failed", { error })
       }
     }
-
-    this.isHealthChecking = false
+    this.providers.clear()
   }
 
-  /**
-   * Delay with exponential backoff.
-   * @param attempt - Current attempt number (starts from 1)
-   * @returns Promise that resolves after the calculated delay
-   */
-  private delayWithBackoff(attempt: number): Promise<void> {
-    // Calculate delay: initialDelay * 2^(attempt-1), capped at maxBackoffDelay
-    const delay = Math.min(
-      this.options.retryDelay * Math.pow(2, attempt - 1),
-      this.options.maxBackoffDelay
-    )
-    return new Promise((resolve) => setTimeout(resolve, delay))
-  }
+  // ---------- internals ----------
 
   /**
-   * Simple delay helper (kept for backward compatibility).
+   * Cache one provider per endpoint.
+   *
+   * `staticNetwork` suppresses ethers' periodic `eth_chainId` re-detection, which
+   * would otherwise add a recurring background request per provider.
    */
-  private delay(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms))
+  private providerFor(url: string): JsonRpcProvider {
+    const existing = this.providers.get(url)
+    if (existing) return existing
+
+    const provider = new JsonRpcProvider(url, this.options.network, {
+      staticNetwork: this.options.network !== undefined ? true : null,
+    })
+    this.providers.set(url, provider)
+    return provider
+  }
+
+  /** Available endpoints, best first, rotated so load spreads. */
+  private selectionOrder(): EndpointState[] {
+    const now = Date.now()
+    const available = this.endpoints.filter((endpoint) => endpoint.benchedUntil <= now)
+    if (available.length === 0) return []
+
+    const ranked = [...available].sort((a, b) => {
+      if (a.priority !== b.priority) return a.priority - b.priority
+      // An unmeasured endpoint sorts as average so it gets a fair first try.
+      const aLatency = a.latencyMs ?? 500
+      const bLatency = b.latencyMs ?? 500
+      return aLatency - bLatency
+    })
+
+    // Rotate by a cursor so repeated calls do not always hammer the same host.
+    const offset = this.cursor++ % ranked.length
+    return [...ranked.slice(offset), ...ranked.slice(0, offset)]
+  }
+
+  /** The endpoint whose bench expires soonest, for last-resort use. */
+  private leastRecentlyBenched(): EndpointState | undefined {
+    return [...this.endpoints].sort((a, b) => a.benchedUntil - b.benchedUntil)[0]
+  }
+
+  private recordSuccess(endpoint: EndpointState, latencyMs: number): void {
+    endpoint.consecutiveFailures = 0
+    endpoint.benchedUntil = 0
+    endpoint.successes++
+    // Smooth the estimate so one slow response does not resort the whole pool.
+    endpoint.latencyMs =
+      endpoint.latencyMs === null
+        ? latencyMs
+        : Math.round(endpoint.latencyMs * 0.7 + latencyMs * 0.3)
+  }
+
+  private recordFailure(endpoint: EndpointState): void {
+    endpoint.consecutiveFailures++
+    endpoint.failures++
+    if (endpoint.consecutiveFailures >= this.options.failureThreshold) {
+      // Bench it. Unlike the previous implementation nothing revives it early:
+      // the cooldown is the single source of truth for availability.
+      endpoint.benchedUntil = Date.now() + this.options.cooldownMs
+    }
   }
 }

@@ -9,24 +9,37 @@ import {
   formatEther,
   Contract,
   formatUnits,
-  isError,
 } from "ethers"
-import { RpcPool, type RpcEndpoint, type EndpointHealthStatus } from "./multiRpc"
+import {
+  RpcError,
+  RpcPool,
+  type EndpointHealthStatus,
+  type PoolHealth,
+  type RpcEndpoint,
+} from "./multiRpc"
+import { logger } from "./logger"
+import { filterValidCustomNetworks } from "./schema"
+import { readJson, writeJson, STORAGE_KEYS, type WriteResult } from "./storage"
+
+export { RpcError }
+export type { EndpointHealthStatus, PoolHealth }
 
 // ===== Types =====
 
 export interface CustomNetwork {
   name: string
-  rpcUrls: string[] // Now supports multiple RPC URLs
+  rpcUrls: string[]
   explorerUrl: string
   currency: string
   type: "mainnet" | "testnet"
   isCustom: true
+  /** Native currency decimals. Defaults to 18 when absent. */
+  decimals?: number
 }
 
 export interface BuiltInNetwork {
   name: string
-  rpcUrls: string[] // Now supports multiple RPC URLs
+  rpcUrls: string[]
   explorerUrl: string
   currency: string
   type: "mainnet" | "testnet"
@@ -35,7 +48,39 @@ export interface BuiltInNetwork {
 
 export type NetworkConfig = BuiltInNetwork | CustomNetwork
 
-export type Network = keyof typeof NETWORKS | string
+/**
+ * A network key.
+ *
+ * Deliberately widened to `string` because custom networks are user-created at
+ * runtime, so no closed union can describe every valid key. Use
+ * {@link isBuiltInNetwork} when a built-in key is actually required — the
+ * previous `keyof typeof NETWORKS | string` collapsed to plain `string` and gave
+ * the false impression of being checked.
+ */
+export type Network = string
+
+/** Keys of the built-in network table, as a literal union. */
+export type BuiltInNetworkKey = keyof typeof NETWORKS
+
+/**
+ * Native currency decimals for chains that are not 18.
+ *
+ * Everything else defaults to 18. This exists because amount parsing previously
+ * assumed 18 decimals for every chain, which is wrong for any chain whose native
+ * unit differs and would misprice a transfer by orders of magnitude.
+ */
+const NATIVE_DECIMALS_OVERRIDES: Readonly<Record<string, number>> = {
+  // Arc's native unit is USDC, which uses 6 decimals.
+  "arc-mainnet": 6,
+  "arc-testnet": 6,
+}
+
+/** Decimals of a network's native currency. Defaults to 18. */
+export function getNativeDecimals(network: Network): number {
+  const custom = getCustomNetworks()[network]
+  if (custom?.decimals !== undefined) return custom.decimals
+  return NATIVE_DECIMALS_OVERRIDES[network] ?? 18
+}
 
 // ===== Built-in Networks with Multiple RPCs =====
 
@@ -385,112 +430,195 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
 
 // ===== Custom Networks Storage =====
 
-const CUSTOM_NETWORKS_KEY = "ethtools_custom_networks"
-
+/**
+ * Read user-added networks, dropping any that fail validation.
+ *
+ * `localStorage` is writable by anything running on the origin, so this is a
+ * trust boundary. Validation rejects non-`https:` RPC and explorer URLs, which is
+ * what stops a tampered entry from routing requests through an attacker's node or
+ * smuggling a `javascript:` URL into an explorer link.
+ */
 export function getCustomNetworks(): Record<string, CustomNetwork> {
-  if (typeof window === "undefined") return {}
-  try {
-    const stored = localStorage.getItem(CUSTOM_NETWORKS_KEY)
-    return stored ? JSON.parse(stored) : {}
-  } catch {
-    return {}
-  }
-}
+  const validated = filterValidCustomNetworks(
+    readJson<unknown>(STORAGE_KEYS.CUSTOM_NETWORKS, (value): value is unknown => true, {})
+  )
 
-export function saveCustomNetwork(key: string, network: CustomNetwork): void {
-  const existing = getCustomNetworks()
-  existing[key] = network
-  localStorage.setItem(CUSTOM_NETWORKS_KEY, JSON.stringify(existing))
-  // Clear RPC pools so they are recreated with new network
-  rpcPools.delete(key)
-}
-
-export function removeCustomNetwork(key: string): void {
-  const existing = getCustomNetworks()
-  delete existing[key]
-  localStorage.setItem(CUSTOM_NETWORKS_KEY, JSON.stringify(existing))
-  rpcPools.delete(key)
-}
-
-export function getAllNetworks(): Record<string, NetworkConfig> {
-  return { ...NETWORKS, ...getCustomNetworks() }
-}
-
-// ===== RPC Pool Cache =====
-
-const rpcPools = new Map<string, RpcPool>()
-
-/**
- * Get a JsonRpcProvider for the specified network with automatic multi-RPC failover.
- * @param network - Network key (e.g., "mainnet", "sepolia")
- * @returns Promise resolving to a JsonRpcProvider
- * @throws {Error} If network is not configured or no RPC endpoints available
- */
-export async function getProvider(network: Network): Promise<JsonRpcProvider> {
-  const allNetworks = getAllNetworks()
-  const config = allNetworks[network]
-  if (!config) {
-    throw new Error(`Network "${network}" not found`)
-  }
-
-  let rpcEndpoints: RpcEndpoint[] = []
-  if (Array.isArray(config.rpcUrls)) {
-    if (config.rpcUrls.length === 0) {
-      throw new Error(`No RPC URLs configured for network "${network}"`)
+  // Never let a stored entry shadow a built-in key: an override of "mainnet"
+  // would silently repoint Ethereum Mainnet.
+  const safe: Record<string, CustomNetwork> = {}
+  for (const [key, config] of Object.entries(validated)) {
+    if (key in NETWORKS) {
+      logger.warn("Ignoring custom network that shadows a built-in key", { key })
+      continue
     }
-    // Convert string URLs to RpcEndpoint objects if needed
-    rpcEndpoints = config.rpcUrls.map((item) =>
-      typeof item === "string" ? { url: item, priority: 1 } : item
-    )
-  } else {
-    // Fallback for legacy single-string rpcUrl
-    const url = (config as any).rpcUrl
-    if (typeof url === "string" && url) {
-      rpcEndpoints = [{ url, priority: 1 }]
-    } else {
-      throw new Error(`Invalid rpcUrls format for network "${network}"`)
-    }
+    safe[key] = { ...config, isCustom: true }
   }
-
-  // Reuse or create a pool for this network
-  if (!rpcPools.has(network)) {
-    const pool = new RpcPool(rpcEndpoints, {
-      retryCount: 3,
-      failoverStrategy: "sequential",
-      healthCheckInterval: 60000,
-      requestTimeout: 20000,
-      maxBackoffDelay: 30000,
-    })
-    rpcPools.set(network, pool)
-  }
-
-  return rpcPools.get(network)!.getProvider()
+  return safe
 }
 
 /**
- * Get the health status of all RPC pools for UI monitoring.
- * @param network - Optional specific network to check; if omitted, returns all.
- * @returns Map of network to array of endpoint health statuses
+ * Persist a user-added network.
+ *
+ * @param key - Slug identifying the network. Must not collide with a built-in.
+ * @param network - Validated configuration.
+ * @returns Whether the write succeeded; storage can be full or unavailable.
  */
-export function getRpcHealthStatus(network?: Network): Map<string, EndpointHealthStatus[]> {
-  const result = new Map<string, EndpointHealthStatus[]>()
-  if (network) {
-    const pool = rpcPools.get(network)
-    if (pool && !pool.isDestroyedPool()) {
-      result.set(network, pool.getHealthStatus())
-    }
-  } else {
-    for (const [key, pool] of rpcPools) {
-      if (!pool.isDestroyedPool()) {
-        result.set(key, pool.getHealthStatus())
-      }
+export function saveCustomNetwork(key: string, network: CustomNetwork): WriteResult {
+  if (key in NETWORKS) {
+    return {
+      ok: false,
+      reason: "unavailable",
+      error: `"${key}" is a built-in network and cannot be overridden.`,
     }
   }
+
+  const existing = getCustomNetworks()
+  const result = writeJson(STORAGE_KEYS.CUSTOM_NETWORKS, { ...existing, [key]: network })
+  // Drop the pool so the next request picks up the new endpoints.
+  if (result.ok) disposePool(key)
   return result
 }
 
 /**
- * Clean up all RPC pools (e.g., on logout or app unmount).
+ * Remove a user-added network.
+ * @param key - Slug of the network to remove.
+ */
+export function removeCustomNetwork(key: string): WriteResult {
+  const existing = getCustomNetworks()
+  delete existing[key]
+  const result = writeJson(STORAGE_KEYS.CUSTOM_NETWORKS, existing)
+  if (result.ok) disposePool(key)
+  return result
+}
+
+/** Built-in and custom networks merged, with built-ins taking precedence. */
+export function getAllNetworks(): Record<string, NetworkConfig> {
+  return { ...getCustomNetworks(), ...NETWORKS }
+}
+
+/** Whether a key names a built-in network. */
+export function isBuiltInNetwork(network: Network): network is BuiltInNetworkKey {
+  return network in NETWORKS
+}
+
+/** Whether a key resolves to any known network. */
+export function isKnownNetwork(network: Network): boolean {
+  return network in NETWORKS || network in getCustomNetworks()
+}
+
+// ===== RPC pools =====
+
+const rpcPools = new Map<string, RpcPool>()
+
+/** Destroy and forget one pool. */
+function disposePool(network: string): void {
+  const pool = rpcPools.get(network)
+  if (pool) {
+    pool.destroy()
+    rpcPools.delete(network)
+  }
+}
+
+/**
+ * Get or create the pool for a network.
+ *
+ * @param network - Network key.
+ * @throws {RpcError} If the network is unknown or has no usable endpoint.
+ */
+function poolFor(network: Network): RpcPool {
+  const existing = rpcPools.get(network)
+  if (existing && !existing.isDestroyed) return existing
+
+  const config = getAllNetworks()[network]
+  if (!config) {
+    throw new RpcError("no-endpoints", `Network "${network}" is not configured.`)
+  }
+  if (!Array.isArray(config.rpcUrls) || config.rpcUrls.length === 0) {
+    throw new RpcError("no-endpoints", `Network "${network}" has no RPC endpoints.`)
+  }
+
+  const endpoints: RpcEndpoint[] = config.rpcUrls.map((url, index) => ({
+    url,
+    // Preserve the configured order as a priority so the first listed endpoint
+    // is preferred while all are still unmeasured.
+    priority: index + 1,
+  }))
+
+  const pool = new RpcPool(endpoints)
+  rpcPools.set(network, pool)
+  return pool
+}
+
+/**
+ * Run idempotent work against a network, with retry and failover.
+ *
+ * This replaces the old `getProvider()`, which handed back a bare single-URL
+ * provider and therefore gave no failover on any actual request.
+ *
+ * @param network - Network key.
+ * @param work - Idempotent operation. May run more than once, on different
+ *   endpoints, so it must not broadcast a transaction.
+ * @param signal - Optional cancellation signal.
+ * @throws {RpcError} On exhaustion, timeout, or cancellation.
+ */
+export async function withProvider<T>(
+  network: Network,
+  work: (provider: JsonRpcProvider) => Promise<T>,
+  signal?: AbortSignal
+): Promise<T> {
+  return poolFor(network).execute(work, signal)
+}
+
+/**
+ * Run non-idempotent work against a single endpoint, with no retry.
+ *
+ * Use for broadcasting a signed transaction: retrying after an ambiguous timeout
+ * risks submitting the same transaction twice.
+ *
+ * @param network - Network key.
+ * @param work - Operation that must run at most once.
+ * @param signal - Optional cancellation signal.
+ */
+export async function withProviderOnce<T>(
+  network: Network,
+  work: (provider: JsonRpcProvider) => Promise<T>,
+  signal?: AbortSignal
+): Promise<T> {
+  return poolFor(network).executeOnce(work, signal)
+}
+
+/**
+ * Health of every pool that has been used, for a status indicator.
+ *
+ * Health is derived from real request outcomes rather than a polling loop, so
+ * this is a pure read with no network cost.
+ *
+ * @param network - Optional single network to report on.
+ */
+export function getRpcHealthStatus(network?: Network): Map<string, PoolHealth> {
+  const result = new Map<string, PoolHealth>()
+  if (network !== undefined) {
+    const pool = rpcPools.get(network)
+    if (pool && !pool.isDestroyed) result.set(network, pool.getHealth())
+    return result
+  }
+  for (const [key, pool] of rpcPools) {
+    if (!pool.isDestroyed) result.set(key, pool.getHealth())
+  }
+  return result
+}
+
+/** Health of one network, or null if it has not been contacted yet. */
+export function getNetworkHealth(network: Network): PoolHealth | null {
+  const pool = rpcPools.get(network)
+  return pool && !pool.isDestroyed ? pool.getHealth() : null
+}
+
+/**
+ * Destroy every pool.
+ *
+ * Call on logout and on unmount. An ethers provider holds an internal event loop,
+ * so dropping the reference without destroying it leaks.
  */
 export function cleanupRpcPools(): void {
   for (const pool of rpcPools.values()) {
@@ -509,78 +637,148 @@ const ERC20_ABI = [
 ]
 
 /**
- * Get the native balance of an address on a given network.
- * @param address - Ethereum address
- * @param network - Network key
- * @returns Promise resolving to formatted balance string (with 5 decimals)
- * @throws {Error} If address is invalid or RPC fails
+ * Native balance in base units.
+ *
+ * Returns `bigint` because that is the only lossless representation. Formatting
+ * for display belongs in `lib/format.ts`; a spendability decision must be made on
+ * this value, never on a rounded display string.
+ *
+ * @param address - Address to query.
+ * @param network - Network key.
+ * @param signal - Optional cancellation signal.
+ * @throws {Error} If the address is invalid.
+ * @throws {RpcError} If every endpoint fails.
  */
-export async function getBalance(address: string, network: Network): Promise<string> {
-  if (!isAddress(address)) {
-    throw new Error("Invalid address.")
-  }
-  const provider = await getProvider(network)
-  try {
-    const balanceWei = await provider.getBalance(address)
-    return Number.parseFloat(formatEther(balanceWei)).toFixed(5)
-  } catch (error) {
-    console.error(`Error fetching balance on ${network}:`, error)
-    throw new Error(`Failed to fetch balance on ${network}`)
-  }
+export async function getBalanceWei(
+  address: string,
+  network: Network,
+  signal?: AbortSignal
+): Promise<bigint> {
+  if (!isAddress(address)) throw new Error("Invalid address.")
+  return withProvider(network, (provider) => provider.getBalance(address), signal)
 }
 
 /**
- * Get the balance of an ERC-20 token for a given address.
- * @param contractAddress - Token contract address
- * @param userAddress - Wallet address
- * @param network - Network key
- * @returns Promise resolving to formatted token balance string
- * @throws {Error} If address is invalid or token fetch fails
+ * Native balance as a display string.
+ *
+ * Retained for existing call sites. Truncates toward zero rather than rounding,
+ * because rounding a balance up shows funds the user does not have.
+ *
+ * @param address - Address to query.
+ * @param network - Network key.
+ * @param signal - Optional cancellation signal.
+ */
+export async function getBalance(
+  address: string,
+  network: Network,
+  signal?: AbortSignal
+): Promise<string> {
+  const wei = await getBalanceWei(address, network, signal)
+  const decimals = getNativeDecimals(network)
+  const full = formatUnits(wei, decimals)
+
+  const dot = full.indexOf(".")
+  if (dot === -1) return full
+  const truncated = full.slice(0, dot + 6)
+  return truncated.endsWith(".") ? truncated.slice(0, -1) : truncated
+}
+
+/**
+ * ERC-20 balance in base units, together with the token's decimals.
+ *
+ * Both values are returned so the caller can format without a second round trip;
+ * the previous version fetched `decimals` separately on every balance read.
+ *
+ * @param contractAddress - Token contract.
+ * @param userAddress - Holder address.
+ * @param network - Network key.
+ * @param signal - Optional cancellation signal.
+ */
+export async function getTokenBalanceRaw(
+  contractAddress: string,
+  userAddress: string,
+  network: Network,
+  signal?: AbortSignal
+): Promise<{ value: bigint; decimals: number }> {
+  if (!isAddress(contractAddress) || !isAddress(userAddress)) {
+    throw new Error("Invalid address.")
+  }
+
+  return withProvider(
+    network,
+    async (provider) => {
+      const contract = new Contract(contractAddress, ERC20_ABI, provider)
+      // Parallel rather than sequential: two round trips became one.
+      const [value, decimals] = await Promise.all([
+        contract.balanceOf(userAddress) as Promise<bigint>,
+        contract.decimals() as Promise<bigint>,
+      ])
+      return { value, decimals: Number(decimals) }
+    },
+    signal
+  )
+}
+
+/**
+ * ERC-20 balance as a display string.
+ *
+ * @param contractAddress - Token contract.
+ * @param userAddress - Holder address.
+ * @param network - Network key.
+ * @param signal - Optional cancellation signal.
  */
 export async function getTokenBalance(
   contractAddress: string,
   userAddress: string,
-  network: Network
+  network: Network,
+  signal?: AbortSignal
 ): Promise<string> {
-  if (!isAddress(contractAddress) || !isAddress(userAddress)) {
-    throw new Error("Invalid address.")
-  }
-  const provider = await getProvider(network)
-  const contract = new Contract(contractAddress, ERC20_ABI, provider)
-  try {
-    const balance = await contract.balanceOf(userAddress)
-    const decimals = await contract.decimals()
-    return Number.parseFloat(formatUnits(balance, decimals)).toFixed(4)
-  } catch (error) {
-    console.error(`Error fetching token balance on ${network}:`, error)
-    throw new Error("Failed to fetch token balance.")
-  }
+  const { value, decimals } = await getTokenBalanceRaw(
+    contractAddress,
+    userAddress,
+    network,
+    signal
+  )
+  const full = formatUnits(value, decimals)
+  const dot = full.indexOf(".")
+  if (dot === -1) return full
+  const truncated = full.slice(0, dot + 5)
+  return truncated.endsWith(".") ? truncated.slice(0, -1) : truncated
 }
 
 /**
- * Get ERC-20 token details (name, symbol, decimals).
+ * ERC-20 metadata.
+ *
+ * @param contractAddress - Token contract.
+ * @param network - Network key.
+ * @param signal - Optional cancellation signal.
  */
-export async function getTokenDetails(contractAddress: string, network: Network): Promise<{
-  name: string
-  symbol: string
-  decimals: number
-}> {
-  if (!isAddress(contractAddress)) {
-    throw new Error("Invalid contract address.")
-  }
-  const provider = await getProvider(network)
-  const contract = new Contract(contractAddress, ERC20_ABI, provider)
+export async function getTokenDetails(
+  contractAddress: string,
+  network: Network,
+  signal?: AbortSignal
+): Promise<{ name: string; symbol: string; decimals: number }> {
+  if (!isAddress(contractAddress)) throw new Error("Invalid contract address.")
+
   try {
-    const [name, symbol, decimals] = await Promise.all([
-      contract.name(),
-      contract.symbol(),
-      contract.decimals(),
-    ])
-    return { name, symbol, decimals: Number(decimals) }
+    return await withProvider(
+      network,
+      async (provider) => {
+        const contract = new Contract(contractAddress, ERC20_ABI, provider)
+        const [name, symbol, decimals] = await Promise.all([
+          contract.name() as Promise<string>,
+          contract.symbol() as Promise<string>,
+          contract.decimals() as Promise<bigint>,
+        ])
+        return { name, symbol, decimals: Number(decimals) }
+      },
+      signal
+    )
   } catch (error) {
-    console.error(`Error fetching token details on ${network}:`, error)
+    if (error instanceof RpcError) throw error
+    logger.warn("Token metadata lookup failed", { network, error })
     throw new Error(
-      "Failed to fetch token details. Make sure the address is a valid ERC20 contract on the selected network."
+      "Could not read token details. Check that this is an ERC-20 contract on the selected network."
     )
   }
 }
@@ -608,20 +806,55 @@ export function getAddressFromPrivateKey(privateKey: string): string {
 
 // ===== Validation =====
 
-export async function validateRpcUrl(rpcUrl: string): Promise<{
-  valid: boolean
-  chainId?: number
-  error?: string
-}> {
+/**
+ * Probe a candidate RPC URL before a user adds it.
+ *
+ * Three defects in the previous version are fixed: the provider was never
+ * destroyed (leaking a polling connection per probe), there was no timeout (a
+ * black-holing URL hung the dialog indefinitely), and `http:` was accepted even
+ * though it is blocked as mixed content on an HTTPS page.
+ *
+ * @param rpcUrl - Candidate endpoint.
+ * @param timeoutMs - Deadline. Defaults to 8000.
+ */
+export async function validateRpcUrl(
+  rpcUrl: string,
+  timeoutMs = 8_000
+): Promise<{ valid: boolean; chainId?: number; error?: string }> {
+  let parsed: URL
   try {
-    const provider = new JsonRpcProvider(rpcUrl)
-    const network = await provider.getNetwork()
+    parsed = new URL(rpcUrl)
+  } catch {
+    return { valid: false, error: "That is not a valid URL." }
+  }
+  if (parsed.protocol !== "https:") {
+    return { valid: false, error: "Only https:// endpoints are accepted." }
+  }
+
+  const provider = new JsonRpcProvider(rpcUrl)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const network = await Promise.race([
+      provider.getNetwork(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("timeout")), timeoutMs)
+      }),
+    ])
     return { valid: true, chainId: Number(network.chainId) }
   } catch (error) {
+    logger.debug("RPC validation failed", { error })
+    const timedOut = error instanceof Error && error.message === "timeout"
     return {
       valid: false,
-      error: error instanceof Error ? error.message : "Invalid RPC URL",
+      // Never surface the library message: it embeds the URL, which may carry a key.
+      error: timedOut
+        ? `No response within ${Math.round(timeoutMs / 1000)}s.`
+        : "Could not reach that endpoint.",
     }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    // Always release the connection, success or failure.
+    provider.destroy()
   }
 }
 

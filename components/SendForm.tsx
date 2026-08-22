@@ -1,12 +1,28 @@
 "use client"
 
 import { useState } from "react"
-import { X, Send, Loader2, Bookmark, ChevronDown } from "lucide-react"
-import { Wallet, isAddress, parseEther, formatEther } from "ethers"
-import { getProvider, getAllNetworks, type Network } from "@/lib/ethers"
+import { Send, Bookmark, ChevronDown, Check } from "lucide-react"
+import { Wallet, formatUnits, isAddress, type TransactionRequest } from "ethers"
+import {
+  RpcError,
+  getAllNetworks,
+  getNativeDecimals,
+  withProvider,
+  withProviderOnce,
+  type Network,
+} from "@/lib/ethers"
 import { saveTransaction, updateTransactionStatus } from "@/lib/transactionHistory"
 import { getBookmarksByNetwork, isAddressBookmarked } from "@/lib/bookmarks"
+import { parseAmount } from "@/lib/format"
+import { describeError, logger } from "@/lib/logger"
 import BookmarkManager from "./BookmarkManager"
+import ResponsiveDialog from "./ui/ResponsiveDialog"
+import Card from "./ui/Card"
+import Button from "./ui/Button"
+import Field, { inputClassName, monoInputClassName } from "./ui/Field"
+import Alert from "./ui/Alert"
+import { notify } from "./ui/Toast"
+import { cn } from "@/lib/utils"
 
 interface SendFormProps {
   network: Network
@@ -14,6 +30,9 @@ interface SendFormProps {
   onClose: () => void
   onSuccess: (txHash: string) => void
 }
+
+/** Links the dropdown trigger to the list it controls. */
+const BOOKMARK_LIST_ID = "send-form-bookmark-list"
 
 export default function SendForm({ network, wallet, onClose, onSuccess }: SendFormProps) {
   const [recipient, setRecipient] = useState("")
@@ -26,6 +45,8 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
 
   const networkInfo = getAllNetworks()[network]
   const currencySymbol = networkInfo?.currency || "ETH"
+  // Not every chain uses 18 decimals; assuming so would misprice a transfer.
+  const nativeDecimals = getNativeDecimals(network)
 
   // Get bookmarks for this network
   const bookmarks = getBookmarksByNetwork(network as string)
@@ -43,45 +64,54 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
     setIsCalculatingMax(true)
     setError("")
     try {
-      const provider = await getProvider(network)
-      const feeData = await provider.getFeeData()
+      // Fee data, balance, and gas estimate are all idempotent reads, so they go
+      // through the pooled path and inherit retry plus failover.
+      const { balance, gasCost } = await withProvider(network, async (provider) => {
+        const [feeData, currentBalance] = await Promise.all([
+          provider.getFeeData(),
+          provider.getBalance(wallet.address),
+        ])
 
-      const gasPrice = feeData.maxFeePerGas || feeData.gasPrice
-      if (!gasPrice) {
-        throw new Error("Could not fetch gas price.")
+        const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice
+        if (gasPrice === null) throw new Error("no-gas-price")
+
+        let gasLimit = 21_000n
+        try {
+          const estimated = await provider.estimateGas({
+            to: recipient !== "" && isAddress(recipient) ? recipient : wallet.address,
+            value: 1n,
+          })
+          gasLimit = (estimated * 120n) / 100n
+        } catch {
+          // A plain transfer is 21000; the estimate only matters for contracts.
+          gasLimit = 21_000n
+        }
+
+        return { balance: currentBalance, gasCost: gasLimit * gasPrice }
+      })
+
+      // Reserve a further margin because the base fee can rise between this
+      // estimate and the send, and because OP-stack chains add an L1 data fee
+      // that gasLimit * gasPrice does not include. Without it, "Max" reliably
+      // fails for insufficient funds on those networks.
+      const reserve = gasCost + gasCost / 2n
+
+      if (balance <= reserve) {
+        setAmount("")
+        setError(
+          `Balance does not cover the network fee. You need at least ${formatUnits(reserve, nativeDecimals)} ${currencySymbol}.`
+        )
+        return
       }
 
-      // Get current balance
-      const balance = await provider.getBalance(wallet.address)
-
-      // Estimate gas limit with 20% buffer
-      let gasLimit = BigInt(21000) // Default for ETH transfer
-      try {
-        const estimatedGas = await provider.estimateGas({
-          to: recipient || wallet.address,
-          value: parseEther("0.001"),
-        })
-        gasLimit = (estimatedGas * BigInt(120)) / BigInt(100)
-      } catch {
-        gasLimit = BigInt(21000)
-      }
-
-      const gasCost = gasLimit * gasPrice
-
-      if (balance <= gasCost) {
-        setAmount("0")
-        throw new Error("Balance is not sufficient to cover gas fees.")
-      }
-
-      const maxAmount = balance - gasCost
-      setAmount(formatEther(maxAmount))
-    } catch (e) {
-      console.error(e)
-      if (e instanceof Error) {
-        setError(e.message)
-      } else {
-        setError("Failed to calculate max amount.")
-      }
+      setAmount(formatUnits(balance - reserve, nativeDecimals))
+    } catch (error) {
+      logger.warn("Max amount calculation failed", { network, error })
+      setError(
+        error instanceof RpcError
+          ? error.userMessage
+          : describeError(error, "Could not calculate the maximum amount.")
+      )
     } finally {
       setIsCalculatingMax(false)
     }
@@ -89,42 +119,57 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
 
   const handleSend = async () => {
     setError("")
+
     if (!isAddress(recipient)) {
-      setError("Invalid recipient address.")
+      setError("Enter a valid recipient address.")
       return
     }
-    if (Number.parseFloat(amount) <= 0) {
-      setError("Amount must be greater than zero.")
+
+    // Validate through the shared bigint-exact parser rather than parseFloat.
+    // `Number.parseFloat("abc") <= 0` is false, so the previous check let garbage
+    // through to fail later inside parseUnits with an opaque message.
+    const parsedAmount = parseAmount(amount, nativeDecimals)
+    if (!parsedAmount.ok) {
+      setError(parsedAmount.error)
       return
     }
 
     setIsSending(true)
-    let txHash = ""
+    let broadcastHash = ""
 
     try {
-      const provider = await getProvider(network)
-      if (!provider) {
-        throw new Error("Could not connect to provider.")
-      }
-
-      const tx = {
-        to: recipient,
-        value: parseEther(amount),
-      }
+      // Estimate against the real recipient and value, not a placeholder.
+      const request: TransactionRequest = { to: recipient, value: parsedAmount.value }
 
       try {
-        const estimatedGas = await provider.estimateGas(tx)
-        ;(tx as any).gasLimit = (estimatedGas * BigInt(120)) / BigInt(100)
-      } catch (e) {
-        console.warn("Gas estimation failed, using default:", e)
+        const estimated = await withProvider(network, (provider) =>
+          provider.estimateGas(request)
+        )
+        request.gasLimit = (estimated * 120n) / 100n
+      } catch (error) {
+        // A failed estimate usually means the transaction would revert. Surface
+        // it rather than broadcasting blind and burning the fee.
+        logger.warn("Gas estimation failed", { network, error })
+        setError(
+          error instanceof RpcError
+            ? error.userMessage
+            : "This transaction is expected to fail, so it was not sent. Check the recipient and amount."
+        )
+        setIsSending(false)
+        return
       }
 
-      const walletInstance = new Wallet(wallet.privateKey, provider)
-      const txResponse = await walletInstance.sendTransaction(tx)
-      txHash = txResponse.hash
+      // Broadcast exactly once. Retrying an ambiguous timeout could submit the
+      // same transaction twice, so this deliberately does not fail over.
+      const response = await withProviderOnce(network, async (provider) => {
+        const signer = new Wallet(wallet.privateKey, provider)
+        return signer.sendTransaction(request)
+      })
 
-      saveTransaction({
-        hash: txHash,
+      broadcastHash = response.hash
+
+      const saved = saveTransaction({
+        hash: broadcastHash,
         network,
         from: wallet.address,
         to: recipient,
@@ -132,43 +177,56 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
         currency: currencySymbol,
         status: "pending",
       })
-
-      onSuccess(txHash)
-
-      // Update status after confirmation
-      try {
-        const receipt = await txResponse.wait(1)
-        if (receipt) {
-          if (receipt.status === 1) {
-            updateTransactionStatus(txHash, "success")
-          } else {
-            updateTransactionStatus(txHash, "failed")
-          }
-        } else {
-          // If receipt is null, still mark as success (network issue)
-          updateTransactionStatus(txHash, "success")
-        }
-      } catch (confirmError) {
-        console.warn("Transaction confirmation failed, marking as success anyway:", confirmError)
-        // If we can't confirm, still mark as success assuming it went through
-        updateTransactionStatus(txHash, "success")
+      if (saved !== undefined && !saved.ok) {
+        // The transaction is already on the network; only the local record failed.
+        notify.warning("Transaction sent, but history could not be saved", saved.error)
       }
 
-    } catch (e) {
-      console.error(e)
-      const errorMessage = e instanceof Error ? e.message : "Transaction failed."
-      setError(errorMessage)
+      onSuccess(broadcastHash)
 
-      const failedHash = txHash || `failed-${Date.now()}`
-      saveTransaction({
-        hash: failedHash,
-        network,
-        from: wallet.address,
-        to: recipient,
-        amount,
-        currency: currencySymbol,
-        status: "failed",
-      })
+      // Resolve the real outcome. A transaction is "success" only when a receipt
+      // confirms status 1. Anything else is genuinely unknown, and reporting
+      // unknown as success — as this code previously did — tells the user their
+      // funds moved when they may not have.
+      try {
+        const receipt = await response.wait(1)
+        if (receipt === null) {
+          updateTransactionStatus(broadcastHash, "unknown")
+          notify.warning(
+            "Transaction status unknown",
+            "It was broadcast but no receipt was returned. Check the explorer before retrying."
+          )
+        } else if (receipt.status === 1) {
+          updateTransactionStatus(broadcastHash, "success")
+          notify.success("Transaction confirmed")
+        } else {
+          updateTransactionStatus(broadcastHash, "failed")
+          notify.error("Transaction reverted", "The network rejected it. The fee was still spent.")
+        }
+      } catch (confirmError) {
+        // Could not confirm. The transaction may still be in the mempool, so it
+        // is neither a success nor a failure.
+        logger.warn("Confirmation wait failed", { network, error: confirmError })
+        updateTransactionStatus(broadcastHash, "unknown")
+        notify.warning(
+          "Could not confirm the transaction",
+          "It was broadcast successfully. Check the explorer for its final status."
+        )
+      }
+    } catch (error) {
+      logger.error("Send failed", { network, error })
+      setError(
+        error instanceof RpcError
+          ? error.userMessage
+          : describeError(error, "The transaction could not be sent.")
+      )
+
+      // Only record a failure that actually reached the network. A pre-broadcast
+      // failure has no hash, and the old synthetic `failed-<timestamp>` value was
+      // not a valid hash yet was still rendered as an explorer link.
+      if (broadcastHash !== "") {
+        updateTransactionStatus(broadcastHash, "failed")
+      }
     } finally {
       setIsSending(false)
     }
@@ -176,59 +234,107 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
 
   return (
     <>
-      <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50">
-        <div className="bg-gray-800 p-6 rounded-2xl shadow-lg w-full max-w-md mx-4">
-          <div className="flex justify-between items-center mb-4">
-            <h3 className="text-lg font-bold">
-              Send {currencySymbol}
-              {networkInfo && <span className="text-sm font-normal text-gray-400 ml-2">on {networkInfo.name}</span>}
-            </h3>
-            <button onClick={onClose}>
-              <X size={24} />
-            </button>
-          </div>
-          <div className="space-y-4">
-            {/* Recipient Address with Bookmark Support */}
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="text-sm font-bold text-gray-300">Recipient Address</label>
-                <button
-                  onClick={() => setShowBookmarkManager(true)}
-                  className="text-xs text-purple-400 hover:text-purple-300 flex items-center gap-1"
-                >
-                  <Bookmark size={14} />
-                  {bookmarks.length > 0 ? `(${bookmarks.length})` : "Add"}
-                </button>
-              </div>
+      <ResponsiveDialog
+        isOpen
+        onClose={onClose}
+        title={`Send ${currencySymbol}`}
+        description={networkInfo ? `On ${networkInfo.name}` : undefined}
+        footer={
+          <Button
+            onClick={handleSend}
+            disabled={isSending || !recipient || !amount}
+            isLoading={isSending}
+            loadingLabel="Sending…"
+            variant="success"
+            fullWidth
+            icon={<Send size={18} aria-hidden="true" />}
+          >
+            Send
+          </Button>
+        }
+      >
+        {/* Recipient Address with Bookmark Support */}
+        <div className="space-y-1.5">
+          <Field
+            label="Recipient Address"
+            required
+            action={
+              <Button
+                variant="link"
+                size="sm"
+                className="h-auto px-0"
+                onClick={() => setShowBookmarkManager(true)}
+                icon={<Bookmark size={14} aria-hidden="true" />}
+              >
+                {bookmarks.length > 0 ? `Bookmarks (${bookmarks.length})` : "Add bookmark"}
+              </Button>
+            }
+          >
+            {(props) => (
               <div className="relative">
                 <input
+                  {...props}
                   type="text"
                   value={recipient}
                   onChange={(e) => setRecipient(e.target.value)}
-                  className="w-full p-2 bg-black/20 rounded-lg mt-1 pr-24"
+                  className={cn(monoInputClassName, bookmarks.length > 0 && "pr-20")}
                   placeholder="0x..."
+                  autoComplete="off"
+                  autoCorrect="off"
+                  autoCapitalize="off"
+                  spellCheck={false}
                 />
+
                 {/* Bookmark Dropdown Button */}
                 {bookmarks.length > 0 && (
                   <button
+                    type="button"
                     onClick={() => setIsBookmarkDropdownOpen(!isBookmarkDropdownOpen)}
-                    className="absolute right-1 top-1/2 -translate-y-1/2 bg-purple-600 hover:bg-purple-700 rounded-lg px-2 py-1 text-xs flex items-center gap-1 h-5/6"
+                    aria-expanded={isBookmarkDropdownOpen}
+                    aria-controls={BOOKMARK_LIST_ID}
+                    aria-haspopup="true"
+                    aria-label={
+                      isBookmarkDropdownOpen ? "Hide saved addresses" : "Show saved addresses"
+                    }
+                    className={cn(
+                      "absolute right-1 top-1/2 flex h-10 -translate-y-1/2 items-center gap-1 rounded-md px-2",
+                      "bg-primary text-xs text-primary-foreground transition-colors hover:bg-primary/90",
+                      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    )}
                   >
-                    <Bookmark size={14} />
-                    <ChevronDown size={14} className={isBookmarkDropdownOpen ? "rotate-180" : ""} />
+                    <Bookmark size={14} aria-hidden="true" />
+                    <ChevronDown
+                      size={14}
+                      aria-hidden="true"
+                      className={isBookmarkDropdownOpen ? "rotate-180" : ""}
+                    />
                   </button>
                 )}
+
                 {/* Bookmark Dropdown List */}
                 {isBookmarkDropdownOpen && bookmarks.length > 0 && (
-                  <div className="absolute top-full left-0 right-0 mt-1 bg-gray-700 rounded-lg shadow-lg border border-white/10 z-50 max-h-48 overflow-y-auto">
+                  <div
+                    id={BOOKMARK_LIST_ID}
+                    role="group"
+                    aria-label="Saved addresses"
+                    className={cn(
+                      "absolute left-0 right-0 top-full z-50 mt-1 max-h-48 overflow-y-auto",
+                      "rounded-lg border border-border bg-card shadow-glass-lg"
+                    )}
+                  >
                     {bookmarks.map((b) => (
                       <button
                         key={b.id}
+                        type="button"
                         onClick={() => handleSelectBookmark(b.address)}
-                        className="w-full text-left px-3 py-2 hover:bg-black/30 transition-colors text-sm flex flex-col"
+                        className={cn(
+                          "flex w-full min-h-[44px] flex-col justify-center px-3 py-2 text-left text-sm",
+                          "transition-colors hover:bg-secondary",
+                          "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+                        )}
                       >
-                        <span className="font-semibold text-white">{b.label}</span>
-                        <span className="text-xs text-gray-400 font-mono truncate">
+                        <span className="font-semibold text-foreground">{b.label}</span>
+                        <span className="break-all font-mono text-xs text-muted-foreground">
                           {b.address}
                         </span>
                       </button>
@@ -236,51 +342,79 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
                   </div>
                 )}
               </div>
-              {isBookmarked && (
-                <p className="text-xs text-green-400 mt-1">✓ Bookmarked address</p>
-              )}
-            </div>
+            )}
+          </Field>
 
-            {/* Amount */}
-            <div>
-              <label className="text-sm font-bold text-gray-300">Amount ({currencySymbol})</label>
-              <div className="relative flex items-center">
-                <input
-                  type="number"
-                  value={amount}
-                  onChange={(e) => setAmount(e.target.value)}
-                  className="w-full p-2 bg-black/20 rounded-lg mt-1 pr-16"
-                  placeholder="0.1"
-                  step="any"
-                />
-                <button
-                  onClick={handleSetMaxAmount}
-                  disabled={isCalculatingMax}
-                  className="absolute right-1 top-1/2 -translate-y-1/2 bg-purple-600 px-3 py-1 text-xs rounded-md hover:bg-purple-700 disabled:bg-gray-500 h-5/6 flex items-center"
-                >
-                  {isCalculatingMax ? <Loader2 className="animate-spin" size={16} /> : "Max"}
-                </button>
-              </div>
-            </div>
-
-            {error && <p className="text-red-400 text-sm">{error}</p>}
-
-            <button
-              onClick={handleSend}
-              disabled={isSending || !recipient || !amount}
-              className="w-full bg-green-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-green-700 transition-colors disabled:bg-gray-500"
-            >
-              {isSending ? (
-                <Loader2 className="animate-spin mx-auto" />
-              ) : (
-                <div className="flex items-center justify-center">
-                  <Send size={20} className="mr-2" /> Send
-                </div>
-              )}
-            </button>
-          </div>
+          {isBookmarked && (
+            <p className="flex items-center gap-1 text-xs text-success">
+              <Check size={12} aria-hidden="true" />
+              Bookmarked address
+            </p>
+          )}
         </div>
-      </div>
+
+        {/* Amount */}
+        <Field
+          label={`Amount (${currencySymbol})`}
+          required
+          action={
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={handleSetMaxAmount}
+              isLoading={isCalculatingMax}
+              loadingLabel="Calculating…"
+              aria-label={`Use maximum available ${currencySymbol}`}
+            >
+              Max
+            </Button>
+          }
+        >
+          {(props) => (
+            <input
+              {...props}
+              type="number"
+              inputMode="decimal"
+              value={amount}
+              onChange={(e) => setAmount(e.target.value)}
+              className={inputClassName}
+              placeholder="0.1"
+              step="any"
+            />
+          )}
+        </Field>
+
+        {/* Summary. Every value here is already in state, so this costs no extra
+            RPC call; the gas figure is deliberately absent because the estimate
+            is only made at send time. */}
+        {(recipient !== "" || amount !== "") && (
+          <Card variant="inset" padding="sm">
+            <dl className="space-y-2 text-sm">
+              <div className="flex justify-between gap-3">
+                <dt className="shrink-0 text-muted-foreground">Network</dt>
+                <dd className="text-right font-medium">{networkInfo?.name ?? network}</dd>
+              </div>
+              <div className="flex justify-between gap-3">
+                <dt className="shrink-0 text-muted-foreground">To</dt>
+                <dd className="min-w-0 break-all text-right font-mono text-xs">
+                  {recipient || "—"}
+                </dd>
+              </div>
+              <div className="flex justify-between gap-3 border-t border-border/60 pt-2">
+                <dt className="shrink-0 text-muted-foreground">Amount</dt>
+                <dd className="text-right font-mono font-semibold">
+                  {amount || "—"} {currencySymbol}
+                </dd>
+              </div>
+            </dl>
+            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+              The network fee is estimated when you send and is charged on top of this amount.
+            </p>
+          </Card>
+        )}
+
+        {error && <Alert tone="danger">{error}</Alert>}
+      </ResponsiveDialog>
 
       {/* Bookmark Manager Modal */}
       <BookmarkManager

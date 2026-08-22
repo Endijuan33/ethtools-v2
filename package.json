@@ -1,14 +1,17 @@
 {
-  "name": "ethereum-address-converter",
-  "version": "1.0.0",
+  "name": "ethtools",
+  "version": "2.0.0",
   "private": true,
-  "description": "Secure client-side Ethereum address converter from mnemonic or private key",
-  "envNote": "Optional env vars: NEXT_PUBLIC_ROUTESCAN_MAINNET_URL, NEXT_PUBLIC_ROUTESCAN_TESTNET_URL",
+  "description": "Client-side Ethereum wallet utility. Keys are encrypted in the browser and never sent to a server.",
   "scripts": {
     "build": "next build",
     "dev": "next dev",
     "lint": "next lint",
-    "start": "next start"
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "pretest": "tsc -p tsconfig.test.json",
+    "test": "node --test \".test-build/__tests__/*.test.js\"",
+    "verify": "pnpm typecheck && pnpm lint && pnpm test"
   },
   "dependencies": {
     "@emotion/is-prop-valid": "latest",
@@ -66,6 +69,7 @@
     "vaul": "^1.1.2"
   },
   "devDependencies": {
+    "@next/swc-wasm-nodejs": "14.2.4",
     "@types/node": "^20.19.23",
     "@types/react": "^18.3.26",
     "@types/react-dom": "^18.3.7",
