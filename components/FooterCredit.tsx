@@ -9,10 +9,10 @@ import { Github } from "lucide-react"
  */
 export default function FooterCredit() {
   return (
-    <footer className="mt-10 border-t border-border/60 px-4 py-6 text-center text-muted-foreground">
+    <footer className="mt-10 border-t border-border/60 px-4 pb-24 pt-6 text-center text-muted-foreground lg:pb-6">
       <p className="text-xs">
         © {new Date().getFullYear()} built by{" "}
-        <span className="font-medium text-foreground">endcore.base.eth</span>
+        <span className="font-medium text-gradient">endcore.base.eth</span>
       </p>
 
       <div className="mt-2 flex items-center justify-center gap-4">

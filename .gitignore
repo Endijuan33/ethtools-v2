@@ -31,3 +31,6 @@ next-env.d.ts
 
 # local dev server logs
 /.devlogs/
+
+# automated UI review screenshots
+/.review-screens/

@@ -51,7 +51,7 @@ export function EmptyState({ title, description, action, icon, className }: Empt
     <div className={cn("flex flex-col items-center gap-3 px-4 py-10 text-center", className)}>
       {icon && (
         <span
-          className="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground"
+          className="flex h-14 w-14 items-center justify-center rounded-2xl border border-primary/20 bg-gradient-to-b from-primary/15 to-transparent text-primary"
           aria-hidden="true"
         >
           {icon}

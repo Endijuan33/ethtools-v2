@@ -85,7 +85,7 @@ export default function ResponsiveDialog({
           <Drawer.Content
             className={cn(
               "fixed inset-x-0 bottom-0 z-50 flex max-h-[92dvh] flex-col",
-              "rounded-t-2xl border-t border-border bg-card text-card-foreground",
+              "rounded-t-3xl border-t border-border bg-card text-card-foreground",
               "shadow-glass-lg focus-visible:outline-none"
             )}
           >

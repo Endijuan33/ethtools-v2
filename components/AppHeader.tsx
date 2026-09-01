@@ -32,16 +32,16 @@ export default function AppHeader({ actions, isLocked }: AppHeaderProps) {
         {/* Identity */}
         <a
           href="/"
-          className="flex min-w-0 items-center gap-2.5 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex min-w-0 items-center gap-2.5 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           <span
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-primary text-primary-foreground"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary to-info text-primary-foreground shadow-glow-sm"
             aria-hidden="true"
           >
             <ShieldCheck className="h-[18px] w-[18px]" />
           </span>
           <span className="min-w-0">
-            <span className="block truncate text-sm font-semibold leading-tight tracking-tight">
+            <span className="block truncate text-[15px] font-semibold leading-tight tracking-tight">
               EthTools
             </span>
             <span className="hidden text-xs leading-tight text-muted-foreground sm:block">

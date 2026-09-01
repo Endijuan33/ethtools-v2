@@ -315,6 +315,9 @@ export default function WalletVault() {
       }
     }
 
+    // Clear the "Wallet locked." notice left over from locking; showing it on
+    // the unlocked screen would state the opposite of the current state.
+    setNotice("")
     setBusy(false)
     setPayload(opened.value)
     setStage("unlocked")
@@ -421,7 +424,13 @@ export default function WalletVault() {
   if (stage === "setup") {
     return shell(
       <>
-        <CardHeader>
+        <CardHeader className="flex-col items-center text-center">
+          <span
+            className="mb-1 flex h-14 w-14 items-center justify-center rounded-2xl border border-primary/25 bg-gradient-to-b from-primary/15 to-transparent text-primary shadow-glow-sm"
+            aria-hidden="true"
+          >
+            <ShieldCheck className="h-6 w-6" />
+          </span>
           <div className="min-w-0">
             <CardTitle>Create your wallet</CardTitle>
             <CardDescription>
@@ -602,10 +611,18 @@ export default function WalletVault() {
   if (stage === "locked") {
     return shell(
       <>
-        <CardHeader>
-          <div className="flex items-center gap-2">
-            <Lock className="h-5 w-5 text-primary" aria-hidden="true" />
+        <CardHeader className="flex-col items-center text-center">
+          <span
+            className="mb-1 flex h-14 w-14 items-center justify-center rounded-2xl border border-primary/25 bg-gradient-to-b from-primary/15 to-transparent text-primary shadow-glow-sm"
+            aria-hidden="true"
+          >
+            <Lock className="h-6 w-6" />
+          </span>
+          <div className="min-w-0">
             <CardTitle>Wallet locked</CardTitle>
+            <CardDescription>
+              Enter your vault password to decrypt your accounts on this device.
+            </CardDescription>
           </div>
           <Badge tone="success" dot>
             Encrypted

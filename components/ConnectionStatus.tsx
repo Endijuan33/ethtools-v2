@@ -36,7 +36,9 @@ export default function ConnectionStatus() {
       aria-live="polite"
       // Bottom-anchored and inert: it sits in the thumb zone on a phone without
       // covering the header, and never intercepts a tap meant for the page.
-      className="pb-safe pointer-events-none fixed inset-x-0 bottom-0 z-50 px-4"
+      // Raised above the mobile tab bar (56px + safe area + gap) on small
+      // screens; on desktop there is no tab bar to clear.
+      className="pb-safe pointer-events-none fixed inset-x-0 bottom-24 z-50 px-4 lg:bottom-0"
     >
       <div className="mx-auto flex max-w-md items-start gap-3 rounded-xl border border-warning/35 bg-card/95 px-3 py-2.5 shadow-glass-lg backdrop-blur">
         <WifiOff className="mt-0.5 h-4 w-4 shrink-0 text-warning" aria-hidden="true" />

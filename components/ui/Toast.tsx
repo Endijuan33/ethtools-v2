@@ -25,7 +25,10 @@ export function Toaster() {
       // Errors stay until dismissed; a failed transaction must not vanish.
       duration={4500}
       gap={10}
-      offset={16}
+      // Desktop toasts start below the 64px sticky header so a persistent
+      // error toast can never sit on top of the header controls; mobile toasts
+      // are lifted above the fixed section tab bar (56px + safe area).
+      offset={isDesktop ? 80 : 92}
       toastOptions={{
         classNames: {
           toast:

@@ -88,9 +88,17 @@ const config: Config = {
         // Layered rather than one large blur: a single wide shadow produces a
         // muddy halo on dark backgrounds instead of reading as elevation.
         glass:
-          "0 1px 1px hsl(224 71% 4% / 0.04), 0 8px 24px -8px hsl(224 71% 4% / 0.12), 0 16px 48px -24px hsl(224 71% 4% / 0.18)",
+          "0 1px 1px hsl(230 26% 4% / 0.04), 0 8px 24px -8px hsl(230 26% 4% / 0.12), 0 16px 48px -24px hsl(230 26% 4% / 0.18)",
         "glass-lg":
-          "0 1px 1px hsl(224 71% 4% / 0.05), 0 16px 40px -12px hsl(224 71% 4% / 0.18), 0 32px 72px -32px hsl(224 71% 4% / 0.24)",
+          "0 1px 1px hsl(230 26% 4% / 0.05), 0 16px 40px -12px hsl(230 26% 4% / 0.18), 0 32px 72px -32px hsl(230 26% 4% / 0.24)",
+        // Elevation used when a card lifts on hover.
+        "glass-hover":
+          "0 1px 1px hsl(230 26% 4% / 0.05), 0 12px 32px -10px hsl(230 26% 4% / 0.18), 0 24px 64px -28px hsl(230 26% 4% / 0.26)",
+        // Brand halo for primary actions and the active nav pill.
+        glow: "0 0 0 1px hsl(var(--primary) / 0.25), 0 4px 20px -2px hsl(var(--primary) / 0.45)",
+        "glow-sm": "0 2px 12px -2px hsl(var(--primary) / 0.4)",
+        "glow-success": "0 2px 12px -2px hsl(var(--success) / 0.45)",
+        "glow-destructive": "0 2px 12px -2px hsl(var(--destructive) / 0.45)",
       },
       keyframes: {
         "accordion-down": {

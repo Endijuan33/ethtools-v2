@@ -126,7 +126,7 @@ export default function Tabs<T extends string>({
               <motion.span
                 layoutId={`${layoutGroupId}-indicator`}
                 transition={{ type: "spring", stiffness: 400, damping: 32 }}
-                className="absolute inset-0 rounded-lg bg-primary shadow-sm"
+                className="absolute inset-0 rounded-lg bg-gradient-to-b from-primary to-primary/90 shadow-glow-sm"
                 aria-hidden="true"
               />
             )}

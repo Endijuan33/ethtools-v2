@@ -60,28 +60,30 @@
   }
 
   .dark {
-    /* A deep blue-tinted neutral rather than pure black. Pure black smears
-       during scroll on OLED and removes any sense of depth between layers. */
-    --background: 224 71% 4%;
-    --foreground: 210 20% 98%;
+    /* A deep navy-neutral rather than pure black. Pure black smears during
+       scroll on OLED and removes any sense of depth between layers. The
+       saturation is deliberately restrained: a highly chromatic base makes
+       every coloured accent vibrate against it. */
+    --background: 230 26% 4%;
+    --foreground: 220 28% 97%;
 
-    --card: 224 44% 8%;
-    --card-foreground: 210 20% 98%;
-    --popover: 224 44% 9%;
-    --popover-foreground: 210 20% 98%;
+    --card: 230 22% 7%;
+    --card-foreground: 220 28% 97%;
+    --popover: 230 22% 8%;
+    --popover-foreground: 220 28% 97%;
 
-    --surface: 220 33% 11%;
-    --surface-foreground: 210 20% 98%;
+    --surface: 230 18% 10%;
+    --surface-foreground: 220 28% 97%;
 
-    --primary: 263 85% 70%;
-    --primary-foreground: 224 71% 6%;
+    --primary: 262 85% 71%;
+    --primary-foreground: 230 26% 5%;
 
-    --secondary: 215 28% 16%;
-    --secondary-foreground: 210 20% 96%;
-    --muted: 215 28% 16%;
-    --muted-foreground: 218 14% 71%;
-    --accent: 263 40% 22%;
-    --accent-foreground: 263 85% 88%;
+    --secondary: 228 14% 13%;
+    --secondary-foreground: 220 25% 96%;
+    --muted: 228 14% 13%;
+    --muted-foreground: 222 13% 68%;
+    --accent: 262 35% 20%;
+    --accent-foreground: 262 85% 90%;
 
     /* Lightened for dark surfaces so status text keeps its contrast ratio. */
     --success: 142 69% 58%;
@@ -172,9 +174,15 @@
 /* ==================================================================== */
 
 @layer utilities {
-  /* Frosted panel shared by cards, dialogs, and the app header. */
+  /* Frosted panel shared by cards, dialogs, and the app header. The hairline
+     top highlight sells the "lit from above" depth of real glass. */
   .surface-glass {
     background-color: hsl(var(--surface) / 0.72);
+    background-image: linear-gradient(
+      to bottom,
+      hsl(var(--foreground) / 0.04),
+      transparent 120px
+    );
     backdrop-filter: blur(16px) saturate(140%);
     -webkit-backdrop-filter: blur(16px) saturate(140%);
   }
@@ -182,8 +190,26 @@
   /* Ambient page backdrop. Rendered behind content and non-interactive. */
   .app-backdrop {
     background-image:
-      radial-gradient(55rem 55rem at 10% -12%, hsl(var(--primary) / 0.18), transparent 60%),
-      radial-gradient(45rem 45rem at 105% 4%, hsl(var(--info) / 0.14), transparent 55%);
+      radial-gradient(55rem 55rem at 10% -12%, hsl(var(--primary) / 0.16), transparent 60%),
+      radial-gradient(45rem 45rem at 105% 4%, hsl(var(--info) / 0.12), transparent 55%),
+      radial-gradient(38rem 38rem at 50% 118%, hsl(var(--primary) / 0.1), transparent 60%);
+  }
+
+  /* Brand gradient, used for headline accents and the logo mark. */
+  .text-gradient {
+    background-image: linear-gradient(
+      135deg,
+      hsl(var(--primary)),
+      hsl(var(--info)) 130%
+    );
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  /* Soft halo behind the primary action or the logo mark. */
+  .glow-primary {
+    box-shadow: 0 0 24px hsl(var(--primary) / 0.35);
   }
 
   /* Hairline rule that reads correctly in both themes. */
@@ -207,6 +233,27 @@
     -webkit-box-orient: vertical;
     -webkit-line-clamp: 2;
     overflow: hidden;
+  }
+
+  /*
+   * Section panel entrance. Driven by a key-driven remount in app/page.tsx so
+   * there is no exit-completion callback to miss (see the note there). The
+   * global prefers-reduced-motion rule near the bottom of this file reduces
+   * this to a no-op for users who ask for less motion.
+   */
+  .animate-panel-in {
+    animation: panel-in 0.18s cubic-bezier(0.2, 0, 0, 1);
+  }
+}
+
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
   }
 }
 

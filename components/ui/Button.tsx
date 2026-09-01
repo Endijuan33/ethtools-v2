@@ -28,13 +28,21 @@ const buttonVariants = cva(
   {
     variants: {
       variant: {
-        primary: "bg-primary text-primary-foreground shadow-sm hover:bg-primary/90",
-        secondary: "bg-secondary text-secondary-foreground hover:bg-secondary/80",
+        // Vertical gradient plus a brand halo: the primary action should read
+        // as "lit" rather than flat, which is what separates a premium CTA
+        // from a default-filled rectangle. Brightness on hover keeps the
+        // gradient; swapping to a flat hover colour would flatten it.
+        primary:
+          "bg-gradient-to-b from-primary to-primary/90 text-primary-foreground shadow-glow-sm hover:shadow-glow hover:brightness-[1.06]",
+        secondary:
+          "border border-border/60 bg-secondary text-secondary-foreground hover:bg-secondary/70",
         outline:
-          "border border-input bg-transparent hover:bg-secondary hover:text-secondary-foreground",
+          "border border-input bg-background/40 hover:border-input/80 hover:bg-secondary hover:text-secondary-foreground",
         ghost: "text-muted-foreground hover:bg-secondary hover:text-foreground",
-        danger: "bg-destructive text-destructive-foreground shadow-sm hover:bg-destructive/90",
-        success: "bg-success text-success-foreground shadow-sm hover:bg-success/90",
+        danger:
+          "bg-destructive text-destructive-foreground shadow-glow-destructive hover:brightness-110",
+        success:
+          "bg-success text-success-foreground shadow-glow-success hover:brightness-110",
         link: "text-primary underline-offset-4 hover:underline",
       },
       size: {

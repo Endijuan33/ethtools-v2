@@ -4,8 +4,8 @@
  * Application shell.
  *
  * Structured as a dashboard rather than a stack of forms: a sticky header, a
- * persistent navigation rail (a horizontal scroller on mobile, a sidebar from
- * `lg`), and a content region that swaps panels.
+ * persistent sidebar rail on desktop with a fixed glass tab bar on mobile, and
+ * a content region that swaps panels.
  *
  * Only the active panel mounts. That is deliberate for a wallet: an unmounted
  * panel cannot keep polling an RPC or hold a decrypted secret in state.
@@ -17,9 +17,9 @@
 
 import { useState } from "react"
 import dynamic from "next/dynamic"
-import { AnimatePresence, motion, useReducedMotion } from "framer-motion"
 import { ArrowLeftRight, KeyRound, Sparkles, Wallet, Wrench } from "lucide-react"
 import AppHeader from "@/components/AppHeader"
+import { MobileTabBar, SidebarNav } from "@/components/AppNav"
 import InputCard from "@/components/InputCard"
 import AddressCard from "@/components/AddressCard"
 import ConnectionStatus from "@/components/ConnectionStatus"
@@ -27,7 +27,6 @@ import ErrorBoundary from "@/components/ErrorBoundary"
 import FooterCredit from "@/components/FooterCredit"
 import Alert from "@/components/ui/Alert"
 import { Spinner } from "@/components/ui/Feedback"
-import { cn } from "@/lib/utils"
 import { classifySecret } from "@/lib/hdWallet"
 import { getAddressFromMnemonic, getAddressFromPrivateKey } from "@/lib/ethers"
 import { describeError, logger } from "@/lib/logger"
@@ -113,7 +112,6 @@ export default function Home() {
   const [isLoading, setIsLoading] = useState(false)
   const [network, setNetwork] = useState<Network>("mainnet")
   const [section, setSection] = useState<SectionId>("vault")
-  const reduceMotion = useReducedMotion()
 
   const handleConvert = (input: string, selectedNetwork: Network) => {
     setIsLoading(true)
@@ -145,6 +143,7 @@ export default function Home() {
   }
 
   const active = SECTIONS.find((entry) => entry.id === section) ?? SECTIONS[0]
+  const ActiveIcon = active.icon
 
   return (
     <div className="relative flex min-h-[100dvh] flex-col">
@@ -153,71 +152,50 @@ export default function Home() {
 
       <AppHeader />
 
-      <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 px-4 py-6 sm:px-6 lg:flex-row lg:gap-8 lg:py-8">
-        {/* Navigation: horizontal scroller on mobile, sidebar from lg. */}
-        <nav aria-label="Sections" className="-mx-4 shrink-0 px-4 lg:mx-0 lg:w-56 lg:px-0">
-          <ul
-            className={cn(
-              "flex gap-2 overflow-x-auto pb-2",
-              // Hide the scrollbar on the mobile rail; the overflow is obvious
-              // from the clipped final item.
-              "[scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
-              "lg:flex-col lg:overflow-visible lg:pb-0"
-            )}
-          >
-            {SECTIONS.map(({ id, label, description, icon: Icon }) => {
-              const selected = id === section
-              return (
-                <li key={id} className="shrink-0 lg:w-full">
-                  <button
-                    type="button"
-                    onClick={() => setSection(id)}
-                    aria-current={selected ? "page" : undefined}
-                    className={cn(
-                      "group flex w-full min-h-[44px] items-center gap-2.5 rounded-xl border px-3 py-2 text-left transition-colors",
-                      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                      selected
-                        ? "border-primary/40 bg-primary/10 text-foreground"
-                        : "border-transparent text-muted-foreground hover:bg-secondary hover:text-foreground"
-                    )}
-                  >
-                    <Icon
-                      className={cn(
-                        "h-4 w-4 shrink-0",
-                        selected ? "text-primary" : "text-muted-foreground"
-                      )}
-                      aria-hidden="true"
-                    />
-                    <span className="min-w-0">
-                      <span className="block text-sm font-medium leading-tight">{label}</span>
-                      <span className="hidden text-xs leading-tight text-muted-foreground lg:block">
-                        {description}
-                      </span>
-                    </span>
-                  </button>
-                </li>
-              )
-            })}
-          </ul>
-        </nav>
+      {/*
+        Bottom padding clears the fixed mobile tab bar (56px + safe area) so the
+        footer credit is never covered. Desktop has no tab bar and keeps the
+        normal rhythm.
+      */}
+      <div className="mx-auto flex w-full max-w-6xl flex-1 flex-col gap-6 px-4 py-6 pb-28 sm:px-6 lg:flex-row lg:gap-8 lg:py-8 lg:pb-8">
+        {/* Navigation: fixed glass tab bar on mobile, sticky sidebar from lg. */}
+        <aside className="hidden shrink-0 lg:block lg:w-60">
+          <div className="lg:sticky lg:top-24">
+            <SidebarNav items={SECTIONS} value={section} onChange={setSection} />
+          </div>
+        </aside>
 
         {/* Content */}
         <main className="min-w-0 flex-1">
-          <div className="mb-5">
-            <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">{active.label}</h1>
-            <p className="mt-0.5 text-sm text-muted-foreground">{active.description}</p>
+          <div className="mb-6 flex items-center gap-3">
+            <span
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-primary/25 bg-primary/10 text-primary"
+              aria-hidden="true"
+            >
+              <ActiveIcon className="h-5 w-5" />
+            </span>
+            <div>
+              <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">{active.label}</h1>
+              <p className="mt-0.5 text-sm text-muted-foreground">{active.description}</p>
+            </div>
           </div>
 
-          <AnimatePresence mode="wait" initial={false}>
-            <motion.section
-              key={section}
-              aria-label={active.label}
-              initial={reduceMotion ? false : { opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={reduceMotion ? undefined : { opacity: 0, y: -8 }}
-              transition={{ duration: 0.18, ease: [0.2, 0, 0, 1] }}
-              className="flex flex-col items-center gap-6"
-            >
+          {/*
+            Panel swap via remount + CSS animation, not AnimatePresence.
+
+            AnimatePresence's exit machinery (framer-motion 11.18) never fires
+            its exit-complete callback for the vault panel's subtree, which —
+            with `mode="wait"` — permanently blocked the next panel from
+            mounting after leaving the vault. A key-driven remount has no
+            callback to miss: the old DOM is gone in the same commit, and the
+            `panel-in` keyframe (globals.css) still plays the entrance
+            transition. The global prefers-reduced-motion rule disables it.
+          */}
+          <section
+            key={section}
+            aria-label={active.label}
+            className="animate-panel-in flex flex-col items-center gap-6"
+          >
               {/*
                 One boundary per panel. A panel that throws is contained: the
                 header, the nav rail, and every other section stay interactive,
@@ -288,12 +266,13 @@ export default function Home() {
                   <DevToolsCard />
                 </ErrorBoundary>
               )}
-            </motion.section>
-          </AnimatePresence>
+          </section>
         </main>
       </div>
 
       <FooterCredit />
+
+      <MobileTabBar items={SECTIONS} value={section} onChange={setSection} />
 
       {/* Mounted once, outside the swapped content, so the banner survives a
           section change and a panel-level failure. */}
