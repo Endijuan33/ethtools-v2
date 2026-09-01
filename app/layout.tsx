@@ -57,11 +57,9 @@ export const metadata: Metadata = {
     "Client-side Ethereum wallet utility. Keys are encrypted in your browser and never sent to a server.",
   applicationName: "EthTools",
   icons: {
-    icon: [
-      { url: "/icon.svg", type: "image/svg+xml" },
-      { url: "/icon-light-32x32.png", sizes: "32x32", media: "(prefers-color-scheme: light)" },
-      { url: "/icon-dark-32x32.png", sizes: "32x32", media: "(prefers-color-scheme: dark)" },
-    ],
+    // The brand mark is a coloured tile that reads on both light and dark
+    // chrome, so a single SVG serves every scheme — no per-theme PNG pair.
+    icon: [{ url: "/icon.svg", type: "image/svg+xml" }],
     apple: "/apple-icon.png",
   },
 

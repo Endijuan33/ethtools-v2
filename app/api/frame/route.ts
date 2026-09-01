@@ -3,7 +3,7 @@ export const dynamic = 'force-dynamic';
 export async function GET() {
   const miniappEmbed = JSON.stringify({
     version: "1",
-    imageUrl: "https://ethtools.vercel.app/placeholder-logo.png",
+    imageUrl: "https://ethtools.vercel.app/apple-icon.png",
     buttons: [
       {
         title: "Open App",
@@ -11,8 +11,8 @@ export async function GET() {
           type: "launch_miniapp",
           url: "https://ethtools.vercel.app",
           name: "EthTools",
-          splashImageUrl: "https://ethtools.vercel.app/placeholder-logo.png",
-          splashBackgroundColor: "#eeccff"
+          splashImageUrl: "https://ethtools.vercel.app/apple-icon.png",
+          splashBackgroundColor: "#8B5CF6"
         }
       },
       {
@@ -38,7 +38,7 @@ export async function GET() {
 
   <!-- Legacy Frames v1 Fallback (MUST use name, not property) -->
   <meta name="fc:frame" content="vNext" />
-  <meta name="fc:frame:image" content="https://ethtools.vercel.app/placeholder-logo.png" />
+  <meta name="fc:frame:image" content="https://ethtools.vercel.app/apple-icon.png" />
   <meta name="fc:frame:image:aspect_ratio" content="1.91:1" />
   <meta name="fc:frame:button:1" content="Open App" />
   <meta name="fc:frame:button:1:action" content="link" />
@@ -50,7 +50,7 @@ export async function GET() {
   <!-- OpenGraph (still uses property) -->
   <meta property="og:title" content="EthTools MiniApp" />
   <meta property="og:description" content="Tools for Ethereum users" />
-  <meta property="og:image" content="https://ethtools.vercel.app/placeholder-logo.png" />
+  <meta property="og:image" content="https://ethtools.vercel.app/apple-icon.png" />
 </head>
 <body>
   <h1>Welcome to EthTools</h1>

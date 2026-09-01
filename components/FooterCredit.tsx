@@ -1,11 +1,12 @@
-import Image from "next/image"
-import { Github } from "lucide-react"
+import { Github, Send } from "lucide-react"
 
 /**
  * Footer credit and project links.
  *
- * Deliberately low-contrast and small: it is attribution, not a call to action.
- * The year is computed rather than hardcoded so it cannot go stale.
+ * Deliberately low-contrast and small: it is attribution, not a call to
+ * action. The year is computed rather than hardcoded so it cannot go stale.
+ * Both link glyphs are generic lucide icons (ISC-licensed) rather than
+ * third-party brand assets.
  */
 export default function FooterCredit() {
   return (
@@ -32,16 +33,9 @@ export default function FooterCredit() {
           target="_blank"
           rel="noopener noreferrer"
           aria-label="Contact the author on Telegram (opens in a new tab)"
-          className="group flex min-h-[44px] flex-col items-center justify-center gap-1 rounded-lg px-3 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex min-h-[44px] flex-col items-center justify-center gap-1 rounded-lg px-3 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
-          <Image
-            src="/icons/telegram.svg"
-            alt=""
-            width={20}
-            height={20}
-            aria-hidden="true"
-            className="opacity-70 transition-opacity group-hover:opacity-100"
-          />
+          <Send className="h-5 w-5 opacity-80" aria-hidden="true" />
           <span className="text-xs">Contact</span>
         </a>
       </div>
