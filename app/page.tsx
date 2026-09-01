@@ -55,6 +55,11 @@ const GeneratorCard = dynamic(() => import("@/components/GeneratorCard"), {
   loading: () => <Spinner label="Loading generator…" />,
 })
 
+const VanityGeneratorCard = dynamic(() => import("@/components/VanityGeneratorCard"), {
+  ssr: false,
+  loading: () => <Spinner label="Loading vanity generator…" />,
+})
+
 const WalletCard = dynamic(() => import("@/components/WalletCard"), {
   ssr: false,
   loading: () => <Spinner label="Loading balances…" />,
@@ -250,9 +255,17 @@ export default function Home() {
               )}
 
               {section === "generator" && (
-                <ErrorBoundary name="Generator">
-                  <GeneratorCard />
-                </ErrorBoundary>
+                <>
+                  <ErrorBoundary name="Generator">
+                    <GeneratorCard />
+                  </ErrorBoundary>
+                  {/* Its own boundary: the vanity search runs a Web Worker with
+                      its own failure modes, and a crash there must not take
+                      the mnemonic generator down with it. */}
+                  <ErrorBoundary name="Vanity generator">
+                    <VanityGeneratorCard />
+                  </ErrorBoundary>
+                </>
               )}
 
               {section === "wallet" && (

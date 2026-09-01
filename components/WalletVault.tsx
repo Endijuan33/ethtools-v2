@@ -18,9 +18,11 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import dynamic from "next/dynamic"
 import {
   Eye,
   FileJson,
+  Fingerprint,
   KeyRound,
   Lock,
   LockOpen,
@@ -71,6 +73,13 @@ import {
   setActiveAccountId,
   unlockVault,
 } from "@/lib/vaultStore"
+import {
+  enrollPasskeyUnlock,
+  hasPasskeyUnlock,
+  isPasskeyUnlockAvailable,
+  removePasskeyUnlock,
+  unlockWithPasskey,
+} from "@/lib/webauthnUnlock"
 import { NETWORKS } from "@/lib/ethers"
 import {
   AUTOLOCK_MINUTES_CHOICES,
@@ -84,6 +93,16 @@ import {
 
 type Stage = "checking" | "setup" | "locked" | "unlocked"
 type SetupMode = "generate" | "import"
+
+/*
+ * The WalletConnect panel pulls in the Reown SDK (relay + websocket code,
+ * a meaningful chunk). Code-splitting it keeps that cost off the vault bundle
+ * until the panel is actually rendered.
+ */
+const WalletConnectPanel = dynamic(() => import("./WalletConnectPanel"), {
+  ssr: false,
+  loading: () => <Spinner label="Loading WalletConnect…" />,
+})
 
 /** Setup paths offered on a device with no vault yet. */
 const SETUP_MODES = [
@@ -140,6 +159,21 @@ export default function WalletVault() {
     DEFAULT_AUTOLOCK_MINUTES
   )
 
+  // Optional passkey unlock (experimental). `passkeySupported` is a capability
+  // hint read after mount — WebAuthn cannot be probed during server rendering —
+  // and only gates the ENROLL control; `passkeyEnrolled` reflects a valid
+  // envelope in storage. The password path stays primary in every state.
+  const [passkeySupported, setPasskeySupported] = useState(false)
+  const [passkeyEnrolled, setPasskeyEnrolled] = useState(false)
+  const [showPasskeyEnroll, setShowPasskeyEnroll] = useState(false)
+  // The enroll dialog asks for the vault password to prove possession before
+  // wrapping it (the unlocked state alone must never be enough to enroll a
+  // passkey and thereby learn the password). Cleared the moment the dialog
+  // closes or the ceremony ends — never kept around.
+  const [passkeyPassword, setPasskeyPassword] = useState("")
+  const [passkeyError, setPasskeyError] = useState("")
+  const [passkeyBusy, setPasskeyBusy] = useState(false)
+
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const strength = assessPassword(newPassword)
 
@@ -149,6 +183,8 @@ export default function WalletVault() {
     setLegacyCount(detectLegacyWallets().length)
     setActiveId(getActiveAccountId())
     setAutolockMinutes(getAutolockMinutes())
+    setPasskeySupported(isPasskeyUnlockAvailable())
+    setPasskeyEnrolled(hasPasskeyUnlock())
     setStage(hasVault() ? "locked" : "setup")
   }, [])
 
@@ -162,6 +198,11 @@ export default function WalletVault() {
       setWatchLabel("")
       setWatchAddress("")
       setWatchError("")
+      // Passkey-enrollment dialog state: the typed password is a secret and
+      // must never outlive the interaction that asked for it.
+      setShowPasskeyEnroll(false)
+      setPasskeyPassword("")
+      setPasskeyError("")
       // A recovered keystore key is a secret like any other; never let one
       // outlive the interaction that produced it.
       setSetupKeystore(null)
@@ -410,41 +451,91 @@ export default function WalletVault() {
 
   // ===== Unlock =====
 
+  /**
+   * Shared success path for every unlock (typed password or passkey).
+   *
+   * Folds any legacy cleartext wallets into the vault, then drops into the
+   * unlocked stage. Busy state is the caller's concern: the password and
+   * passkey flows report progress through different controls.
+   */
+  const completeUnlock = useCallback(
+    async (candidate: string, opened: VaultPayload): Promise<void> => {
+      if (legacyCount > 0) {
+        const migrated = await migrateLegacyWallets(candidate, opened)
+        if (migrated.ok && migrated.value.migrated > 0) {
+          setLegacyCount(0)
+          setNotice(
+            `Secured ${migrated.value.migrated} wallet(s) that were previously stored unencrypted.`
+          )
+          const refreshed = await unlockVault(candidate)
+          if (refreshed.ok) {
+            setPayload(refreshed.value)
+            setStage("unlocked")
+            return
+          }
+        }
+      }
+
+      // Clear the "Wallet locked." notice left over from locking; showing it on
+      // the unlocked screen would state the opposite of the current state.
+      setNotice("")
+      setPayload(opened)
+      setStage("unlocked")
+    },
+    [legacyCount]
+  )
+
   const handleUnlock = useCallback(async () => {
     setError("")
     setBusy(true)
-
-    const opened = await unlockVault(password)
-    if (!opened.ok) {
-      setBusy(false)
-      setError(opened.error)
-      return
-    }
-
-    if (legacyCount > 0) {
-      const migrated = await migrateLegacyWallets(password, opened.value)
-      if (migrated.ok && migrated.value.migrated > 0) {
-        setLegacyCount(0)
-        setNotice(
-          `Secured ${migrated.value.migrated} wallet(s) that were previously stored unencrypted.`
-        )
-        const refreshed = await unlockVault(password)
-        if (refreshed.ok) {
-          setPayload(refreshed.value)
-          setBusy(false)
-          setStage("unlocked")
-          return
-        }
+    try {
+      const opened = await unlockVault(password)
+      if (!opened.ok) {
+        setError(opened.error)
+        return
       }
+      await completeUnlock(password, opened.value)
+    } finally {
+      setBusy(false)
     }
+  }, [password, completeUnlock])
 
-    // Clear the "Wallet locked." notice left over from locking; showing it on
-    // the unlocked screen would state the opposite of the current state.
-    setNotice("")
-    setBusy(false)
-    setPayload(opened.value)
-    setStage("unlocked")
-  }, [legacyCount, password])
+  /**
+   * Unlock via the passkey envelope.
+   *
+   * The ceremony unwraps the vault password, which then flows through the same
+   * `completeUnlock` path as a typed password. A wrap that no longer opens the
+   * vault (the password changed since enrollment) is reported as stale — fail
+   * closed to the password path, never a bypass — with re-enrollment offered
+   * from the unlocked view once the user is back in.
+   */
+  const handleUnlockWithPasskey = useCallback(async () => {
+    setError("")
+    setPasskeyBusy(true)
+    try {
+      const unwrapped = await unlockWithPasskey()
+      if (!unwrapped.ok) {
+        setError(unwrapped.error)
+        return
+      }
+
+      const candidate = unwrapped.value
+      const opened = await unlockVault(candidate)
+      if (!opened.ok) {
+        setError(
+          "Passkey unlock no longer matches this vault. Unlock with your password, then remove and set up the passkey again."
+        )
+        return
+      }
+
+      // The password now exists in memory exactly as if typed: later re-seals
+      // of the vault (add/remove account) need it, mirroring the typed path.
+      setPassword(candidate)
+      await completeUnlock(candidate, opened.value)
+    } finally {
+      setPasskeyBusy(false)
+    }
+  }, [completeUnlock])
 
   // ===== Account management =====
 
@@ -609,6 +700,72 @@ export default function WalletVault() {
       return
     }
     setAutolockMinutes(minutes)
+  }, [])
+
+  // ===== Passkey unlock (experimental) =====
+
+  const closePasskeyEnroll = useCallback(() => {
+    setShowPasskeyEnroll(false)
+    setPasskeyPassword("")
+    setPasskeyError("")
+  }, [])
+
+  /**
+   * Enroll passkey unlock from the unlocked view.
+   *
+   * The dialog asks for the vault password even though the vault is unlocked:
+   * wrapping the password into a passkey-opened envelope must require PROOF of
+   * the password, not momentary access to an unlocked screen. The typed value
+   * is verified against the stored vault, used for the ceremony, and cleared —
+   * never kept longer than the interaction.
+   */
+  const handlePasskeyEnroll = useCallback(async () => {
+    setPasskeyError("")
+    if (passkeyPassword === "") {
+      setPasskeyError("Enter your vault password.")
+      return
+    }
+
+    setPasskeyBusy(true)
+    try {
+      // Verify before wrapping: a wrong password must never be baked into the
+      // envelope, where it would silently break passkey unlock later.
+      const verified = await unlockVault(passkeyPassword)
+      if (!verified.ok) {
+        setPasskeyError("Incorrect vault password.")
+        return
+      }
+
+      const enrolled = await enrollPasskeyUnlock(passkeyPassword)
+      if (!enrolled.ok) {
+        setPasskeyError(enrolled.error)
+        return
+      }
+
+      setPasskeyEnrolled(true)
+      setShowPasskeyEnroll(false)
+      notify.success(
+        "Passkey unlock enabled",
+        "You can now unlock the vault with this device's passkey. Your password always works too."
+      )
+    } finally {
+      setPasskeyPassword("")
+      setPasskeyBusy(false)
+    }
+  }, [passkeyPassword])
+
+  const handlePasskeyRemove = useCallback(async () => {
+    const confirmed = await confirmAction({
+      message: "Remove passkey unlock?",
+      description:
+        "The passkey will no longer unlock this vault on this device. Your password and encrypted vault are unaffected.",
+      confirmLabel: "Remove",
+    })
+    if (!confirmed) return
+
+    removePasskeyUnlock()
+    setPasskeyEnrolled(false)
+    notify.info("Passkey unlock removed")
   }, [])
 
   const activeAccount = useMemo(
@@ -959,6 +1116,29 @@ export default function WalletVault() {
         {banners}
 
         <div className="space-y-4">
+          {/*
+            Offered only when an envelope exists — enrollment implies this
+            browser created it. A ceremony that fails (wrong browser state,
+            cancelled prompt) falls back to the password field right below.
+          */}
+          {passkeyEnrolled && (
+            <>
+              <Button
+                variant="outline"
+                onClick={() => void handleUnlockWithPasskey()}
+                isLoading={passkeyBusy}
+                loadingLabel="Waiting for passkey…"
+                fullWidth
+                icon={<Fingerprint className="h-4 w-4" aria-hidden="true" />}
+              >
+                Unlock with passkey
+              </Button>
+              <p className="text-center text-xs text-muted-foreground">
+                or unlock with your password
+              </p>
+            </>
+          )}
+
           <Field label="Vault password" required>
             {(props) => (
               <input
@@ -1159,6 +1339,24 @@ export default function WalletVault() {
             watchOnly={activeAccount.watchOnly}
           />
 
+          {/*
+            Wallet-side dApp connections for the active account. Keyed by
+            address like the portfolio card: a session's pending requests and
+            signing keys belong to one account, and a stale panel wired to the
+            previous key would be a signing hazard, not just a display bug.
+            The key crosses this boundary only to sign locally — everything
+            sent back to the dApp is a signature, never the key.
+          */}
+          {activeAccount.privateKey && !activeAccount.watchOnly && (
+            <WalletConnectPanel
+              key={activeAccount.address}
+              account={{
+                address: activeAccount.address,
+                privateKey: activeAccount.privateKey,
+              }}
+            />
+          )}
+
           {activeAccount.watchOnly ? (
             /* No secret exists to show for a watch-only address, and rendering
                the vault's recovery phrase here would wrongly imply the address
@@ -1204,6 +1402,37 @@ export default function WalletVault() {
           ))}
         </select>
         <span>of inactivity.</span>
+      </div>
+
+      {/*
+        Passkey unlock (experimental), placed beside the auto-lock control
+        because both are device-local security preferences. The enroll control
+        is gated on capability detection so unsupported browsers never see an
+        offer they cannot complete; an enrolled passkey always leaves the
+        password path fully available.
+      */}
+      <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-2 border-t border-border pt-3 text-xs text-muted-foreground">
+        <Fingerprint className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <span>Passkey unlock</span>
+        <Badge tone="warning">Experimental</Badge>
+        {/* Spacer pushing the state controls to the right on wide screens. */}
+        <span className="min-w-0 flex-1" aria-hidden="true" />
+        {passkeyEnrolled ? (
+          <>
+            <Badge tone="success" dot>
+              Enabled
+            </Badge>
+            <Button variant="ghost" size="sm" onClick={() => void handlePasskeyRemove()}>
+              Remove
+            </Button>
+          </>
+        ) : passkeySupported ? (
+          <Button variant="ghost" size="sm" onClick={() => setShowPasskeyEnroll(true)}>
+            Set up
+          </Button>
+        ) : (
+          <span className="text-muted-foreground/70">Not available in this browser</span>
+        )}
       </div>
 
       <ResponsiveDialog
@@ -1317,6 +1546,60 @@ export default function WalletVault() {
           nothing can be sent from a watch address here. Remove it at any time; there is nothing
           to back up for it.
         </Alert>
+      </ResponsiveDialog>
+
+      <ResponsiveDialog
+        isOpen={showPasskeyEnroll}
+        onClose={closePasskeyEnroll}
+        title="Set up passkey unlock"
+        description="Optional, and experimental — your vault password always works."
+        footer={
+          <>
+            <Button variant="secondary" onClick={closePasskeyEnroll}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => void handlePasskeyEnroll()}
+              isLoading={passkeyBusy}
+              loadingLabel="Waiting for passkey…"
+              disabled={passkeyPassword === ""}
+              icon={<Fingerprint className="h-4 w-4" aria-hidden="true" />}
+            >
+              Continue
+            </Button>
+          </>
+        }
+      >
+        {/* Dialog-local errors: a card-level banner would sit behind the
+            overlay and never be seen. */}
+        {passkeyError && <Alert tone="danger">{passkeyError}</Alert>}
+
+        <Alert tone="info" title="How this works.">
+          Your vault password is encrypted with a key derived from this device&apos;s passkey
+          and stored here. Unlocking with the passkey simply retrieves that password — the
+          vault and its password stay exactly as they are today. Losing the passkey loses
+          nothing: the password always unlocks the vault.
+        </Alert>
+
+        <Field
+          label="Vault password"
+          required
+          hint="Typed once to confirm before the passkey is set up. It is never stored in the clear."
+        >
+          {(props) => (
+            <input
+              {...props}
+              {...secretInputProps}
+              type="password"
+              value={passkeyPassword}
+              onChange={(e) => {
+                setPasskeyPassword(e.target.value)
+                setPasskeyError("")
+              }}
+              className={inputClassName}
+            />
+          )}
+        </Field>
       </ResponsiveDialog>
 
       <BackupManager

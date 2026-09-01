@@ -22,6 +22,14 @@ export const STORAGE_KEYS = {
    * "never lock".
    */
   AUTOLOCK_MINUTES: "vault.autolockMinutes",
+  /**
+   * Passkey-unlock envelope: the vault password wrapped under a key derived
+   * from a WebAuthn credential's PRF extension. Not the vault itself, and not
+   * readable without the matching passkey — but registered here so "erase all
+   * data" removes it alongside the vault, and so every read goes through the
+   * schema guard instead of trusting `localStorage` blindly.
+   */
+  VAULT_PASSKEY: "vault.passkey",
   CUSTOM_NETWORKS: "ethtools_custom_networks",
   TRANSACTION_HISTORY: "ethtools_transaction_history",
   BOOKMARKS: "ethtools_bookmarks",

@@ -201,6 +201,68 @@ export function isAutolockMinutes(value: unknown): value is AutoLockMinutes {
   )
 }
 
+// ===== Passkey unlock envelope =====
+
+/** Current passkey-unlock envelope format version. Bump on breaking changes. */
+export const PASSKEY_ENVELOPE_VERSION = 1
+
+/** The vault password wrapped under a WebAuthn PRF-derived AES-GCM key. */
+export interface PasskeyWrappedPassword {
+  /** Base64 12-byte AES-GCM initialization vector. */
+  iv: string
+  /** Base64 AES-GCM ciphertext of the password, authentication tag appended. */
+  cipher: string
+}
+
+/**
+ * The additive "Unlock with passkey" record.
+ *
+ * This is NOT the vault: the canonical encrypted vault in `lib/vaultStore.ts`
+ * is untouched. It is a second envelope that stores the vault password itself,
+ * encrypted under a key only the matching passkey's PRF output can re-derive.
+ * Without the credential the record is inert ciphertext, so corrupting it can
+ * only disable the feature — never bypass the password.
+ *
+ * @see lib/webauthnUnlock.ts for the ceremony that produces and consumes it.
+ */
+export interface PasskeyUnlockEnvelope {
+  /** Envelope format version ({@link PASSKEY_ENVELOPE_VERSION}). */
+  version: number
+  /** Base64 id of the one credential whose PRF can re-derive the wrapping key. */
+  credentialId: string
+  /** Base64 salt fed to the PRF evaluation; fixes the derived key per enrollment. */
+  salt: string
+  /**
+   * Base64 16-byte user handle generated per enrollment. Stored so each
+   * enrollment creates a DISTINCT credential (a fresh handle never collides
+   * with a passkey the authenticator already holds for this site).
+   */
+  userHandle: string
+  /** The vault password wrapped under the PRF-derived key. */
+  envelope: PasskeyWrappedPassword
+}
+
+/**
+ * Whether a value is a readable passkey-unlock envelope.
+ *
+ * Applies to untrusted `localStorage`, so the exact version is part of the
+ * check: an entry written by a future format must read as ABSENT, which makes
+ * the feature degrade to "passkey unlock unavailable, use your password"
+ * instead of feeding an unknown shape to the crypto layer. Base64 fields are
+ * only length-capped here; exact byte lengths are enforced at decode time.
+ */
+export function isPasskeyUnlockEnvelope(value: unknown): value is PasskeyUnlockEnvelope {
+  if (!isRecord(value)) return false
+  if (value.version !== PASSKEY_ENVELOPE_VERSION) return false
+  if (!isNonEmptyString(value.credentialId, 2048)) return false
+  if (!isNonEmptyString(value.salt, 128)) return false
+  if (!isNonEmptyString(value.userHandle, 128)) return false
+  if (!isRecord(value.envelope)) return false
+  if (!isNonEmptyString(value.envelope.iv, 64)) return false
+  if (!isNonEmptyString(value.envelope.cipher, 8192)) return false
+  return true
+}
+
 /** A saved address label. */
 export interface StoredBookmark {
   id: string
