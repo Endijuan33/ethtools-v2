@@ -21,6 +21,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Eye,
   FileJson,
+  KeyRound,
   Lock,
   LockOpen,
   Plus,
@@ -45,6 +46,7 @@ import BackupManager from "./BackupManager"
 import PortfolioCard from "./PortfolioCard"
 import { truncateHex } from "@/lib/format"
 import { assessPassword, isVaultSupported } from "@/lib/vault"
+import { decryptKeystore, MAX_KEYSTORE_BYTES, type RecoveredKeystoreAccount } from "@/lib/keystore"
 import {
   DEFAULT_PRESET_ID,
   classifySecret,
@@ -113,6 +115,14 @@ export default function WalletVault() {
   const [confirmPassword, setConfirmPassword] = useState("")
   const [acknowledged, setAcknowledged] = useState(false)
 
+  // Setup: a key recovered from a V3 keystore file, waiting for vault creation.
+  // Held decrypted in memory only, exactly like a typed private key, and never
+  // rendered — only its public address is displayed.
+  const [setupKeystore, setSetupKeystore] = useState<RecoveredKeystoreAccount | null>(null)
+  const [setupKeystoreFile, setSetupKeystoreFile] = useState<File | null>(null)
+  const [setupKeystorePassword, setSetupKeystorePassword] = useState("")
+  const setupKeystoreFileRef = useRef<HTMLInputElement | null>(null)
+
   const [legacyCount, setLegacyCount] = useState(0)
   const [showDerive, setShowDerive] = useState(false)
   const [showBackup, setShowBackup] = useState(false)
@@ -152,6 +162,10 @@ export default function WalletVault() {
       setWatchLabel("")
       setWatchAddress("")
       setWatchError("")
+      // A recovered keystore key is a secret like any other; never let one
+      // outlive the interaction that produced it.
+      setSetupKeystore(null)
+      setSetupKeystorePassword("")
       setStage(hasVault() ? "locked" : "setup")
       setNotice(reason ?? "")
       setError("")
@@ -199,6 +213,54 @@ export default function WalletVault() {
     setAcknowledged(false)
   }, [wordCount])
 
+  /**
+   * Decrypt a keystore (V3) file during setup, feeding its key into the normal
+   * "import existing" creation path.
+   *
+   * This exists because a keystore file is the one common key format a fresh
+   * device has no other way to consume: the setup textarea accepts phrases and
+   * raw keys, but pasting keystore JSON would only fail classification, and
+   * the decrypted key must never be displayed — so it never touches the
+   * textarea. Only the recovered address is shown; the key itself goes
+   * straight into vault creation.
+   */
+  const handleUnlockSetupKeystore = useCallback(async () => {
+    setError("")
+    if (!setupKeystoreFile) {
+      setError("Choose a keystore file first.")
+      return
+    }
+    if (setupKeystoreFile.size > MAX_KEYSTORE_BYTES) {
+      setError("That file is too large to be a keystore.")
+      return
+    }
+
+    setBusy(true)
+    try {
+      const raw = await setupKeystoreFile.text()
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(raw)
+      } catch {
+        setError("This file is not valid JSON.")
+        return
+      }
+
+      const opened = await decryptKeystore(parsed, setupKeystorePassword)
+      if (!opened.ok) {
+        setError(opened.error)
+        return
+      }
+
+      setSetupKeystore(opened.value)
+      setSetupKeystorePassword("")
+    } catch {
+      setError("Could not read that file.")
+    } finally {
+      setBusy(false)
+    }
+  }, [setupKeystoreFile, setupKeystorePassword])
+
   const handleCreate = useCallback(async () => {
     setError("")
 
@@ -224,6 +286,18 @@ export default function WalletVault() {
         return
       }
       mnemonic = draftPhrase
+    } else if (setupKeystore !== null) {
+      // A keystore the user unlocked above: its key is already recovered and
+      // validated, so it flows straight into the new vault without ever being
+      // displayed.
+      accounts = [
+        {
+          id: crypto.randomUUID?.() ?? `account-${Date.now()}`,
+          label: "Imported keystore",
+          address: setupKeystore.address,
+          privateKey: setupKeystore.privateKey,
+        },
+      ]
     } else {
       const classified = classifySecret(importInput)
       if (classified.kind === "mnemonic") {
@@ -317,6 +391,10 @@ export default function WalletVault() {
     setNewPassword("")
     setConfirmPassword("")
     setAcknowledged(false)
+    setSetupKeystore(null)
+    setSetupKeystoreFile(null)
+    setSetupKeystorePassword("")
+    if (setupKeystoreFileRef.current) setupKeystoreFileRef.current.value = ""
   }, [
     acknowledged,
     bip39Passphrase,
@@ -325,6 +403,7 @@ export default function WalletVault() {
     importInput,
     legacyCount,
     newPassword,
+    setupKeystore,
     setupMode,
     strength,
   ])
@@ -383,6 +462,52 @@ export default function WalletVault() {
       setPayload(result.value)
       setShowDerive(false)
       setNotice(`Added ${derived.length} account(s).`)
+    },
+    [password, payload]
+  )
+
+  /**
+   * Add a private key recovered from a keystore (V3) file to the unlocked vault.
+   *
+   * BackupManager owns the keystore format; this side receives the already
+   * decrypted key and re-seals it under the vault password through the same
+   * path every other imported key takes, so the key never touches storage in
+   * the clear. The duplicate check runs here rather than inside
+   * `addAccountsToVault`'s silent skip so the user hears "already present"
+   * instead of nothing happening.
+   */
+  const handleImportKeystoreAccount = useCallback(
+    async (
+      recovered: RecoveredKeystoreAccount
+    ): Promise<{ ok: true } | { ok: false; error: string }> => {
+      if (!payload) return { ok: false, error: "The vault is locked." }
+
+      const duplicate = payload.accounts.some(
+        (a) => a.address.toLowerCase() === recovered.address.toLowerCase()
+      )
+      if (duplicate) {
+        return { ok: false, error: "An account with this address is already in the vault." }
+      }
+
+      setBusy(true)
+      const result = await addAccountsToVault(
+        payload,
+        [
+          {
+            id: crypto.randomUUID?.() ?? `account-${Date.now()}`,
+            label: "Imported keystore",
+            address: recovered.address,
+            privateKey: recovered.privateKey,
+          },
+        ],
+        password
+      )
+      setBusy(false)
+
+      if (!result.ok) return { ok: false, error: result.error }
+
+      setPayload(result.value)
+      return { ok: true }
     },
     [password, payload]
   )
@@ -636,10 +761,101 @@ export default function WalletVault() {
                   value={importInput}
                   onChange={(e) => setImportInput(e.target.value)}
                   rows={3}
+                  disabled={setupKeystore !== null}
                   className={`${inputClassName} resize-none font-mono text-sm`}
                 />
               )}
             </Field>
+          )}
+
+          {setupMode === "import" && (
+            <div className="space-y-3 rounded-xl border border-border bg-muted/20 p-3">
+              <div>
+                <p className="text-sm font-medium text-foreground">
+                  Or import a keystore file (V3)
+                </p>
+                <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                  A keystore JSON from geth, MetaMask, or MyCrypto. Its key is decrypted here in
+                  your browser and added to your new vault.
+                </p>
+              </div>
+
+              {setupKeystore ? (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <p className="min-w-0 flex-1 break-all font-mono text-sm text-success">
+                      {setupKeystore.address}
+                    </p>
+                    <CopyButton value={setupKeystore.address} label="address" />
+                  </div>
+                  <p className="text-xs leading-relaxed text-muted-foreground">
+                    Keystore unlocked — only the address is shown. This account will be imported
+                    into your new vault.
+                  </p>
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      setSetupKeystore(null)
+                      setSetupKeystoreFile(null)
+                      // Clear the picker too, or re-choosing the same file
+                      // would not fire another change event.
+                      if (setupKeystoreFileRef.current) setupKeystoreFileRef.current.value = ""
+                    }}
+                    fullWidth
+                  >
+                    Use a different keystore
+                  </Button>
+                </div>
+              ) : (
+                <>
+                  <Field label="Keystore file" required>
+                    {(props) => (
+                      <input
+                        {...props}
+                        ref={setupKeystoreFileRef}
+                        type="file"
+                        accept="application/json,.json"
+                        onChange={(e) => setSetupKeystoreFile(e.target.files?.[0] ?? null)}
+                        className={cn(
+                          inputClassName,
+                          "cursor-pointer py-2 text-sm",
+                          "file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-primary file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-primary-foreground"
+                        )}
+                      />
+                    )}
+                  </Field>
+
+                  <Field
+                    label="Keystore password"
+                    required
+                    hint="The password set when this file was created — not the vault password you will choose below."
+                  >
+                    {(props) => (
+                      <input
+                        {...props}
+                        {...secretInputProps}
+                        type="password"
+                        value={setupKeystorePassword}
+                        onChange={(e) => setSetupKeystorePassword(e.target.value)}
+                        className={inputClassName}
+                      />
+                    )}
+                  </Field>
+
+                  <Button
+                    variant="outline"
+                    onClick={() => void handleUnlockSetupKeystore()}
+                    isLoading={busy}
+                    loadingLabel="Decrypting…"
+                    fullWidth
+                    disabled={setupKeystoreFile === null || setupKeystorePassword === ""}
+                    icon={<KeyRound className="h-4 w-4" aria-hidden="true" />}
+                  >
+                    Unlock keystore
+                  </Button>
+                </>
+              )}
+            </div>
           )}
 
           <Field
@@ -1116,6 +1332,8 @@ export default function WalletVault() {
               }
             : null
         }
+        getExportAccount={() => activeAccount ?? null}
+        onImportPrivateKey={handleImportKeystoreAccount}
       />
     </>
   )

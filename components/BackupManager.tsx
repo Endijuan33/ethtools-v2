@@ -13,11 +13,13 @@
  * - Restore is atomic; a partial write is rolled back.
  */
 
-import { useCallback, useRef, useState } from "react"
+import { useCallback, useMemo, useRef, useState } from "react"
 import {
   ChevronLeft,
   Download,
   FileJson,
+  FileKey,
+  KeyRound,
   QrCode,
   ShieldAlert,
   Trash2,
@@ -32,6 +34,7 @@ import Alert from "./ui/Alert"
 import Badge from "./ui/Badge"
 import { Spinner } from "./ui/Feedback"
 import { confirmAction, notify } from "./ui/Toast"
+import CopyButton from "./ui/CopyButton"
 import { cn } from "@/lib/utils"
 import {
   applyNonSecretRestore,
@@ -52,6 +55,16 @@ import {
 } from "@/lib/backup"
 import { assessPassword, isVaultSupported } from "@/lib/vault"
 import { clearAllAppData } from "@/lib/storage"
+import { truncateHex } from "@/lib/format"
+import {
+  decryptKeystore,
+  encryptKeystore,
+  isV3Keystore,
+  keystoreFilename,
+  MAX_KEYSTORE_BYTES,
+  type RecoveredKeystoreAccount,
+} from "@/lib/keystore"
+import type { VaultAccount } from "@/lib/schema"
 
 export interface BackupManagerProps {
   isOpen: boolean
@@ -61,13 +74,29 @@ export interface BackupManagerProps {
    * locked or empty; the dialog then offers settings-only export.
    */
   getSecrets?: () => SecretPayload | null
+  /**
+   * The account a keystore (V3) export should target — normally the vault's
+   * active account. The returned object carries that account's private key, so
+   * it must only be supplied while the vault is unlocked. Omit it entirely and
+   * keystore export is not offered.
+   */
+  getExportAccount?: () => VaultAccount | null
+  /**
+   * Imports a private key recovered from a keystore into the unlocked vault.
+   * Supplied by the host, which alone holds the vault password needed to
+   * re-seal the payload; omitted while locked, and keystore import is then
+   * not offered.
+   */
+  onImportPrivateKey?: (
+    recovered: RecoveredKeystoreAccount
+  ) => Promise<{ ok: true } | { ok: false; error: string }>
   /** Network keys a restored custom network may not shadow. */
   reservedNetworkKeys?: readonly string[]
   /** Called after a successful restore so the host can reload its state. */
   onRestored?: (contents: BackupContents) => void
 }
 
-type Panel = "menu" | "export" | "qr" | "import" | "danger"
+type Panel = "menu" | "export" | "qr" | "keystore-export" | "import" | "keystore-import" | "danger"
 
 /** Trigger a file download without navigating away. */
 function downloadTextFile(filename: string, contents: string): void {
@@ -130,6 +159,8 @@ export default function BackupManager({
   isOpen,
   onClose,
   getSecrets,
+  getExportAccount,
+  onImportPrivateKey,
   reservedNetworkKeys = [],
   onRestored,
 }: BackupManagerProps) {
@@ -150,11 +181,48 @@ export default function BackupManager({
   const [restoreMode, setRestoreMode] = useState<RestoreMode>("merge")
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
+  // Keystore (V3) exchange. `recovered` holds a decrypted private key between
+  // the unlock step and the "add to vault" step; it lives in memory only, is
+  // never rendered, and is cleared on add, on re-pick, and on close.
+  const [keystoreFile, setKeystoreFile] = useState<File | null>(null)
+  const [keystoreText, setKeystoreText] = useState("")
+  const [keystorePassword, setKeystorePassword] = useState("")
+  const [recovered, setRecovered] = useState<RecoveredKeystoreAccount | null>(null)
+  const keystoreFileInputRef = useRef<HTMLInputElement | null>(null)
+
   const secrets = getSecrets?.() ?? null
   const hasSecrets =
     secrets !== null && (secrets.mnemonic !== undefined || (secrets.accounts?.length ?? 0) > 0)
   const strength = assessPassword(password)
   const passwordsReady = strength.acceptable && password === confirmPassword
+
+  const exportAccount = getExportAccount?.() ?? null
+  /**
+   * The export target narrowed to an account that actually holds a key. A
+   * watch-only account stores an address only, so it is excluded here and the
+   * panel explains why instead of offering a button that can never work.
+   * Memoized so the export callback below has a stable dependency.
+   */
+  const keystoreTarget = useMemo<{
+    label: string
+    address: string
+    privateKey: string
+  } | null>(() => {
+    if (
+      exportAccount === null ||
+      exportAccount.watchOnly ||
+      typeof exportAccount.privateKey !== "string"
+    ) {
+      return null
+    }
+    return {
+      label: exportAccount.label,
+      address: exportAccount.address,
+      privateKey: exportAccount.privateKey,
+    }
+  }, [exportAccount])
+  const canImportKeystore = onImportPrivateKey !== undefined
+  const hasKeystoreInput = keystoreFile !== null || keystoreText.trim() !== ""
 
   const reset = useCallback(() => {
     setPanel("menu")
@@ -166,7 +234,12 @@ export default function BackupManager({
     setImportPassword("")
     setSelectedFile(null)
     setPendingRestore(null)
+    setKeystoreFile(null)
+    setKeystoreText("")
+    setKeystorePassword("")
+    setRecovered(null)
     if (fileInputRef.current) fileInputRef.current.value = ""
+    if (keystoreFileInputRef.current) keystoreFileInputRef.current.value = ""
   }, [])
 
   const handleClose = useCallback(() => {
@@ -226,6 +299,51 @@ export default function BackupManager({
     setQrPayload(result.value.payload)
   }, [password, secrets])
 
+  /**
+   * Export the active account's private key as a V3 keystore file.
+   *
+   * Behind an explicit confirmation because the resulting file controls funds
+   * on its own, with no vault around it: the dialog states what the file
+   * contains and that a lost keystore password is unrecoverable before any
+   * key material is touched. The key is passed straight from the unlocked
+   * vault to `encryptKeystore` and never rendered or logged.
+   */
+  const handleKeystoreExport = useCallback(async () => {
+    setError("")
+    if (!keystoreTarget) {
+      setError("The active account has no private key available to export.")
+      return
+    }
+
+    const confirmed = await confirmAction({
+      message: "Export this private key as a keystore file?",
+      description: `The file will contain the private key for ${truncateHex(
+        keystoreTarget.address,
+        8,
+        6
+      )}, encrypted with the keystore password you chose. Anyone with both the file and its password can spend funds from this account, and a lost password cannot be recovered.`,
+      confirmLabel: "Export",
+    })
+    if (!confirmed) return
+
+    setBusy(true)
+    const sealed = await encryptKeystore(keystoreTarget.privateKey, password)
+    setBusy(false)
+
+    if (!sealed.ok) {
+      setError(sealed.error)
+      return
+    }
+
+    downloadTextFile(keystoreFilename(sealed.value), JSON.stringify(sealed.value, null, 2))
+    notify.success(
+      "Keystore downloaded",
+      "It opens in geth, MetaMask, MyCrypto, and most wallet tools. Store it somewhere safe."
+    )
+    setPassword("")
+    setConfirmPassword("")
+  }, [keystoreTarget, password])
+
   // ===== Import =====
 
   const handleFileChosen = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
@@ -252,7 +370,19 @@ export default function BackupManager({
       const raw = await selectedFile.text()
       const inspected = inspectBackup(raw)
       if (!inspected.ok) {
-        setError(inspected.error)
+        // A V3 keystore is the other JSON wallet file users reach for; route
+        // them to the keystore import instead of a generic "not a backup".
+        let parsed: unknown = null
+        try {
+          parsed = JSON.parse(raw)
+        } catch {
+          parsed = null
+        }
+        setError(
+          isV3Keystore(parsed)
+            ? "This is a keystore (V3) file, not an EthTools backup. Use Import keystore from the main menu instead."
+            : inspected.error
+        )
         return
       }
       if (inspected.value.requiresPassword && importPassword === "") {
@@ -301,6 +431,83 @@ export default function BackupManager({
     setPanel("menu")
   }, [onRestored, pendingRestore, restoreMode])
 
+  /** Accept a keystore file, bounding its size before it is ever read. */
+  const handleKeystoreFileChosen = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
+    setError("")
+    setRecovered(null)
+    setKeystoreText("")
+    const file = event.target.files?.[0] ?? null
+    if (file && file.size > MAX_KEYSTORE_BYTES) {
+      setError("That file is too large to be a keystore.")
+      setKeystoreFile(null)
+      return
+    }
+    setKeystoreFile(file)
+  }, [])
+
+  /**
+   * Decrypt a picked or pasted keystore with its own password.
+   *
+   * On success only the recovered address is surfaced — the private key sits
+   * in component state solely until the user adds it to the vault, and is
+   * never displayed or copied from here.
+   */
+  const handleUnlockKeystore = useCallback(async () => {
+    setError("")
+    if (!onImportPrivateKey) return
+
+    setBusy(true)
+    try {
+      const raw = keystoreFile !== null ? await keystoreFile.text() : keystoreText
+      if (raw.length > MAX_KEYSTORE_BYTES) {
+        setError("That keystore is too large to be valid.")
+        return
+      }
+
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(raw)
+      } catch {
+        setError("This file is not valid JSON.")
+        return
+      }
+
+      const opened = await decryptKeystore(parsed, keystorePassword)
+      if (!opened.ok) {
+        setError(opened.error)
+        return
+      }
+      setRecovered(opened.value)
+    } catch {
+      setError("Could not read that file.")
+    } finally {
+      setBusy(false)
+    }
+  }, [keystoreFile, keystorePassword, keystoreText, onImportPrivateKey])
+
+  /** Re-seal the recovered key into the vault through the host's import path. */
+  const handleAddKeystoreAccount = useCallback(async () => {
+    setError("")
+    if (!recovered || !onImportPrivateKey) return
+
+    setBusy(true)
+    const added = await onImportPrivateKey(recovered)
+    setBusy(false)
+
+    if (!added.ok) {
+      setError(added.error)
+      return
+    }
+
+    notify.success("Keystore account added", "The key was re-encrypted with your vault password.")
+    setRecovered(null)
+    setKeystoreFile(null)
+    setKeystoreText("")
+    setKeystorePassword("")
+    if (keystoreFileInputRef.current) keystoreFileInputRef.current.value = ""
+    setPanel("menu")
+  }, [onImportPrivateKey, recovered])
+
   const handleErase = useCallback(async () => {
     const confirmed = await confirmAction({
       message: "Erase all data from this device?",
@@ -324,12 +531,16 @@ export default function BackupManager({
 
   // ===== Shared fragments =====
 
-  const passwordFields = (
+  /**
+   * Password + confirm pair with the shared strength assessor. Parameterized so
+   * the keystore export can label it distinctly from backup exports.
+   */
+  const passwordFields = (label: string, hint: string) => (
     <div className="space-y-3">
       <Field
-        label="Backup password"
+        label={label}
         required
-        hint="Used only to encrypt this file. It is never stored or transmitted."
+        hint={hint}
         error={password !== "" && !strength.acceptable ? strength.issues[0] : undefined}
         action={
           password !== "" ? (
@@ -390,7 +601,9 @@ export default function BackupManager({
     menu: "Backup and restore",
     export: "Export backup",
     qr: "QR backup",
+    "keystore-export": "Export keystore",
     import: "Restore backup",
+    "keystore-import": "Import keystore",
     danger: "Erase all data",
   }
 
@@ -428,12 +641,28 @@ export default function BackupManager({
               description="Encrypted QR code you can print or photograph for offline storage."
               onClick={() => setPanel("qr")}
             />
+            {getExportAccount !== undefined && (
+              <MenuRow
+                icon={FileKey}
+                title="Export keystore (V3)"
+                description="A standard keystore file for the active account, encrypted with a password you choose."
+                onClick={() => setPanel("keystore-export")}
+              />
+            )}
             <MenuRow
               icon={Upload}
               title="Restore backup"
               description="Load a previous export. You will see what changes before it applies."
               onClick={() => setPanel("import")}
             />
+            {onImportPrivateKey !== undefined && (
+              <MenuRow
+                icon={KeyRound}
+                title="Import keystore (V3)"
+                description="Recover one account from a keystore file and add it to this vault."
+                onClick={() => setPanel("keystore-import")}
+              />
+            )}
             <MenuRow
               icon={Trash2}
               title="Erase all data"
@@ -466,7 +695,10 @@ export default function BackupManager({
 
           {hasSecrets && isVaultSupported() && (
             <>
-              {passwordFields}
+              {passwordFields(
+                "Backup password",
+                "Used only to encrypt this file. It is never stored or transmitted."
+              )}
               <Button
                 onClick={handleEncryptedExport}
                 isLoading={busy}
@@ -522,7 +754,10 @@ export default function BackupManager({
             </div>
           ) : (
             <>
-              {passwordFields}
+              {passwordFields(
+                "Backup password",
+                "Used only to encrypt this file. It is never stored or transmitted."
+              )}
               <Button
                 onClick={handleQr}
                 isLoading={busy}
@@ -534,6 +769,58 @@ export default function BackupManager({
                 Generate QR code
               </Button>
             </>
+          )}
+
+          {backButton}
+        </div>
+      )}
+
+      {panel === "keystore-export" && (
+        <div className="space-y-4">
+          <Alert tone="danger" title="This file contains a private key.">
+            A keystore file stores the private key of one account, encrypted with the password you
+            choose below. Anyone with both the file and its password can spend everything in that
+            account, and a lost password cannot be recovered. The keystore password protects this
+            file — it does not have to match your vault password.
+          </Alert>
+
+          {keystoreTarget ? (
+            <>
+              <Card variant="inset" padding="sm">
+                <p className="text-sm font-medium text-foreground">{keystoreTarget.label}</p>
+                <p className="mt-0.5 break-all font-mono text-xs text-muted-foreground">
+                  {keystoreTarget.address}
+                </p>
+              </Card>
+
+              {passwordFields(
+                "Keystore password",
+                "Encrypts this keystore file. It is never stored or transmitted, and cannot be recovered if lost."
+              )}
+
+              <Button
+                onClick={handleKeystoreExport}
+                isLoading={busy}
+                loadingLabel="Encrypting…"
+                fullWidth
+                disabled={!passwordsReady}
+                icon={<FileKey className="h-4 w-4" aria-hidden="true" />}
+              >
+                Create keystore file
+              </Button>
+            </>
+          ) : exportAccount ? (
+            /* Only the active account is exported, so the one exclusion users
+               will actually hit — a watch-only account — gets its own reason. */
+            <Alert tone="warning" title="This account has no private key to export.">
+              {exportAccount.watchOnly
+                ? "The active account is watch-only: it stores only an address, so there is no key to export. Select a key-holding account in your wallet, then try again."
+                : "The active account does not expose a private key, so it cannot be exported as a keystore."}
+            </Alert>
+          ) : (
+            <Alert tone="warning">
+              No account is available to export. Unlock your wallet and select an account first.
+            </Alert>
           )}
 
           {backButton}
@@ -671,6 +958,136 @@ export default function BackupManager({
               ) : (
                 <Button onClick={handlePrepareRestore} fullWidth disabled={!selectedFile}>
                   Review backup
+                </Button>
+              )}
+            </>
+          )}
+
+          {backButton}
+        </div>
+      )}
+
+      {panel === "keystore-import" && (
+        <div className="space-y-4">
+          <Alert tone="info" title="One account per file.">
+            A keystore (V3) file holds a single private key, encrypted with the password that was
+            set when the file was created. It is decrypted here in your browser and re-encrypted
+            into your vault; the key itself is never shown or sent anywhere.
+          </Alert>
+
+          {!canImportKeystore ? (
+            <Alert tone="warning" title="Unlock your wallet first.">
+              Keystore import adds the recovered key to your unlocked vault. Close this dialog,
+              unlock the wallet, and reopen backup and restore.
+            </Alert>
+          ) : recovered ? (
+            <>
+              <Card variant="inset" padding="sm" className="space-y-2">
+                <p className="text-sm font-medium text-foreground">Recovered account</p>
+                <div className="flex items-center gap-2">
+                  <p className="min-w-0 flex-1 break-all font-mono text-sm text-success">
+                    {recovered.address}
+                  </p>
+                  <CopyButton value={recovered.address} label="address" />
+                </div>
+                <p className="text-xs leading-relaxed text-muted-foreground">
+                  Only the address is shown. The private key stays in memory until it is
+                  re-encrypted into your vault.
+                </p>
+              </Card>
+
+              <div className="flex gap-3">
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setRecovered(null)
+                    setKeystoreFile(null)
+                    setKeystoreText("")
+                    // Clear the picker too, or re-choosing the same file would
+                    // not fire another change event.
+                    if (keystoreFileInputRef.current) keystoreFileInputRef.current.value = ""
+                  }}
+                  fullWidth
+                >
+                  Use a different file
+                </Button>
+                <Button
+                  onClick={handleAddKeystoreAccount}
+                  isLoading={busy}
+                  loadingLabel="Encrypting…"
+                  fullWidth
+                  icon={<KeyRound className="h-4 w-4" aria-hidden="true" />}
+                >
+                  Add to vault
+                </Button>
+              </div>
+            </>
+          ) : (
+            <>
+              <Field
+                label="Keystore file"
+                hint="A V3 JSON file, e.g. from geth or MetaMask. You can paste its contents below instead."
+              >
+                {(props) => (
+                  <input
+                    {...props}
+                    ref={keystoreFileInputRef}
+                    type="file"
+                    accept="application/json,.json"
+                    onChange={handleKeystoreFileChosen}
+                    className={cn(
+                      inputClassName,
+                      "cursor-pointer py-2 text-sm",
+                      "file:mr-3 file:cursor-pointer file:rounded-md file:border-0 file:bg-primary file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-primary-foreground"
+                    )}
+                  />
+                )}
+              </Field>
+
+              <Field label="Or paste the keystore JSON">
+                {(props) => (
+                  <textarea
+                    {...props}
+                    {...secretInputProps}
+                    value={keystoreText}
+                    onChange={(event) => {
+                      setKeystoreText(event.target.value)
+                      setKeystoreFile(null)
+                    }}
+                    rows={3}
+                    placeholder={'{"version":3,"id":"…","crypto":{…}}'}
+                    className={`${inputClassName} resize-none font-mono text-sm`}
+                  />
+                )}
+              </Field>
+
+              <Field
+                label="Keystore password"
+                required
+                hint="The password set when this file was created — not necessarily your vault password."
+              >
+                {(props) => (
+                  <input
+                    {...props}
+                    {...secretInputProps}
+                    type="password"
+                    value={keystorePassword}
+                    onChange={(event) => setKeystorePassword(event.target.value)}
+                    className={inputClassName}
+                  />
+                )}
+              </Field>
+
+              {busy ? (
+                <Spinner label="Decrypting…" />
+              ) : (
+                <Button
+                  onClick={handleUnlockKeystore}
+                  fullWidth
+                  disabled={!hasKeystoreInput || keystorePassword === ""}
+                  icon={<KeyRound className="h-4 w-4" aria-hidden="true" />}
+                >
+                  Unlock keystore
                 </Button>
               )}
             </>
