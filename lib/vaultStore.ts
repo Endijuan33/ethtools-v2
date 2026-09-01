@@ -13,8 +13,17 @@
  *   the plaintext copy does not linger after a password is set.
  */
 
+import { getAddress, isAddress } from "ethers"
 import { decryptJson, encryptJson, isEncryptedEnvelope } from "./vault"
-import { isVaultPayload, type VaultAccount, type VaultPayload } from "./schema"
+import {
+  DEFAULT_AUTOLOCK_MINUTES,
+  isAutolockMinutes,
+  isVaultAccount,
+  isVaultPayload,
+  type AutoLockMinutes,
+  type VaultAccount,
+  type VaultPayload,
+} from "./schema"
 import {
   readJson,
   readRaw,
@@ -132,6 +141,33 @@ export function setActiveAccountId(id: string | null): WriteResult {
 /** The selected account id, if any. */
 export function getActiveAccountId(): string | null {
   return readRaw(STORAGE_KEYS.ACTIVE_WALLET)
+}
+
+/**
+ * Read the configured idle auto-lock timeout.
+ *
+ * The stored value is untrusted, so it passes the schema's closed choice list;
+ * anything absent, corrupt, or out of range resolves to the default. A hostile
+ * write can therefore only pick one of the allowed timeouts — it can never
+ * disable the idle lock.
+ *
+ * @returns Timeout in minutes.
+ */
+export function getAutolockMinutes(): AutoLockMinutes {
+  return readJson<AutoLockMinutes>(
+    STORAGE_KEYS.AUTOLOCK_MINUTES,
+    isAutolockMinutes,
+    DEFAULT_AUTOLOCK_MINUTES
+  )
+}
+
+/**
+ * Persist the idle auto-lock timeout.
+ *
+ * @param minutes - One of the allowed choices.
+ */
+export function setAutolockMinutes(minutes: AutoLockMinutes): WriteResult {
+  return writeJson(STORAGE_KEYS.AUTOLOCK_MINUTES, minutes)
 }
 
 // ===== Legacy migration =====
@@ -270,6 +306,80 @@ export async function removeAccountFromVault(
     ...current,
     accounts: current.accounts.filter((a) => a.id !== accountId),
   }
+  const saved = await saveVault(payload, password)
+  if (!saved.ok) return saved
+  return { ok: true, value: payload }
+}
+
+// ===== Watch-only accounts =====
+
+/** Generate an id, preferring the platform UUID when it is available. */
+function createId(): string {
+  const platformCrypto = typeof globalThis.crypto === "undefined" ? undefined : globalThis.crypto
+  if (platformCrypto !== undefined && typeof platformCrypto.randomUUID === "function") {
+    return platformCrypto.randomUUID()
+  }
+  return `account-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+/**
+ * Add a watch-only (observability) account to an unlocked vault and persist it.
+ *
+ * A watch-only account stores an address and a label and nothing else — no key,
+ * no derivation data — so displaying it can never require a secret. The address
+ * is normalized to its EIP-55 checksum form before encryption, because for a
+ * hand-entered address the checksum is the only protection against a typo that
+ * would attribute someone else's funds to this vault.
+ *
+ * @param current - Currently unlocked payload.
+ * @param account - Label and address to add.
+ * @param password - Passphrase to re-seal with.
+ */
+export async function addWatchOnlyAccountToVault(
+  current: VaultPayload,
+  account: { label: string; address: string },
+  password: string
+): Promise<VaultStoreResult<VaultPayload>> {
+  const label = account.label.trim()
+  if (label === "") return { ok: false, error: "Enter a label." }
+  if (label.length > 128) {
+    return { ok: false, error: "Choose a label of 128 characters or fewer." }
+  }
+
+  const trimmed = account.address.trim()
+  if (!isAddress(trimmed)) {
+    return { ok: false, error: "This is not a valid Ethereum address." }
+  }
+  let checksummed: string
+  try {
+    checksummed = getAddress(trimmed)
+  } catch {
+    return { ok: false, error: "This is not a valid Ethereum address." }
+  }
+
+  // A duplicate would only ever show one of the two entries as active.
+  const duplicate = current.accounts.some(
+    (a) => a.address.toLowerCase() === checksummed.toLowerCase()
+  )
+  if (duplicate) {
+    return { ok: false, error: "An account with this address is already in the vault." }
+  }
+
+  const added: VaultAccount = {
+    id: createId(),
+    label,
+    address: checksummed,
+    watchOnly: true,
+  }
+
+  // The whole payload is re-validated on every unlock, so an account that
+  // fails validation must never be written: it would make the vault — including
+  // every key-holding account in it — unreadable with its own password.
+  if (!isVaultAccount(added)) {
+    return { ok: false, error: "That watch address could not be added." }
+  }
+
+  const payload: VaultPayload = { ...current, accounts: [...current.accounts, added] }
   const saved = await saveVault(payload, password)
   if (!saved.ok) return saved
   return { ok: true, value: payload }

@@ -2,15 +2,18 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
   addAccountsToVault,
+  addWatchOnlyAccountToVault,
   changeVaultPassword,
   createVault,
   deleteVault,
   detectLegacyWallets,
   getActiveAccountId,
+  getAutolockMinutes,
   hasVault,
   migrateLegacyWallets,
   removeAccountFromVault,
   setActiveAccountId,
+  setAutolockMinutes,
   unlockVault,
 } from "../vaultStore"
 import { createMemoryBackend, readRaw, setStorageBackend, STORAGE_KEYS, writeJson } from "../storage"
@@ -297,6 +300,190 @@ test("tracks the active account id", () => {
     assert.equal(getActiveAccountId(), "abc")
     setActiveAccountId(null)
     assert.equal(getActiveAccountId(), null)
+  } finally {
+    resetStore()
+  }
+})
+
+// ===== Watch-only accounts =====
+
+test("adds a watch-only account and persists it", async () => {
+  useStore()
+  try {
+    const created = await createVault({ accounts: [account("1", A)], password: PASSWORD })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+
+    const added = await addWatchOnlyAccountToVault(
+      created.value,
+      { label: "Cold wallet", address: B },
+      PASSWORD
+    )
+    assert.equal(added.ok, true)
+    if (!added.ok) return
+
+    assert.equal(added.value.accounts.length, 2)
+    const stored = added.value.accounts[1]
+    assert.equal(stored.label, "Cold wallet")
+    assert.equal(stored.address, B)
+    assert.equal(stored.watchOnly, true)
+    assert.equal(stored.privateKey, undefined, "no key may be attached to a watch-only account")
+
+    // The stored vault must still decrypt and pass payload validation.
+    const reopened = await unlockVault(PASSWORD)
+    assert.equal(reopened.ok, true)
+    if (!reopened.ok) return
+    assert.equal(reopened.value.accounts[1].watchOnly, true)
+  } finally {
+    resetStore()
+  }
+})
+
+test("normalizes a lowercase watch address to checksummed form", async () => {
+  useStore()
+  try {
+    const created = await createVault({ accounts: [account("1", A)], password: PASSWORD })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+
+    const added = await addWatchOnlyAccountToVault(
+      created.value,
+      { label: "Cold", address: B.toLowerCase() },
+      PASSWORD
+    )
+    assert.equal(added.ok, true)
+    if (!added.ok) return
+    assert.equal(added.value.accounts[1].address, B, "stored address must be checksummed")
+  } finally {
+    resetStore()
+  }
+})
+
+test("rejects a watch address that duplicates an existing account", async () => {
+  useStore()
+  try {
+    const created = await createVault({ accounts: [account("1", A)], password: PASSWORD })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+
+    // Same address, different casing: the duplicate check is case-insensitive.
+    const added = await addWatchOnlyAccountToVault(
+      created.value,
+      { label: "Dup", address: A.toLowerCase() },
+      PASSWORD
+    )
+    assert.equal(added.ok, false)
+    if (added.ok) return
+    assert.match(added.error, /already in the vault/)
+
+    const reopened = await unlockVault(PASSWORD)
+    assert.equal(reopened.ok, true)
+    if (reopened.ok) assert.equal(reopened.value.accounts.length, 1)
+  } finally {
+    resetStore()
+  }
+})
+
+test("rejects an invalid watch address without touching the vault", async () => {
+  useStore()
+  try {
+    const created = await createVault({ mnemonic: PHRASE, accounts: [], password: PASSWORD })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+
+    const added = await addWatchOnlyAccountToVault(
+      created.value,
+      { label: "Bad", address: "not-an-address" },
+      PASSWORD
+    )
+    assert.equal(added.ok, false)
+
+    // A rejected add must not overwrite the vault that is already stored.
+    const reopened = await unlockVault(PASSWORD)
+    assert.equal(reopened.ok, true)
+    if (!reopened.ok) return
+    assert.equal(reopened.value.mnemonic, PHRASE)
+    assert.equal(reopened.value.accounts.length, 0)
+  } finally {
+    resetStore()
+  }
+})
+
+test("rejects a watch-only add with an empty label", async () => {
+  useStore()
+  try {
+    const created = await createVault({ accounts: [], password: PASSWORD })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+
+    const added = await addWatchOnlyAccountToVault(
+      created.value,
+      { label: "   ", address: B },
+      PASSWORD
+    )
+    assert.equal(added.ok, false)
+    if (added.ok) return
+    assert.match(added.error, /label/i)
+  } finally {
+    resetStore()
+  }
+})
+
+test("a watch-only account survives a password change", async () => {
+  useStore()
+  try {
+    const created = await createVault({ accounts: [], password: PASSWORD })
+    assert.equal(created.ok, true)
+    if (!created.ok) return
+
+    const added = await addWatchOnlyAccountToVault(
+      created.value,
+      { label: "Cold", address: B },
+      PASSWORD
+    )
+    assert.equal(added.ok, true)
+    if (!added.ok) return
+
+    const changed = await changeVaultPassword(PASSWORD, NEW_PASSWORD)
+    assert.equal(changed.ok, true)
+
+    const reopened = await unlockVault(NEW_PASSWORD)
+    assert.equal(reopened.ok, true)
+    if (!reopened.ok) return
+    assert.equal(reopened.value.accounts[0].watchOnly, true)
+  } finally {
+    resetStore()
+  }
+})
+
+// ===== Auto-lock preference =====
+
+test("auto-lock preference round-trips through storage", () => {
+  useStore()
+  try {
+    assert.equal(getAutolockMinutes(), 5, "an absent preference falls back to the default")
+
+    const written = setAutolockMinutes(15)
+    assert.equal(written.ok, true)
+    assert.equal(getAutolockMinutes(), 15)
+
+    setAutolockMinutes(1)
+    assert.equal(getAutolockMinutes(), 1)
+
+    // The preference is plain validated data, never a secret.
+    assert.equal(readRaw(STORAGE_KEYS.AUTOLOCK_MINUTES), "1")
+  } finally {
+    resetStore()
+  }
+})
+
+test("a corrupt auto-lock value degrades to the default, never to no lock", () => {
+  useStore()
+  try {
+    for (const hostile of [0, -1, 999, 5.5, "30", null, [15]]) {
+      writeJson(STORAGE_KEYS.AUTOLOCK_MINUTES, hostile)
+      assert.equal(getAutolockMinutes(), 5, `value ${JSON.stringify(hostile)} must fall back`)
+    }
   } finally {
     resetStore()
   }

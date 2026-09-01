@@ -10,12 +10,24 @@
  *   through `lib/vaultStore.ts`, which encrypts first.
  * - A private key or recovery phrase is rendered only through `SecretField`,
  *   which keeps it out of the DOM until explicitly revealed.
+ * - Watch-only accounts store an address and a label and nothing else, so
+ *   displaying them can never require a secret, and no send flow exists for
+ *   them anywhere in the app.
  * - Existing cleartext wallets are detected and offered migration, because
  *   leaving them in place is a live exposure.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { FileJson, Lock, LockOpen, Plus, ShieldCheck, Trash2, Wallet } from "lucide-react"
+import {
+  Eye,
+  FileJson,
+  Lock,
+  LockOpen,
+  Plus,
+  ShieldCheck,
+  Trash2,
+  Wallet,
+} from "lucide-react"
 import Button from "./ui/Button"
 import Card, { CardDescription, CardHeader, CardTitle } from "./ui/Card"
 import Tabs from "./ui/Tabs"
@@ -44,20 +56,28 @@ import {
 } from "@/lib/hdWallet"
 import {
   addAccountsToVault,
+  addWatchOnlyAccountToVault,
   createVault,
   detectLegacyWallets,
   getActiveAccountId,
+  getAutolockMinutes,
   hasVault,
   migrateLegacyWallets,
   removeAccountFromVault,
+  setAutolockMinutes as persistAutolockMinutes,
   setActiveAccountId,
   unlockVault,
 } from "@/lib/vaultStore"
 import { NETWORKS } from "@/lib/ethers"
-import type { VaultAccount, VaultPayload } from "@/lib/schema"
-
-/** Lock automatically after this much inactivity. */
-const IDLE_LOCK_MS = 5 * 60 * 1000
+import {
+  AUTOLOCK_MINUTES_CHOICES,
+  DEFAULT_AUTOLOCK_MINUTES,
+  isChecksummedAddress,
+  isEthAddress,
+  type AutoLockMinutes,
+  type VaultAccount,
+  type VaultPayload,
+} from "@/lib/schema"
 
 type Stage = "checking" | "setup" | "locked" | "unlocked"
 type SetupMode = "generate" | "import"
@@ -96,6 +116,19 @@ export default function WalletVault() {
   const [showDerive, setShowDerive] = useState(false)
   const [showBackup, setShowBackup] = useState(false)
 
+  // Watch-address form. An address is public information, so this form holds
+  // no secret — but it is still cleared on lock like every other open form.
+  const [showWatch, setShowWatch] = useState(false)
+  const [watchLabel, setWatchLabel] = useState("")
+  const [watchAddress, setWatchAddress] = useState("")
+  const [watchError, setWatchError] = useState("")
+
+  // Idle auto-lock timeout, in minutes. Read from storage once on mount; the
+  // stored default equals the historical hardcoded 5-minute lock.
+  const [autolockMinutes, setAutolockMinutes] = useState<AutoLockMinutes>(
+    DEFAULT_AUTOLOCK_MINUTES
+  )
+
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const strength = assessPassword(newPassword)
 
@@ -104,6 +137,7 @@ export default function WalletVault() {
   useEffect(() => {
     setLegacyCount(detectLegacyWallets().length)
     setActiveId(getActiveAccountId())
+    setAutolockMinutes(getAutolockMinutes())
     setStage(hasVault() ? "locked" : "setup")
   }, [])
 
@@ -113,6 +147,10 @@ export default function WalletVault() {
       setPassword("")
       setShowDerive(false)
       setShowBackup(false)
+      setShowWatch(false)
+      setWatchLabel("")
+      setWatchAddress("")
+      setWatchError("")
       setStage(hasVault() ? "locked" : "setup")
       setNotice(reason ?? "")
       setError("")
@@ -127,8 +165,13 @@ export default function WalletVault() {
     const reset = (): void => {
       if (idleTimer.current) clearTimeout(idleTimer.current)
       idleTimer.current = setTimeout(
-        () => lock("Locked automatically after 5 minutes of inactivity."),
-        IDLE_LOCK_MS
+        () =>
+          lock(
+            `Locked automatically after ${autolockMinutes} minute${
+              autolockMinutes === 1 ? "" : "s"
+            } of inactivity.`
+          ),
+        autolockMinutes * 60_000
       )
     }
 
@@ -140,7 +183,7 @@ export default function WalletVault() {
       events.forEach((event) => window.removeEventListener(event, reset))
       if (idleTimer.current) clearTimeout(idleTimer.current)
     }
-  }, [stage, lock])
+  }, [stage, lock, autolockMinutes])
 
   // ===== Setup =====
 
@@ -347,10 +390,14 @@ export default function WalletVault() {
     async (accountId: string) => {
       if (!payload) return
 
+      const target = payload.accounts.find((a) => a.id === accountId)
       const confirmed = await confirmAction({
         message: "Remove this account from the vault?",
         description:
-          "If it came from your recovery phrase you can derive it again. If it was imported as a private key, make sure that key is saved elsewhere first.",
+          target?.watchOnly
+            ? // A watch-only entry holds nothing but an address and a label.
+              "Only the address and its label are stored, so there is nothing to recover — you can add it back at any time."
+            : "If it came from your recovery phrase you can derive it again. If it was imported as a private key, make sure that key is saved elsewhere first.",
         confirmLabel: "Remove",
       })
       if (!confirmed) return
@@ -373,6 +420,70 @@ export default function WalletVault() {
     },
     [activeId, password, payload]
   )
+
+  /**
+   * Live validation state for the watch-address form.
+   *
+   * The in-form hint is convenience, not the security boundary: the address is
+   * normalized and re-validated inside `vaultStore` before anything is written.
+   */
+  const watchAddressTrimmed = watchAddress.trim()
+  const watchAddressValid = isEthAddress(watchAddressTrimmed)
+  const watchAddressError =
+    watchAddressTrimmed !== "" && !watchAddressValid
+      ? "This is not a valid Ethereum address."
+      : undefined
+  const watchAddressHint =
+    watchAddressValid && !isChecksummedAddress(watchAddressTrimmed)
+      ? "Valid address. It will be stored in EIP-55 checksum form."
+      : undefined
+
+  const handleAddWatchAddress = useCallback(async () => {
+    if (!payload) return
+    setWatchError("")
+
+    const address = watchAddress.trim()
+    if (!isEthAddress(address)) {
+      setWatchError("This is not a valid Ethereum address.")
+      return
+    }
+
+    // Mirror the "Account N" / "Wallet N" convention when no label is given.
+    const label =
+      watchLabel.trim() ||
+      `Watch ${payload.accounts.filter((account) => account.watchOnly).length + 1}`
+
+    setBusy(true)
+    const result = await addWatchOnlyAccountToVault(payload, { label, address }, password)
+    setBusy(false)
+
+    if (!result.ok) {
+      setWatchError(result.error)
+      return
+    }
+    setPayload(result.value)
+    setShowWatch(false)
+    setWatchLabel("")
+    setWatchAddress("")
+    setNotice("Added watch address.")
+  }, [password, payload, watchAddress, watchLabel])
+
+  /**
+   * Apply a new idle auto-lock timeout.
+   *
+   * Persisted before the local value changes, so the visible control can never
+   * claim a setting that failed to save. A refused write (full quota, blocked
+   * storage) re-reads the stored value and surfaces the error.
+   */
+  const handleAutolockChange = useCallback((minutes: AutoLockMinutes) => {
+    const written = persistAutolockMinutes(minutes)
+    if (!written.ok) {
+      setAutolockMinutes(getAutolockMinutes())
+      setError(written.error)
+      return
+    }
+    setAutolockMinutes(minutes)
+  }, [])
 
   const activeAccount = useMemo(
     () => payload?.accounts.find((a) => a.id === activeId) ?? payload?.accounts[0] ?? null,
@@ -747,6 +858,12 @@ export default function WalletVault() {
                       {account.label}
                     </span>
                     {isActive && <Badge tone="primary">Active</Badge>}
+                    {account.watchOnly && (
+                      <Badge tone="info">
+                        <Eye className="h-3 w-3" aria-hidden="true" />
+                        Watch
+                      </Badge>
+                    )}
                   </span>
                   <span className="mt-0.5 block font-mono text-xs text-muted-foreground">
                     {truncateHex(account.address, 10, 8)}
@@ -774,16 +891,28 @@ export default function WalletVault() {
         </ul>
       )}
 
-      {payload?.mnemonic && payload.accounts.length > 0 && (
-        <Button
-          variant="outline"
-          onClick={() => setShowDerive(true)}
-          fullWidth
-          className="mt-3"
-          icon={<Plus className="h-4 w-4" aria-hidden="true" />}
-        >
-          Add accounts from recovery phrase
-        </Button>
+      {payload && (
+        <div className="mt-3 flex flex-col gap-2 sm:flex-row">
+          {payload.mnemonic && payload.accounts.length > 0 && (
+            <Button
+              variant="outline"
+              onClick={() => setShowDerive(true)}
+              className="flex-1"
+              icon={<Plus className="h-4 w-4" aria-hidden="true" />}
+            >
+              Add accounts from recovery phrase
+            </Button>
+          )}
+          {/* Offered even for key-only vaults: a watch address needs no secret. */}
+          <Button
+            variant="outline"
+            onClick={() => setShowWatch(true)}
+            className="flex-1"
+            icon={<Eye className="h-4 w-4" aria-hidden="true" />}
+          >
+            Add watch address
+          </Button>
+        </div>
       )}
 
       {activeAccount && (
@@ -798,25 +927,52 @@ export default function WalletVault() {
             </div>
           </div>
 
-          {activeAccount.privateKey && (
-            <SecretField label="Private key" value={activeAccount.privateKey} allowCopy />
-          )}
+          {activeAccount.watchOnly ? (
+            /* No secret exists to show for a watch-only address, and rendering
+               the vault's recovery phrase here would wrongly imply the address
+               is derived from it. */
+            <Alert tone="info" title="Watch-only address.">
+              This account is observability-only: no private key or recovery phrase is or can be
+              stored for it, so nothing can ever be sent from it here. Reading balances and
+              history needs only the address.
+            </Alert>
+          ) : (
+            <>
+              {activeAccount.privateKey && (
+                <SecretField label="Private key" value={activeAccount.privateKey} allowCopy />
+              )}
 
-          {payload?.mnemonic && (
-            <SecretField
-              label="Recovery phrase"
-              value={payload.mnemonic}
-              variant="phrase"
-              allowCopy
-            />
+              {payload?.mnemonic && (
+                <SecretField
+                  label="Recovery phrase"
+                  value={payload.mnemonic}
+                  variant="phrase"
+                  allowCopy
+                />
+              )}
+            </>
           )}
         </div>
       )}
 
-      <p className="mt-5 flex items-center gap-1.5 border-t border-border pt-3 text-xs text-muted-foreground">
+      <div className="mt-5 flex flex-wrap items-center gap-x-1.5 gap-y-2 border-t border-border pt-3 text-xs text-muted-foreground">
         <ShieldCheck className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-        Encrypted at rest. Locks automatically after 5 minutes of inactivity.
-      </p>
+        <span>Encrypted at rest. Locks automatically after</span>
+        {/* Inline on purpose: the control belongs to the sentence it completes. */}
+        <select
+          value={autolockMinutes}
+          onChange={(e) => handleAutolockChange(Number(e.target.value) as AutoLockMinutes)}
+          aria-label="Auto-lock timeout"
+          className="h-7 rounded-md border border-input bg-background/60 px-1.5 font-medium text-foreground transition-colors hover:border-input/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          {AUTOLOCK_MINUTES_CHOICES.map((minutes) => (
+            <option key={minutes} value={minutes}>
+              {minutes} minute{minutes === 1 ? "" : "s"}
+            </option>
+          ))}
+        </select>
+        <span>of inactivity.</span>
+      </div>
 
       <ResponsiveDialog
         isOpen={showDerive}
@@ -850,6 +1006,85 @@ export default function WalletVault() {
             an imported private key.
           </Alert>
         )}
+      </ResponsiveDialog>
+
+      <ResponsiveDialog
+        isOpen={showWatch}
+        onClose={() => setShowWatch(false)}
+        title="Add watch address"
+        description="Track an address without storing any keys."
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setShowWatch(false)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => void handleAddWatchAddress()}
+              isLoading={busy}
+              loadingLabel="Encrypting…"
+              disabled={!watchAddressValid}
+              icon={<Eye className="h-4 w-4" aria-hidden="true" />}
+            >
+              Add watch address
+            </Button>
+          </>
+        }
+      >
+        {/* Dialog-local errors: a card-level banner would sit behind the
+            overlay and never be seen. */}
+        {watchError && <Alert tone="danger">{watchError}</Alert>}
+
+        <Field label="Label" hint="Optional. Used only to recognize the address.">
+          {(props) => (
+            <input
+              {...props}
+              type="text"
+              value={watchLabel}
+              onChange={(e) => setWatchLabel(e.target.value)}
+              placeholder="e.g., Hardware wallet"
+              className={inputClassName}
+            />
+          )}
+        </Field>
+
+        {/* An address is public data, so this input gets no secret handling —
+            but autocomplete is disabled because browser suggestion dropdowns
+            have no business learning typed addresses. */}
+        <Field
+          label="Address"
+          required
+          error={watchAddressError}
+          hint={watchAddressHint}
+          action={
+            watchAddressValid ? (
+              <Badge tone="success">
+                {isChecksummedAddress(watchAddressTrimmed) ? "Checksummed" : "Valid"}
+              </Badge>
+            ) : undefined
+          }
+        >
+          {(props) => (
+            <input
+              {...props}
+              type="text"
+              value={watchAddress}
+              onChange={(e) => {
+                setWatchAddress(e.target.value)
+                setWatchError("")
+              }}
+              placeholder="0x..."
+              autoComplete="off"
+              spellCheck={false}
+              className={monoInputClassName}
+            />
+          )}
+        </Field>
+
+        <Alert tone="info" title="Observability only.">
+          Only the address and label are stored — never a private key or recovery phrase — so
+          nothing can be sent from a watch address here. Remove it at any time; there is nothing
+          to back up for it.
+        </Alert>
       </ResponsiveDialog>
 
       <BackupManager

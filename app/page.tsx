@@ -65,6 +65,11 @@ const TransactionHistory = dynamic(() => import("@/components/TransactionHistory
   loading: () => <Spinner label="Loading transaction history…" />,
 })
 
+const RpcHealthPanel = dynamic(() => import("@/components/RpcHealthPanel"), {
+  ssr: false,
+  loading: () => <Spinner label="Loading RPC health…" />,
+})
+
 const DevToolsCard = dynamic(() => import("@/components/DevToolsCard"), {
   ssr: false,
   loading: () => <Spinner label="Loading tools…" />,
@@ -256,6 +261,15 @@ export default function Home() {
                         the balance panel down with it. */}
                     <ErrorBoundary name="Transaction history">
                       <TransactionHistory />
+                    </ErrorBoundary>
+                  </div>
+                  {/* RPC health reports on the pools the panels above drive, so
+                      it lives beneath them in the same section. */}
+                  <div className="w-full max-w-2xl">
+                    {/* Its own boundary: a failure reading pool state must not
+                        take the balance or history panels down with it. */}
+                    <ErrorBoundary name="RPC health">
+                      <RpcHealthPanel />
                     </ErrorBoundary>
                   </div>
                 </>

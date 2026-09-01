@@ -88,7 +88,100 @@ export interface PoolHealth {
   healthyEndpoints: number
   /** Best observed latency across healthy endpoints, or null. */
   bestLatencyMs: number | null
+  /** Times work moved from one endpoint to another after failures. */
+  failovers: number
   endpoints: EndpointHealthStatus[]
+}
+
+/**
+ * Latency at which a usable pool is still reported as degraded.
+ *
+ * Public endpoints answer in a few hundred milliseconds; two seconds is where an
+ * interactive balance refresh starts to feel broken even though it succeeds. An
+ * endpoint degrading past this soon collides with the request timeout and gets
+ * benched anyway, so the tier needs no further hysteresis.
+ */
+export const DEGRADED_POOL_LATENCY_MS = 2_000
+
+/** Coarse display tier for a pool. */
+export type PoolHealthTier = "idle" | "healthy" | "degraded" | "down"
+
+/** Pool health reduced to a display tier and a sentence explaining it. */
+export interface PoolHealthSummary {
+  tier: PoolHealthTier
+  /**
+   * Short human-readable explanation, safe to render directly. Empty for the
+   * idle tier, where the label alone says everything there is to say.
+   */
+  reason: string
+}
+
+/**
+ * Reduce a pool's health snapshot to a display tier.
+ *
+ * The pool deliberately reports raw observations — benches, latencies, failure
+ * counters — because those are facts. Turning them into "healthy / degraded /
+ * down" is a presentation decision, so it lives in this pure function rather
+ * than inside the pool: it can be unit-tested without a provider and re-tuned
+ * without touching request logic.
+ *
+ * `null` means no pool exists, which renders as idle: claiming an uncontacted
+ * network is "healthy" would assert something that was never observed.
+ *
+ * @param health - Snapshot from {@link RpcPool.getHealth}, or null when the
+ *   network has not been contacted this session.
+ */
+export function summarizePoolHealth(health: PoolHealth | null): PoolHealthSummary {
+  if (health === null) return { tier: "idle", reason: "" }
+
+  // A pool with no recorded outcome is unmeasured, not healthy. It can exist in
+  // this state when a request was aborted before any endpoint answered.
+  const measured = health.endpoints.some(
+    (endpoint) => endpoint.successes > 0 || endpoint.failures > 0
+  )
+  if (!measured) return { tier: "idle", reason: "" }
+
+  if (health.healthyEndpoints === 0) {
+    return {
+      tier: "down",
+      reason: "All endpoints are in cooldown after repeated failures",
+    }
+  }
+
+  const benched = health.totalEndpoints - health.healthyEndpoints
+  if (benched > 0) {
+    return {
+      tier: "degraded",
+      reason: `${benched} of ${health.totalEndpoints} endpoints in cooldown`,
+    }
+  }
+
+  // Below the failure threshold an endpoint is not benched, but its most recent
+  // request(s) failed. Reporting that keeps "healthy" meaning "no failures",
+  // rather than "not bad enough to bench yet".
+  const failing = health.endpoints.filter(
+    (endpoint) => endpoint.consecutiveFailures > 0
+  ).length
+  if (failing > 0) {
+    return {
+      tier: "degraded",
+      reason: `${failing} ${failing === 1 ? "endpoint is" : "endpoints are"} failing`,
+    }
+  }
+
+  if (health.bestLatencyMs !== null && health.bestLatencyMs >= DEGRADED_POOL_LATENCY_MS) {
+    return {
+      tier: "degraded",
+      reason: `Responding, but slowly (${Math.round(health.bestLatencyMs)}ms)`,
+    }
+  }
+
+  return {
+    tier: "healthy",
+    reason: `${health.healthyEndpoints} ${
+      health.healthyEndpoints === 1 ? "endpoint" : "endpoints"
+    } responding`,
+  }
 }
 
 /** Why a pool operation ultimately failed. */
@@ -242,6 +335,13 @@ export class RpcPool {
   private readonly options: ResolvedOptions
   private readonly providers = new Map<string, JsonRpcProvider>()
   private cursor = 0
+  /**
+   * Times work moved from one endpoint to another after failures.
+   *
+   * Counted for the pool's lifetime; pools are discarded on logout and on the
+   * idle teardown, which is the natural reset point.
+   */
+  private failovers = 0
   private destroyed = false
 
   /**
@@ -322,7 +422,13 @@ export class RpcPool {
     let sawRateLimit = false
     let attempted = 0
 
-    for (const endpoint of order) {
+    for (let index = 0; index < order.length; index++) {
+      const endpoint = order[index]
+      // Whether this endpoint failed during this call. Only a transition away
+      // from a failed endpoint is a failover; a zero attempt budget (a
+      // degenerate configuration) skips endpoints without touching them.
+      let failedHere = false
+
       for (let attempt = 0; attempt < this.options.attemptsPerEndpoint; attempt++) {
         if (signal?.aborted) throw new RpcError("aborted", "Request cancelled")
         if (this.destroyed) throw new RpcError("destroyed", "Pool has been destroyed")
@@ -351,6 +457,7 @@ export class RpcPool {
           if (!retryable) throw error
 
           this.recordFailure(endpoint)
+          failedHere = true
           logger.warn("RPC endpoint failed", {
             // May embed an API key; the logger redacts it.
             url: endpoint.url,
@@ -369,6 +476,11 @@ export class RpcPool {
           }
         }
       }
+
+      // Reaching here means every attempt on this endpoint failed retryably.
+      // Moving on is a failover; failing on the final endpoint is not, because
+      // there was nowhere left to move — that failure becomes the request error.
+      if (failedHere && index < order.length - 1) this.failovers++
     }
 
     throw new RpcError(
@@ -442,6 +554,7 @@ export class RpcPool {
       totalEndpoints: endpoints.length,
       healthyEndpoints: healthy.length,
       bestLatencyMs: latencies.length > 0 ? Math.min(...latencies) : null,
+      failovers: this.failovers,
       endpoints,
     }
   }

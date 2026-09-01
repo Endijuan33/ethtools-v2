@@ -16,6 +16,12 @@ export const STORAGE_KEYS = {
   /** Legacy cleartext wallet array, read only for one-time migration. */
   LEGACY_WALLETS: "ethtools_wallets",
   ACTIVE_WALLET: "ethtools_active_wallet",
+  /**
+   * Vault idle auto-lock timeout in minutes. A validated preference, never a
+   * secret — and a corrupted value must degrade to the default timeout, not to
+   * "never lock".
+   */
+  AUTOLOCK_MINUTES: "vault.autolockMinutes",
   CUSTOM_NETWORKS: "ethtools_custom_networks",
   TRANSACTION_HISTORY: "ethtools_transaction_history",
   BOOKMARKS: "ethtools_bookmarks",

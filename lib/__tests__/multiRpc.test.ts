@@ -1,6 +1,13 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
-import { RpcError, RpcPool } from "../multiRpc"
+import {
+  DEGRADED_POOL_LATENCY_MS,
+  RpcError,
+  RpcPool,
+  summarizePoolHealth,
+  type EndpointHealthStatus,
+  type PoolHealth,
+} from "../multiRpc"
 import { setLogSink } from "../logger"
 
 /**
@@ -304,4 +311,127 @@ test("spreads load across endpoints rather than pinning one", async () => {
   } finally {
     instance.destroy()
   }
+})
+
+// ===== Failover counting =====
+
+test("counts one failover each time work moves to another endpoint", async () => {
+  const instance = pool([A, B, C], { attemptsPerEndpoint: 1 })
+  try {
+    let calls = 0
+    const value = await instance.execute(async () => {
+      calls++
+      // Two endpoints fail out, the third answers.
+      if (calls < 3) throw new Error("connection reset")
+      return "ok"
+    })
+
+    assert.equal(value, "ok")
+    assert.equal(instance.getHealth().failovers, 2)
+  } finally {
+    instance.destroy()
+  }
+})
+
+test("does not count a failover when the final endpoint fails", async () => {
+  const instance = pool([A], { attemptsPerEndpoint: 2 })
+  try {
+    await instance.execute(async () => { throw new Error("network unreachable") }).catch(() => undefined)
+    // Nowhere was left to move to, so the failure is an error, not a failover.
+    assert.equal(instance.getHealth().failovers, 0)
+  } finally {
+    instance.destroy()
+  }
+})
+
+test("does not count a failover for a deterministic failure", async () => {
+  const instance = pool([A, B], { attemptsPerEndpoint: 1 })
+  try {
+    await instance
+      .execute(async () => { throw new Error("execution reverted (CALL_EXCEPTION)") })
+      .catch(() => undefined)
+    // A revert is surfaced immediately; no other endpoint is ever contacted.
+    assert.equal(instance.getHealth().failovers, 0)
+  } finally {
+    instance.destroy()
+  }
+})
+
+// ===== Health tier classification =====
+
+/** Endpoint literal with defaults, so each case states only what it varies. */
+function ep(partial: Partial<EndpointHealthStatus> = {}): EndpointHealthStatus {
+  return {
+    url: A,
+    healthy: true,
+    cooldownRemainingMs: 0,
+    latencyMs: 120,
+    consecutiveFailures: 0,
+    successes: 3,
+    failures: 0,
+    ...partial,
+  }
+}
+
+/** Pool literal that mirrors the derivation `getHealth` performs. */
+function ph(endpoints: EndpointHealthStatus[], extra: Partial<PoolHealth> = {}): PoolHealth {
+  const healthy = endpoints.filter((endpoint) => endpoint.healthy)
+  const latencies = healthy
+    .map((endpoint) => endpoint.latencyMs)
+    .filter((value): value is number => value !== null)
+  return {
+    usable: healthy.length > 0,
+    totalEndpoints: endpoints.length,
+    healthyEndpoints: healthy.length,
+    bestLatencyMs: latencies.length > 0 ? Math.min(...latencies) : null,
+    failovers: 0,
+    endpoints,
+    ...extra,
+  }
+}
+
+test("classifies an absent pool as idle", () => {
+  // Claiming an uncontacted network is healthy would assert the unobserved.
+  assert.equal(summarizePoolHealth(null).tier, "idle")
+})
+
+test("classifies an unmeasured pool as idle, not healthy", () => {
+  const health = ph([ep({ successes: 0, failures: 0, latencyMs: null })])
+  assert.equal(summarizePoolHealth(health).tier, "idle")
+})
+
+test("classifies a fully working pool as healthy", () => {
+  const summary = summarizePoolHealth(ph([ep(), ep({ url: B, latencyMs: 200 })]))
+  assert.equal(summary.tier, "healthy")
+  assert.match(summary.reason, /2 endpoints responding/)
+})
+
+test("classifies a pool with every endpoint benched as down", () => {
+  const benched = { healthy: false, cooldownRemainingMs: 40_000, consecutiveFailures: 2, failures: 2 }
+  const summary = summarizePoolHealth(ph([ep(benched), ep({ url: B, ...benched })]))
+  assert.equal(summary.tier, "down")
+  assert.match(summary.reason, /cooldown/)
+})
+
+test("classifies a pool with a benched endpoint as degraded", () => {
+  const summary = summarizePoolHealth(
+    ph([ep(), ep({ url: B, healthy: false, cooldownRemainingMs: 40_000, consecutiveFailures: 2, failures: 2 })])
+  )
+  assert.equal(summary.tier, "degraded")
+  assert.match(summary.reason, /1 of 2 endpoints in cooldown/)
+})
+
+test("classifies a wobbling endpoint as degraded before it is benched", () => {
+  // A single failure stays under the benching threshold, but "healthy" must
+  // still mean "no failures", not "not bad enough to bench yet".
+  const summary = summarizePoolHealth(ph([ep({ consecutiveFailures: 1, failures: 1 })]))
+  assert.equal(summary.tier, "degraded")
+  assert.match(summary.reason, /1 endpoint is failing/)
+})
+
+test("classifies a slow-but-working pool as degraded", () => {
+  const summary = summarizePoolHealth(ph([ep({ latencyMs: DEGRADED_POOL_LATENCY_MS })]))
+  assert.equal(summary.tier, "degraded")
+  // Just under the threshold stays healthy, so the boundary is exact.
+  assert.equal(summarizePoolHealth(ph([ep({ latencyMs: DEGRADED_POOL_LATENCY_MS - 1 })])).tier, "healthy")
 })

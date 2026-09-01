@@ -3,22 +3,24 @@
 /**
  * Developer tools panel.
  *
- * A thin container over three independent tools. It owns only which tool is
+ * A thin container over four independent tools. It owns only which tool is
  * visible; each tool manages its own state, so they compose without coupling.
  */
 
 import { useState } from "react"
-import { ArrowLeftRight, FileCode2, Globe } from "lucide-react"
+import { ArrowLeftRight, FileCode2, Fuel, Globe } from "lucide-react"
 import Card, { CardDescription, CardHeader, CardTitle } from "./ui/Card"
 import Tabs, { TabPanel } from "./ui/Tabs"
 import UnitConverter from "./UnitConverter"
 import EnsLookup from "./EnsLookup"
 import CalldataDecoder from "./CalldataDecoder"
+import GasTrackerCard from "./GasTrackerCard"
 
 const TOOLS = [
   { id: "units", label: "Units", icon: ArrowLeftRight },
   { id: "ens", label: "ENS", icon: Globe },
   { id: "calldata", label: "Calldata", icon: FileCode2 },
+  { id: "gas", label: "Gas", icon: Fuel },
 ] as const
 
 type ToolId = (typeof TOOLS)[number]["id"]
@@ -32,7 +34,7 @@ export default function DevToolsCard() {
         <div className="min-w-0">
           <CardTitle>Developer tools</CardTitle>
           <CardDescription>
-            Everything runs in your browser. Only ENS lookups make a network request.
+            Everything runs in your browser. Only ENS and gas lookups make a network request.
           </CardDescription>
         </div>
       </CardHeader>
@@ -50,6 +52,7 @@ export default function DevToolsCard() {
         {active === "units" && <UnitConverter />}
         {active === "ens" && <EnsLookup />}
         {active === "calldata" && <CalldataDecoder />}
+        {active === "gas" && <GasTrackerCard />}
       </TabPanel>
     </Card>
   )

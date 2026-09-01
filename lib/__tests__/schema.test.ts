@@ -1,8 +1,12 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
+  AUTOLOCK_MINUTES_CHOICES,
+  DEFAULT_AUTOLOCK_MINUTES,
   filterValid,
   filterValidCustomNetworks,
+  isAutolockMinutes,
+  isChecksummedAddress,
   isEthAddress,
   isHttpsUrl,
   isStoredBookmark,
@@ -15,6 +19,8 @@ import {
 } from "../schema"
 
 const ADDRESS = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+const OTHER_ADDRESS = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
+const KEY = `0x${"11".repeat(32)}`
 const HASH = "0x" + "ab".repeat(32)
 
 test("accepts https URLs only", () => {
@@ -70,6 +76,81 @@ test("validates a vault payload", () => {
   assert.equal(isVaultPayload({ accounts: [{ id: "1", label: "M", address: "bad" }] }), false)
   assert.equal(isVaultPayload({ accounts: "nope" }), false)
   assert.equal(isVaultPayload({}), false)
+})
+
+test("accepts a watch-only account that is address-only", () => {
+  assert.equal(
+    isVaultAccount({ id: "1", label: "Cold", address: ADDRESS, watchOnly: true }),
+    true
+  )
+  // Absent flag keeps every pre-existing account valid — backward compatible.
+  assert.equal(isVaultAccount({ id: "1", label: "Main", address: ADDRESS }), true)
+  assert.equal(
+    isVaultAccount({ id: "1", label: "Main", address: ADDRESS, privateKey: KEY }),
+    true
+  )
+  // Mixed vaults are fine: the flag governs only the account that carries it.
+  assert.equal(
+    isVaultPayload({
+      accounts: [
+        { id: "1", label: "Main", address: ADDRESS, privateKey: KEY },
+        { id: "2", label: "Cold", address: OTHER_ADDRESS, watchOnly: true },
+      ],
+    }),
+    true
+  )
+})
+
+test("rejects a watch-only account that carries key material", () => {
+  // A watch-only account must never require a secret; a record claiming the
+  // flag while holding a key would blur that boundary.
+  assert.equal(
+    isVaultAccount({ id: "1", label: "Cold", address: ADDRESS, watchOnly: true, privateKey: KEY }),
+    false
+  )
+  assert.equal(
+    isVaultAccount({
+      id: "1",
+      label: "Cold",
+      address: ADDRESS,
+      watchOnly: true,
+      derivationPath: "m/44'/60'/0'/0/0",
+    }),
+    false
+  )
+  assert.equal(
+    isVaultAccount({ id: "1", label: "Cold", address: ADDRESS, watchOnly: true, derivationIndex: 0 }),
+    false
+  )
+  // The flag itself must be a boolean, not truthy garbage.
+  assert.equal(isVaultAccount({ id: "1", label: "Main", address: ADDRESS, watchOnly: "yes" }), false)
+})
+
+test("a watch-only address must be in exact checksum form", () => {
+  // The address is hand-entered rather than key-derived, so the EIP-55
+  // checksum is the only typo check available.
+  assert.equal(
+    isVaultAccount({ id: "1", label: "Cold", address: ADDRESS.toLowerCase(), watchOnly: true }),
+    false
+  )
+  assert.equal(isChecksummedAddress(ADDRESS), true)
+  assert.equal(isChecksummedAddress(ADDRESS.toLowerCase()), false)
+  assert.equal(isChecksummedAddress("0x123"), false)
+  assert.equal(isChecksummedAddress(null), false)
+})
+
+test("validates auto-lock choices against the closed list", () => {
+  for (const minutes of AUTOLOCK_MINUTES_CHOICES) {
+    assert.equal(isAutolockMinutes(minutes), true)
+  }
+  // A corrupted or hostile value must not validate: 0 would disable the lock.
+  assert.equal(isAutolockMinutes(0), false)
+  assert.equal(isAutolockMinutes(10), false)
+  assert.equal(isAutolockMinutes(-5), false)
+  assert.equal(isAutolockMinutes(5.5), false)
+  assert.equal(isAutolockMinutes("5"), false)
+  assert.equal(isAutolockMinutes(null), false)
+  assert.equal(DEFAULT_AUTOLOCK_MINUTES, 5, "the default must stay at 5 minutes")
 })
 
 test("validates bookmarks", () => {

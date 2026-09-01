@@ -9,7 +9,7 @@
  * drop records that fail.
  */
 
-import { isAddress } from "ethers"
+import { getAddress, isAddress } from "ethers"
 
 // ===== Primitives =====
 
@@ -49,6 +49,25 @@ export function isHttpsUrl(value: unknown): value is string {
 /** Whether a value is a checksum-valid or lowercase Ethereum address. */
 export function isEthAddress(value: unknown): value is string {
   return typeof value === "string" && isAddress(value)
+}
+
+/**
+ * Whether a string is an Ethereum address in exact EIP-55 checksum form.
+ *
+ * Required for watch-only accounts: their address arrives from user input
+ * instead of being derived from a key, so the checksum is the only check that
+ * catches a mistyped character before funds are attributed to the wrong
+ * account. A lowercase address is valid but must be normalized before storing.
+ *
+ * @param value - Candidate address.
+ */
+export function isChecksummedAddress(value: unknown): value is string {
+  if (typeof value !== "string" || !isAddress(value)) return false
+  try {
+    return getAddress(value) === value
+  } catch {
+    return false
+  }
 }
 
 /** Whether a value is a 32-byte hex transaction hash. */
@@ -93,6 +112,12 @@ export interface VaultAccount {
   derivationIndex?: number
   /** Full derivation path used, for seed-derived accounts. */
   derivationPath?: string
+  /**
+   * True for an observability-only account: an address and a label with no key
+   * material of any kind. Absent on every key-holding account, so existing
+   * vault payloads stay valid unchanged.
+   */
+  watchOnly?: boolean
 }
 
 /** Decrypted vault contents. Only ever exists in memory while unlocked. */
@@ -120,6 +145,19 @@ export function isVaultAccount(value: unknown): value is VaultAccount {
   if (value.derivationPath !== undefined && !isNonEmptyString(value.derivationPath, 128)) {
     return false
   }
+  if (value.watchOnly !== undefined && typeof value.watchOnly !== "boolean") return false
+  if (value.watchOnly === true) {
+    // A watch-only account is address-only by construction. A record claiming
+    // the flag while carrying a key or derivation data is corrupt or hostile,
+    // and accepting it would blur the one boundary this vault depends on: a
+    // watch-only account must never require a secret.
+    if (value.privateKey !== undefined) return false
+    if (value.derivationPath !== undefined) return false
+    if (value.derivationIndex !== undefined) return false
+    // The address was hand-entered rather than derived from a key, so only the
+    // exact EIP-55 checksum form is accepted — it is the sole typo check left.
+    if (!isChecksummedAddress(value.address)) return false
+  }
   return true
 }
 
@@ -135,6 +173,32 @@ export function isVaultPayload(value: unknown): value is VaultPayload {
   }
   if (!Array.isArray(value.accounts)) return false
   return value.accounts.every(isVaultAccount)
+}
+
+// ===== Vault auto-lock =====
+
+/** Idle timeouts the vault may be configured to lock after, in minutes. */
+export const AUTOLOCK_MINUTES_CHOICES = [1, 5, 15, 30] as const
+
+/** A permitted idle timeout, in minutes. */
+export type AutoLockMinutes = (typeof AUTOLOCK_MINUTES_CHOICES)[number]
+
+/** The timeout applied when no valid preference is stored. */
+export const DEFAULT_AUTOLOCK_MINUTES: AutoLockMinutes = 5
+
+/**
+ * Whether a value is a permitted auto-lock timeout.
+ *
+ * A closed list rather than a numeric range: the value is untrusted storage
+ * that feeds a timer, and a corrupted entry must resolve to the default rather
+ * than to zero (which would disable the lock) or to something enormous.
+ *
+ * @param value - Candidate timeout in minutes.
+ */
+export function isAutolockMinutes(value: unknown): value is AutoLockMinutes {
+  return (
+    typeof value === "number" && (AUTOLOCK_MINUTES_CHOICES as readonly number[]).includes(value)
+  )
 }
 
 /** A saved address label. */

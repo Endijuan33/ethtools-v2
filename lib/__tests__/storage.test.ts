@@ -161,3 +161,10 @@ test("key registry includes the token list that the old backup format omitted", 
   assert.equal(STORAGE_KEYS.TOKENS, "ethtools_tokens")
   assert.ok(Object.values(STORAGE_KEYS).includes("ethtools_tokens"))
 })
+
+test("key registry includes the vault auto-lock preference", () => {
+  // Registered so "erase everything" clears it and no reader can bypass
+  // validation by hitting the key directly.
+  assert.equal(STORAGE_KEYS.AUTOLOCK_MINUTES, "vault.autolockMinutes")
+  assert.ok(Object.values(STORAGE_KEYS).includes("vault.autolockMinutes"))
+})
