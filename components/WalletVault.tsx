@@ -42,6 +42,7 @@ import { confirmAction, notify } from "./ui/Toast"
 import { cn } from "@/lib/utils"
 import AccountDiscovery from "./AccountDiscovery"
 import BackupManager from "./BackupManager"
+import PortfolioCard from "./PortfolioCard"
 import { truncateHex } from "@/lib/format"
 import { assessPassword, isVaultSupported } from "@/lib/vault"
 import {
@@ -926,6 +927,21 @@ export default function WalletVault() {
               <CopyButton value={activeAccount.address} label="address" />
             </div>
           </div>
+
+          {/*
+            Portfolio overview for the active account. Keyed by address so
+            switching accounts remounts it with a clean fetch: balances belong
+            to an address, and showing the previous account's figures under a
+            newly selected one would be misleading. The card consumes the
+            public address only — no secret crosses this boundary, which is why
+            it serves watch-only accounts identically.
+          */}
+          <PortfolioCard
+            key={activeAccount.address}
+            address={activeAccount.address}
+            label={activeAccount.label}
+            watchOnly={activeAccount.watchOnly}
+          />
 
           {activeAccount.watchOnly ? (
             /* No secret exists to show for a watch-only address, and rendering

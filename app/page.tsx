@@ -70,6 +70,11 @@ const RpcHealthPanel = dynamic(() => import("@/components/RpcHealthPanel"), {
   loading: () => <Spinner label="Loading RPC health…" />,
 })
 
+const PriceChartCard = dynamic(() => import("@/components/PriceChartCard"), {
+  ssr: false,
+  loading: () => <Spinner label="Loading price chart…" />,
+})
+
 const DevToolsCard = dynamic(() => import("@/components/DevToolsCard"), {
   ssr: false,
   loading: () => <Spinner label="Loading tools…" />,
@@ -270,6 +275,17 @@ export default function Home() {
                         take the balance or history panels down with it. */}
                     <ErrorBoundary name="RPC health">
                       <RpcHealthPanel />
+                    </ErrorBoundary>
+                  </div>
+                  {/* Price history closes out the section: the panels above say
+                      what the assets are worth, this one says how that value
+                      has been moving. */}
+                  <div className="w-full max-w-2xl">
+                    {/* Its own boundary: the chart is the section's most
+                        peripheral panel, and a rendering failure in it must
+                        never take balances, history, or health down. */}
+                    <ErrorBoundary name="Price chart">
+                      <PriceChartCard />
                     </ErrorBoundary>
                   </div>
                 </>
