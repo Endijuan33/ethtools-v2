@@ -1,7 +1,7 @@
 "use client"
 
-import { useState } from "react"
-import { Send, Bookmark, ChevronDown, Check } from "lucide-react"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { Send, Bookmark, ChevronDown, Check, SlidersHorizontal } from "lucide-react"
 import { Wallet, formatUnits, isAddress, type TransactionRequest } from "ethers"
 import {
   RpcError,
@@ -11,15 +11,18 @@ import {
   withProviderOnce,
   type Network,
 } from "@/lib/ethers"
+import { getGasOverview, type GasOverview } from "@/lib/gasTracker"
 import { saveTransaction, updateTransactionStatus } from "@/lib/transactionHistory"
 import { getBookmarksByNetwork, isAddressBookmarked } from "@/lib/bookmarks"
-import { parseAmount } from "@/lib/format"
+import { formatFiat, parseAmount } from "@/lib/format"
+import { formatUnit } from "@/lib/units"
 import { describeError, logger } from "@/lib/logger"
 import BookmarkManager from "./BookmarkManager"
 import ResponsiveDialog from "./ui/ResponsiveDialog"
 import Card from "./ui/Card"
 import Button from "./ui/Button"
 import Field, { inputClassName, monoInputClassName } from "./ui/Field"
+import Tabs from "./ui/Tabs"
 import Alert from "./ui/Alert"
 import { notify } from "./ui/Toast"
 import { cn } from "@/lib/utils"
@@ -34,14 +37,59 @@ interface SendFormProps {
 /** Links the dropdown trigger to the list it controls. */
 const BOOKMARK_LIST_ID = "send-form-bookmark-list"
 
+/** Selectable fee levels. */
+type GasTier = "low" | "recommended" | "fast" | "custom"
+
+const GAS_TIER_TABS = [
+  { id: "low", label: "Low" },
+  { id: "recommended", label: "Recommended" },
+  { id: "fast", label: "Fast" },
+  { id: "custom", label: "Custom" },
+] as const
+
+/** Slider resolution: 1000 positions across the spendable range. */
+const SLIDER_STEPS = 1000
+
+/**
+ * A custom fee is capped at this many gwei so one fat-fingered zero cannot
+ * silently burn the balance; any honest fee sits far below it.
+ */
+const MAX_CUSTOM_GWEI = 10_000
+
+/**
+ * Headroom added on top of the tier total when building `maxFeePerGas`. The
+ * base fee can rise up to 12.5% per block between estimate and inclusion, and
+ * OP-stack chains add an L1 data fee the estimate does not include; half a
+ * base fee of slack absorbs both while the unused part is refunded.
+ */
+function withHeadroom(total: bigint, baseFee: bigint | null): bigint {
+  return baseFee === null ? total : total + baseFee / 2n
+}
+
 export default function SendForm({ network, wallet, onClose, onSuccess }: SendFormProps) {
   const [recipient, setRecipient] = useState("")
   const [amount, setAmount] = useState("")
   const [error, setError] = useState("")
   const [isSending, setIsSending] = useState(false)
-  const [isCalculatingMax, setIsCalculatingMax] = useState(false)
   const [showBookmarkManager, setShowBookmarkManager] = useState(false)
   const [isBookmarkDropdownOpen, setIsBookmarkDropdownOpen] = useState(false)
+
+  /*
+   * Gas tier state. The overview (three tiers + base fee + priority fees +
+   * USD price) is fetched once per dialog via the pooled RPC path; if that
+   * fetch fails, sending still works — the node fills its own defaults — but
+   * the selector says so instead of presenting invented numbers.
+   */
+  const [gasTier, setGasTier] = useState<GasTier>("recommended")
+  const [gasOverview, setGasOverview] = useState<GasOverview | null>(null)
+  const [gasNote, setGasNote] = useState<string | null>(null)
+  const [customPriorityGwei, setCustomPriorityGwei] = useState("")
+  const [customMaxFeeGwei, setCustomMaxFeeGwei] = useState("")
+  const [customGasPriceGwei, setCustomGasPriceGwei] = useState("")
+
+  /** Balance and the estimated gas limit, needed for the slider and fee math. */
+  const [balance, setBalance] = useState<bigint | null>(null)
+  const [gasLimit, setGasLimit] = useState(21_000n)
 
   const networkInfo = getAllNetworks()[network]
   const currencySymbol = networkInfo?.currency || "ETH"
@@ -54,67 +102,189 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
   // Check if current recipient is bookmarked
   const isBookmarked = recipient && isAddress(recipient) && isAddressBookmarked(recipient)
 
+  // ---- Gas + balance load (once per open) ----
+  useEffect(() => {
+    let cancelled = false
+
+    const load = async (): Promise<void> => {
+      const [overviewResult, balanceResult] = await Promise.allSettled([
+        getGasOverview(network),
+        withProvider(network, (provider) => provider.getBalance(wallet.address)),
+      ])
+
+      if (cancelled) return
+
+      if (overviewResult.status === "fulfilled") {
+        setGasOverview(overviewResult.value)
+        setGasNote(null)
+      } else {
+        logger.warn("Send form gas overview fetch failed", {
+          network,
+          error: overviewResult.reason,
+        })
+        setGasOverview(null)
+        setGasNote(
+          "Fee levels could not be fetched for this network. Sending will use the node's own suggestion."
+        )
+      }
+
+      if (balanceResult.status === "fulfilled") {
+        setBalance(balanceResult.value)
+      } else {
+        setBalance(null)
+        logger.warn("Send form balance fetch failed", {
+          network,
+          error: balanceResult.reason,
+        })
+      }
+    }
+
+    void load()
+    return () => {
+      cancelled = true
+    }
+  }, [network, wallet.address])
+
+  // ---- Gas limit estimate (debounced, on a valid recipient) ----
+  const recipientIsValid = recipient !== "" && isAddress(recipient)
+  useEffect(() => {
+    if (!recipientIsValid) {
+      // A plain transfer is 21000; the estimate only matters for contracts.
+      setGasLimit(21_000n)
+      return
+    }
+
+    let cancelled = false
+    const timer = setTimeout(() => {
+      void withProvider(network, async (provider) => {
+        try {
+          const estimated = await provider.estimateGas({
+            to: recipient,
+            value: 1n,
+          })
+          if (!cancelled) setGasLimit((estimated * 120n) / 100n)
+        } catch {
+          // Estimate failure is not fatal: fall back to the transfer limit and
+          // let the send-time estimate surface a genuine revert.
+          if (!cancelled) setGasLimit(21_000n)
+        }
+      })
+    }, 600)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [recipientIsValid, recipient, network])
+
+  // ---- Derived fee values ----
+  const tierTotal: bigint | null = useMemo(() => {
+    if (gasOverview === null) return null
+    if (gasTier === "low") return gasOverview.slow
+    if (gasTier === "recommended") return gasOverview.standard
+    if (gasTier === "fast") return gasOverview.fast
+    return null
+  }, [gasOverview, gasTier])
+
+  const customFeeError = useMemo(() => {
+    if (gasTier !== "custom" || gasOverview === null) return null
+    const is1559 = gasOverview.isEip1559
+
+    if (is1559) {
+      if (customPriorityGwei === "" || customMaxFeeGwei === "") {
+        return "Enter a priority fee and a max fee to use a custom fee."
+      }
+      const priority = parseAmount(customPriorityGwei, 9)
+      if (!priority.ok) return priority.error
+      const maxFee = parseAmount(customMaxFeeGwei, 9)
+      if (!maxFee.ok) return maxFee.error
+      if (priority.value <= 0n) return "The priority fee must be greater than zero."
+      if (maxFee.value < priority.value) {
+        return "The max fee cannot be lower than the priority fee."
+      }
+      if (maxFee.value > BigInt(MAX_CUSTOM_GWEI) * 1_000_000_000n) {
+        return `Fees are capped at ${MAX_CUSTOM_GWEI.toLocaleString()} gwei for safety.`
+      }
+      if (gasOverview.baseFee !== null && maxFee.value < gasOverview.baseFee) {
+        return `The max fee is below the current base fee (${formatUnit(gasOverview.baseFee, "gwei")} gwei); the transaction would stall.`
+      }
+      return null
+    }
+
+    if (customGasPriceGwei === "") return "Enter a gas price to use a custom fee."
+    const gasPrice = parseAmount(customGasPriceGwei, 9)
+    if (!gasPrice.ok) return gasPrice.error
+    if (gasPrice.value <= 0n) return "The gas price must be greater than zero."
+    if (gasPrice.value > BigInt(MAX_CUSTOM_GWEI) * 1_000_000_000n) {
+      return `Fees are capped at ${MAX_CUSTOM_GWEI.toLocaleString()} gwei for safety.`
+    }
+    return null
+  }, [gasTier, gasOverview, customPriorityGwei, customMaxFeeGwei, customGasPriceGwei])
+
+  /** The per-gas price the send will pay, for the fee preview. */
+  const selectedPerGas: bigint | null = useMemo(() => {
+    if (gasTier !== "custom") return tierTotal
+    if (gasOverview === null || customFeeError !== null) return null
+    return gasOverview.isEip1559
+      ? parseAmount(customMaxFeeGwei, 9).ok
+        ? (parseAmount(customMaxFeeGwei, 9) as { ok: true; value: bigint }).value
+        : null
+      : parseAmount(customGasPriceGwei, 9).ok
+        ? (parseAmount(customGasPriceGwei, 9) as { ok: true; value: bigint }).value
+        : null
+  }, [gasTier, tierTotal, gasOverview, customFeeError, customMaxFeeGwei, customGasPriceGwei])
+
+  const feeEstimateWei: bigint | null =
+    selectedPerGas === null ? null : selectedPerGas * gasLimit
+
+  const feeEstimateUsd: number | null = useMemo(() => {
+    if (feeEstimateWei === null || gasOverview?.nativePriceUsd == null) return null
+    const native = Number(formatUnits(feeEstimateWei, nativeDecimals))
+    return Number.isFinite(native) ? native * gasOverview.nativePriceUsd : null
+  }, [feeEstimateWei, gasOverview, nativeDecimals])
+
+  /**
+   * The most that can be sent: balance minus the fee and a reserve, so "max"
+   * never bounces for insufficient funds when the base fee ticks up or an
+   * OP-stack L1 data fee appears. Mirrors the margin the old Max button used.
+   */
+  const maxSpendable: bigint | null = useMemo(() => {
+    if (balance === null || feeEstimateWei === null) return null
+    const reserve = feeEstimateWei + feeEstimateWei / 2n
+    return balance > reserve ? balance - reserve : 0n
+  }, [balance, feeEstimateWei])
+
+  // ---- Slider ↔ amount wiring ----
+  const parsedAmount = useMemo(() => parseAmount(amount, nativeDecimals), [amount, nativeDecimals])
+
+  const sliderPos = useMemo(() => {
+    if (maxSpendable === null || maxSpendable === 0n) return 0
+    if (!parsedAmount.ok) return 0
+    // Ratio only: the magnitudes lose precision in Number, but the slider
+    // position is a presentation concern, not a money concern.
+    const ratio = Number((parsedAmount.value * BigInt(SLIDER_STEPS)) / maxSpendable)
+    return Math.min(Math.max(Math.round(ratio), 0), SLIDER_STEPS)
+  }, [parsedAmount, maxSpendable])
+
+  const handleSliderChange = (position: number): void => {
+    if (maxSpendable === null) return
+    if (position === SLIDER_STEPS) {
+      setAmount(formatUnits(maxSpendable, nativeDecimals))
+      return
+    }
+    const wei = (maxSpendable * BigInt(position)) / BigInt(SLIDER_STEPS)
+    setAmount(wei === 0n ? "" : formatUnits(wei, nativeDecimals))
+  }
+
+  const handleSetMaxAmount = (): void => {
+    if (maxSpendable === null) return
+    setAmount(maxSpendable === 0n ? "" : formatUnits(maxSpendable, nativeDecimals))
+  }
+
   // Auto-fill recipient from bookmark
   const handleSelectBookmark = (address: string) => {
     setRecipient(address)
     setIsBookmarkDropdownOpen(false)
-  }
-
-  const handleSetMaxAmount = async () => {
-    setIsCalculatingMax(true)
-    setError("")
-    try {
-      // Fee data, balance, and gas estimate are all idempotent reads, so they go
-      // through the pooled path and inherit retry plus failover.
-      const { balance, gasCost } = await withProvider(network, async (provider) => {
-        const [feeData, currentBalance] = await Promise.all([
-          provider.getFeeData(),
-          provider.getBalance(wallet.address),
-        ])
-
-        const gasPrice = feeData.maxFeePerGas ?? feeData.gasPrice
-        if (gasPrice === null) throw new Error("no-gas-price")
-
-        let gasLimit = 21_000n
-        try {
-          const estimated = await provider.estimateGas({
-            to: recipient !== "" && isAddress(recipient) ? recipient : wallet.address,
-            value: 1n,
-          })
-          gasLimit = (estimated * 120n) / 100n
-        } catch {
-          // A plain transfer is 21000; the estimate only matters for contracts.
-          gasLimit = 21_000n
-        }
-
-        return { balance: currentBalance, gasCost: gasLimit * gasPrice }
-      })
-
-      // Reserve a further margin because the base fee can rise between this
-      // estimate and the send, and because OP-stack chains add an L1 data fee
-      // that gasLimit * gasPrice does not include. Without it, "Max" reliably
-      // fails for insufficient funds on those networks.
-      const reserve = gasCost + gasCost / 2n
-
-      if (balance <= reserve) {
-        setAmount("")
-        setError(
-          `Balance does not cover the network fee. You need at least ${formatUnits(reserve, nativeDecimals)} ${currencySymbol}.`
-        )
-        return
-      }
-
-      setAmount(formatUnits(balance - reserve, nativeDecimals))
-    } catch (error) {
-      logger.warn("Max amount calculation failed", { network, error })
-      setError(
-        error instanceof RpcError
-          ? error.userMessage
-          : describeError(error, "Could not calculate the maximum amount.")
-      )
-    } finally {
-      setIsCalculatingMax(false)
-    }
   }
 
   const handleSend = async () => {
@@ -126,11 +296,14 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
     }
 
     // Validate through the shared bigint-exact parser rather than parseFloat.
-    // `Number.parseFloat("abc") <= 0` is false, so the previous check let garbage
-    // through to fail later inside parseUnits with an opaque message.
-    const parsedAmount = parseAmount(amount, nativeDecimals)
-    if (!parsedAmount.ok) {
-      setError(parsedAmount.error)
+    const sendAmount = parseAmount(amount, nativeDecimals)
+    if (!sendAmount.ok) {
+      setError(sendAmount.error)
+      return
+    }
+
+    if (gasTier === "custom" && customFeeError !== null) {
+      setError(customFeeError)
       return
     }
 
@@ -139,24 +312,63 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
 
     try {
       // Estimate against the real recipient and value, not a placeholder.
-      const request: TransactionRequest = { to: recipient, value: parsedAmount.value }
+      const request: TransactionRequest = { to: recipient, value: sendAmount.value }
 
       try {
         const estimated = await withProvider(network, (provider) =>
           provider.estimateGas(request)
         )
         request.gasLimit = (estimated * 120n) / 100n
-      } catch (error) {
+      } catch (estError) {
         // A failed estimate usually means the transaction would revert. Surface
         // it rather than broadcasting blind and burning the fee.
-        logger.warn("Gas estimation failed", { network, error })
+        logger.warn("Gas estimation failed", { network, error: estError })
         setError(
-          error instanceof RpcError
-            ? error.userMessage
+          estError instanceof RpcError
+            ? estError.userMessage
             : "This transaction is expected to fail, so it was not sent. Check the recipient and amount."
         )
         setIsSending(false)
         return
+      }
+
+      /*
+       * Apply the selected fee. Tiered and custom fees only ride along when the
+       * overview was fetched — otherwise the node's own suggestion is used and
+       * the selector already told the user that.
+       */
+      if (gasOverview !== null) {
+        if (gasTier !== "custom") {
+          const priority =
+            gasTier === "low"
+              ? gasOverview.slowPriority
+              : gasTier === "fast"
+                ? gasOverview.fastPriority
+                : gasOverview.standardPriority
+          const total =
+            gasTier === "low"
+              ? gasOverview.slow
+              : gasTier === "fast"
+                ? gasOverview.fast
+                : gasOverview.standard
+
+          if (gasOverview.isEip1559) {
+            request.maxPriorityFeePerGas = priority
+            request.maxFeePerGas = withHeadroom(total, gasOverview.baseFee)
+          } else {
+            request.gasPrice = total
+          }
+        } else if (gasOverview.isEip1559) {
+          const priority = parseAmount(customPriorityGwei, 9)
+          const maxFee = parseAmount(customMaxFeeGwei, 9)
+          if (priority.ok && maxFee.ok) {
+            request.maxPriorityFeePerGas = priority.value
+            request.maxFeePerGas = maxFee.value
+          }
+        } else {
+          const gasPrice = parseAmount(customGasPriceGwei, 9)
+          if (gasPrice.ok) request.gasPrice = gasPrice.value
+        }
       }
 
       // Broadcast exactly once. Retrying an ambiguous timeout could submit the
@@ -186,8 +398,8 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
 
       // Resolve the real outcome. A transaction is "success" only when a receipt
       // confirms status 1. Anything else is genuinely unknown, and reporting
-      // unknown as success — as this code previously did — tells the user their
-      // funds moved when they may not have.
+      // unknown as success tells the user their funds moved when they may not
+      // have.
       try {
         const receipt = await response.wait(1)
         if (receipt === null) {
@@ -213,17 +425,16 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
           "It was broadcast successfully. Check the explorer for its final status."
         )
       }
-    } catch (error) {
-      logger.error("Send failed", { network, error })
+    } catch (sendError) {
+      logger.error("Send failed", { network, error: sendError })
       setError(
-        error instanceof RpcError
-          ? error.userMessage
-          : describeError(error, "The transaction could not be sent.")
+        sendError instanceof RpcError
+          ? sendError.userMessage
+          : describeError(sendError, "The transaction could not be sent.")
       )
 
       // Only record a failure that actually reached the network. A pre-broadcast
-      // failure has no hash, and the old synthetic `failed-<timestamp>` value was
-      // not a valid hash yet was still rendered as an explorer link.
+      // failure has no hash.
       if (broadcastHash !== "") {
         updateTransactionStatus(broadcastHash, "failed")
       }
@@ -231,6 +442,9 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
       setIsSending(false)
     }
   }
+
+  const showCustomInputs = gasTier === "custom" && gasOverview !== null
+  const sliderDisabled = maxSpendable === null || maxSpendable === 0n
 
   return (
     <>
@@ -242,7 +456,7 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
         footer={
           <Button
             onClick={handleSend}
-            disabled={isSending || !recipient || !amount}
+            disabled={isSending || !recipient || !amount || customFeeError !== null}
             isLoading={isSending}
             loadingLabel="Sending…"
             variant="success"
@@ -362,8 +576,7 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
               variant="ghost"
               size="sm"
               onClick={handleSetMaxAmount}
-              isLoading={isCalculatingMax}
-              loadingLabel="Calculating…"
+              disabled={maxSpendable === null || maxSpendable === 0n}
               aria-label={`Use maximum available ${currencySymbol}`}
             >
               Max
@@ -384,9 +597,129 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
           )}
         </Field>
 
-        {/* Summary. Every value here is already in state, so this costs no extra
-            RPC call; the gas figure is deliberately absent because the estimate
-            is only made at send time. */}
+        {/* Amount slider: every position between dust and max is one gesture. */}
+        {balance !== null && (
+          <div className="pt-1">
+            <input
+              type="range"
+              min={0}
+              max={SLIDER_STEPS}
+              step={1}
+              value={sliderPos}
+              onChange={(e) => handleSliderChange(Number(e.target.value))}
+              disabled={sliderDisabled}
+              aria-label={`Amount as a share of your spendable ${currencySymbol} balance`}
+              className={cn(
+                "h-6 w-full cursor-pointer accent-primary",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+                sliderDisabled && "cursor-not-allowed opacity-50"
+              )}
+            />
+            <div className="flex justify-between text-xs text-muted-foreground">
+              <span>0</span>
+              <span>
+                {maxSpendable === null
+                  ? "Balance unknown"
+                  : `Max ${formatUnits(maxSpendable, nativeDecimals)} ${currencySymbol}`}
+              </span>
+            </div>
+          </div>
+        )}
+
+        {/* Gas level selection */}
+        <div className="space-y-2">
+          <Tabs
+            items={GAS_TIER_TABS}
+            value={gasTier}
+            onChange={setGasTier}
+            label="Gas level"
+            layoutGroupId="send-gas"
+          />
+
+          {gasNote !== null ? (
+            <p className="text-xs leading-relaxed text-muted-foreground">{gasNote}</p>
+          ) : gasOverview !== null ? (
+            <div className="flex items-start gap-2 text-xs leading-relaxed text-muted-foreground">
+              <SlidersHorizontal className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              <p>
+                {gasTier === "custom"
+                  ? gasOverview.isEip1559
+                    ? "Set your own priority and max fee."
+                    : "Set your own gas price for this legacy market."
+                  : gasTier === "low"
+                    ? `~${formatUnit(gasOverview.slow, "gwei")} gwei`
+                    : gasTier === "fast"
+                      ? `~${formatUnit(gasOverview.fast, "gwei")} gwei`
+                      : `~${formatUnit(gasOverview.standard, "gwei")} gwei`}
+                {feeEstimateWei !== null && selectedPerGas !== null && gasTier !== "custom" && (
+                  <>
+                    {" "}· est. fee {formatUnits(feeEstimateWei, nativeDecimals)}{" "}
+                    {currencySymbol}
+                    {feeEstimateUsd !== null && ` (${formatFiat(feeEstimateUsd)})`}
+                  </>
+                )}
+                {!gasOverview.isEip1559 && gasTier !== "custom" && " · legacy market"}
+              </p>
+            </div>
+          ) : null}
+
+          {showCustomInputs && gasOverview.isEip1559 && (
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Priority fee (gwei)" required>
+                {(props) => (
+                  <input
+                    {...props}
+                    type="number"
+                    inputMode="decimal"
+                    value={customPriorityGwei}
+                    onChange={(e) => setCustomPriorityGwei(e.target.value)}
+                    className={inputClassName}
+                    placeholder="0.5"
+                    step="any"
+                    min="0"
+                  />
+                )}
+              </Field>
+              <Field label="Max fee (gwei)" required>
+                {(props) => (
+                  <input
+                    {...props}
+                    type="number"
+                    inputMode="decimal"
+                    value={customMaxFeeGwei}
+                    onChange={(e) => setCustomMaxFeeGwei(e.target.value)}
+                    className={inputClassName}
+                    placeholder="2"
+                    step="any"
+                    min="0"
+                  />
+                )}
+              </Field>
+            </div>
+          )}
+
+          {showCustomInputs && !gasOverview.isEip1559 && (
+            <Field label="Gas price (gwei)" required>
+              {(props) => (
+                <input
+                  {...props}
+                  type="number"
+                  inputMode="decimal"
+                  value={customGasPriceGwei}
+                  onChange={(e) => setCustomGasPriceGwei(e.target.value)}
+                  className={inputClassName}
+                  placeholder="10"
+                  step="any"
+                  min="0"
+                />
+              )}
+            </Field>
+          )}
+
+          {customFeeError !== null && <Alert tone="warning">{customFeeError}</Alert>}
+        </div>
+
+        {/* Summary */}
         {(recipient !== "" || amount !== "") && (
           <Card variant="inset" padding="sm">
             <dl className="space-y-2 text-sm">
@@ -406,10 +739,19 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
                   {amount || "—"} {currencySymbol}
                 </dd>
               </div>
+              <div className="flex justify-between gap-3">
+                <dt className="shrink-0 text-muted-foreground">Network fee</dt>
+                <dd className="text-right font-mono">
+                  {feeEstimateWei !== null
+                    ? `${formatUnits(feeEstimateWei, nativeDecimals)} ${currencySymbol}${
+                        feeEstimateUsd !== null ? ` (${formatFiat(feeEstimateUsd)})` : ""
+                      }`
+                    : gasOverview === null
+                      ? "Set by the node at send time"
+                      : "Enter a fee to see the estimate"}
+                </dd>
+              </div>
             </dl>
-            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              The network fee is estimated when you send and is charged on top of this amount.
-            </p>
           </Card>
         )}
 

@@ -54,6 +54,23 @@ export interface GasEstimate {
    * which produced the numbers.
    */
   isEip1559: boolean
+  /**
+   * EIP-1559 only: the priority-fee component of each tier, i.e. the total
+   * minus the base fee. A transaction needs `maxPriorityFeePerGas` and
+   * `maxFeePerGas` separately, so a total alone cannot build one. Legacy
+   * markets have no priority component; these are `0n` there.
+   */
+  slowPriority: bigint
+  /** EIP-1559 priority component of `standard`; `0n` on legacy markets. */
+  standardPriority: bigint
+  /** EIP-1559 priority component of `fast`; `0n` on legacy markets. */
+  fastPriority: bigint
+  /**
+   * EIP-1559 only: the next-block base fee the totals were built on, so a
+   * sender can sanity-check their custom max fee against it. Legacy markets
+   * price gas as one number; this is `null` there.
+   */
+  baseFee: bigint | null
 }
 
 /** Everything the gas card renders for one network. */
@@ -244,6 +261,10 @@ export function estimateGasLevels(
         standard: medians[1] + latestBaseFee,
         fast: fastPriority + latestBaseFee,
         isEip1559: true,
+        slowPriority,
+        standardPriority: medians[1],
+        fastPriority,
+        baseFee: latestBaseFee,
       },
     }
   }
@@ -258,7 +279,16 @@ export function estimateGasLevels(
 
     return {
       ok: true,
-      value: { slow, standard: gasPrice, fast, isEip1559: false },
+      value: {
+        slow,
+        standard: gasPrice,
+        fast,
+        isEip1559: false,
+        slowPriority: 0n,
+        standardPriority: 0n,
+        fastPriority: 0n,
+        baseFee: null,
+      },
     }
   }
 
