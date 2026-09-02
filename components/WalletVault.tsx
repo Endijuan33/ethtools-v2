@@ -46,6 +46,7 @@ import { cn } from "@/lib/utils"
 import AccountDiscovery from "./AccountDiscovery"
 import BackupManager from "./BackupManager"
 import PortfolioCard from "./PortfolioCard"
+import TokenDiscoveryCard from "./TokenDiscoveryCard"
 import { truncateHex } from "@/lib/format"
 import { assessPassword, isVaultSupported } from "@/lib/vault"
 import { decryptKeystore, MAX_KEYSTORE_BYTES, type RecoveredKeystoreAccount } from "@/lib/keystore"
@@ -1336,6 +1337,20 @@ export default function WalletVault() {
             key={`portfolio-${activeAccount.address}`}
             address={activeAccount.address}
             label={activeAccount.label}
+            watchOnly={activeAccount.watchOnly}
+          />
+
+          {/*
+            Token discovery for the active account. Keyed by address like the
+            portfolio card so switching accounts resets its state, and mounted
+            for every account: detection needs only the public address, so
+            watch-only accounts get it identically. The scan runs only when the
+            user asks — the address is sent to public explorer APIs, which must
+            be an explicit choice, never an automatic one.
+          */}
+          <TokenDiscoveryCard
+            key={`token-discovery-${activeAccount.address}`}
+            address={activeAccount.address}
             watchOnly={activeAccount.watchOnly}
           />
 
