@@ -3,11 +3,16 @@ import assert from "node:assert/strict"
 
 import {
   clearPriceHistoryCache,
+  describeRangeGranularity,
   fetchPriceHistory,
+  fetchSpotPrice,
   getPriceHistoryCacheStats,
+  getRangeGranularity,
   parsePriceSeries,
+  parseSpotPrice,
   summarizePriceSeries,
   SERIES_CACHE_TTL_MS,
+  SPOT_CACHE_TTL_MS,
   type PriceHistoryRange,
   type PricePoint,
 } from "../priceHistory"
@@ -365,4 +370,152 @@ test("rejects an empty coin id and an unsupported range without a request", asyn
   expectError(await fetchPriceHistory("ethereum", 14 as unknown as PriceHistoryRange))
 
   assert.equal(stub.mock.callCount(), 0)
+})
+
+// ---------- range granularity ladder ----------
+
+test("maps windows to CoinGecko's granularity ladder", () => {
+  assert.equal(getRangeGranularity(1), "5-minute")
+  assert.equal(getRangeGranularity(7), "hourly")
+  assert.equal(getRangeGranularity(30), "hourly")
+  assert.equal(getRangeGranularity(90), "daily")
+  assert.equal(getRangeGranularity(365), "daily")
+})
+
+test("describes each window's granularity for the chart footnote", () => {
+  assert.match(describeRangeGranularity(1), /5-minute points across the last 24 hours/)
+  assert.match(describeRangeGranularity(7), /hourly points across the last 7 days/)
+  assert.match(describeRangeGranularity(90), /daily points across the last 90 days/)
+  assert.match(describeRangeGranularity(365), /daily points across the last 365 days/)
+})
+
+test("accepts the five advertised windows and rejects the gaps between them", async (t) => {
+  const stub = t.mock.method(
+    globalThis,
+    "fetch",
+    async (): Promise<Response> => okResponse(marketChartBody([[1, 2]]))
+  )
+
+  for (const days of [1, 7, 30, 90, 365] as const) {
+    expectOk(await fetchPriceHistory("ethereum", days))
+  }
+  expectError(await fetchPriceHistory("ethereum", 2 as unknown as PriceHistoryRange))
+  expectError(await fetchPriceHistory("ethereum", 180 as unknown as PriceHistoryRange))
+
+  assert.equal(stub.mock.callCount(), 5)
+})
+
+// ---------- fetchSpotPrice (stubbed network) ----------
+
+test("requests the simple/price endpoint and parses the response", async (t) => {
+  const stub = t.mock.method(
+    globalThis,
+    "fetch",
+    async (): Promise<Response> => okResponse({ ethereum: { usd: 3141.59 } })
+  )
+
+  const price = expectOk(await fetchSpotPrice("ethereum"))
+
+  assert.equal(price, 3141.59)
+  assert.equal(stub.mock.callCount(), 1)
+
+  const calledUrl = stub.mock.calls[0].arguments[0] as URL
+  assert.ok(calledUrl instanceof URL)
+  assert.equal(calledUrl.pathname, "/api/v3/simple/price")
+  assert.equal(calledUrl.searchParams.get("ids"), "ethereum")
+  assert.equal(calledUrl.searchParams.get("vs_currencies"), "usd")
+})
+
+test("serves a cached spot price without refetching inside the TTL window", async (t) => {
+  let clock = 1_000_000
+  const realNow = Date.now
+  Date.now = () => clock
+  try {
+    const stub = t.mock.method(
+      globalThis,
+      "fetch",
+      async (): Promise<Response> => okResponse({ ethereum: { usd: 10 } })
+    )
+
+    assert.equal(expectOk(await fetchSpotPrice("ethereum")), 10)
+    assert.equal(expectOk(await fetchSpotPrice("ethereum")), 10)
+    assert.equal(stub.mock.callCount(), 1)
+
+    clock += SPOT_CACHE_TTL_MS + 1
+    assert.equal(expectOk(await fetchSpotPrice("ethereum")), 10)
+    assert.equal(stub.mock.callCount(), 2)
+  } finally {
+    Date.now = realNow
+  }
+})
+
+test("caches spot prices per coin", async (t) => {
+  const stub = t.mock.method(globalThis, "fetch", async (input: unknown): Promise<Response> => {
+    const url = input instanceof URL ? input : new URL(String(input))
+    const id = url.searchParams.get("ids")
+    return okResponse({ [id ?? ""]: { usd: id === "ethereum" ? 10 : 500 } })
+  })
+
+  assert.equal(expectOk(await fetchSpotPrice("ethereum")), 10)
+  assert.equal(expectOk(await fetchSpotPrice("binancecoin")), 500)
+  assert.equal(stub.mock.callCount(), 2)
+})
+
+test("negatively caches a rate-limited spot price for the same TTL", async (t) => {
+  let clock = 1_000_000
+  const realNow = Date.now
+  Date.now = () => clock
+  try {
+    let limited = true
+    const stub = t.mock.method(globalThis, "fetch", async (): Promise<Response> => {
+      return limited
+        ? new Response("rate limited", { status: 429 })
+        : okResponse({ ethereum: { usd: 10 } })
+    })
+
+    assert.match(expectError(await fetchSpotPrice("ethereum")), /rate limited/i)
+    assert.match(expectError(await fetchSpotPrice("ethereum")), /rate limited/i)
+    assert.equal(stub.mock.callCount(), 1)
+
+    clock += SPOT_CACHE_TTL_MS + 1
+    limited = false
+    assert.equal(expectOk(await fetchSpotPrice("ethereum")), 10)
+    assert.equal(stub.mock.callCount(), 2)
+  } finally {
+    Date.now = realNow
+  }
+})
+
+test("rejects spot payloads with no usable price and empty coin ids", async (t) => {
+  const stub = t.mock.method(
+    globalThis,
+    "fetch",
+    async (): Promise<Response> => okResponse({ ethereum: { usd: 0 } })
+  )
+
+  assert.match(expectError(await fetchSpotPrice("ethereum")), /no usable price/i)
+  assert.match(expectError(await fetchSpotPrice("")), /no live price/i)
+  // The unusable response is not cached — a retry of the same coin goes back
+  // out (the empty-id call above never reaches the network at all).
+  assert.match(expectError(await fetchSpotPrice("ethereum")), /no usable price/i)
+  assert.equal(stub.mock.callCount(), 2)
+})
+
+// ---------- parseSpotPrice (pure) ----------
+
+test("parses the documented simple/price shape", () => {
+  assert.equal(parseSpotPrice({ ethereum: { usd: 42.5 } }, "ethereum"), 42.5)
+})
+
+test("rejects hostile or malformed spot payloads", () => {
+  assert.equal(parseSpotPrice(null, "ethereum"), null)
+  assert.equal(parseSpotPrice("string", "ethereum"), null)
+  assert.equal(parseSpotPrice({}, "ethereum"), null)
+  assert.equal(parseSpotPrice({ ethereum: null }, "ethereum"), null)
+  assert.equal(parseSpotPrice({ ethereum: "42" }, "ethereum"), null)
+  assert.equal(parseSpotPrice({ ethereum: { usd: -1 } }, "ethereum"), null)
+  assert.equal(parseSpotPrice({ ethereum: { usd: Number.NaN } }, "ethereum"), null)
+  assert.equal(parseSpotPrice({ ethereum: { usd: Number.POSITIVE_INFINITY } }, "ethereum"), null)
+  // A price under a different coin's key must not be picked up.
+  assert.equal(parseSpotPrice({ bitcoin: { usd: 100 } }, "ethereum"), null)
 })

@@ -22,8 +22,15 @@
 
 import { logger } from "./logger"
 
-/** Lookback windows the chart offers, in days. */
-export const PRICE_HISTORY_RANGES = [7, 30, 365] as const
+/**
+ * Lookback windows the chart offers, in days.
+ *
+ * CoinGecko's free tier decides granularity from this number — 1 day is
+ * served as 5-minute points, 2–90 days as hourly, 90+ as daily — so the
+ * window list doubles as the granularity ladder the chart advertises
+ * ("5-minute", "hourly", "daily" views).
+ */
+export const PRICE_HISTORY_RANGES = [1, 7, 30, 90, 365] as const
 
 /** A supported lookback window in days. */
 export type PriceHistoryRange = (typeof PRICE_HISTORY_RANGES)[number]
@@ -31,11 +38,47 @@ export type PriceHistoryRange = (typeof PRICE_HISTORY_RANGES)[number]
 /** How long a completed response is served without refetching. */
 export const SERIES_CACHE_TTL_MS = 60_000
 
+/**
+ * How long a spot price is trusted. CoinGecko itself republishes simple
+ * prices on roughly a one-minute cadence, so trusting a quote longer than
+ * this would make the "Live" view a lie — while polling faster than this
+ * would only burn rate limit on identical numbers. Paired with the 30s poll
+ * interval, a long-lived Live view costs one real request per minute.
+ */
+export const SPOT_CACHE_TTL_MS = 45_000
+
 /** Deadline for one market-chart request. */
 const REQUEST_TIMEOUT_MS = 10_000
 
 /** Error sentence returned for a remembered rate-limit refusal. */
 const RATE_LIMITED_MESSAGE = "Price history is rate limited. Try again in a minute."
+
+/** Human label for the granularity a window is served at. */
+export type RangeGranularity = "5-minute" | "hourly" | "daily"
+
+/**
+ * The granularity CoinGecko serves a window at, as shown in the chart's
+ * footnote. Pure and total so the footnote can never throw; an unknown
+ * window (only possible if the ranges list and this map drift apart) reads
+ * as "hourly" — the middle of the ladder — rather than as `undefined`.
+ */
+export function getRangeGranularity(days: number): RangeGranularity {
+  if (days < 2) return "5-minute"
+  if (days < 90) return "hourly"
+  return "daily"
+}
+
+/**
+ * The footnote sentence describing a window's granularity, e.g. "5-minute
+ * points across the day". Exported for unit tests and reusable by any
+ * future chart surface.
+ */
+export function describeRangeGranularity(days: number): string {
+  const granularity = getRangeGranularity(days)
+  if (granularity === "5-minute") return "5-minute points across the last 24 hours"
+  if (granularity === "hourly") return `hourly points across the last ${days} days`
+  return `daily points across the last ${days} days`
+}
 
 /** One point of a price series. */
 export interface PricePoint {
@@ -64,6 +107,11 @@ export type PriceHistoryResult =
   | { ok: true; value: PricePoint[] }
   | { ok: false; error: string }
 
+/** A spot-price fetch either yields a price or a user-presentable error. */
+export type SpotPriceResult =
+  | { ok: true; value: number }
+  | { ok: false; error: string }
+
 /**
  * A cached response.
  *
@@ -77,6 +125,12 @@ interface CacheEntry {
 }
 
 const cache = new Map<string, CacheEntry>()
+
+/**
+ * Spot-price cache. `price: null` carries the same meaning as in the series
+ * cache: a remembered rate-limit refusal, not a missing price.
+ */
+const spotCache = new Map<string, { price: number | null; fetchedAt: number }>()
 
 /**
  * Reduce a (timestamp, price) pair to a point, or null when it cannot be
@@ -277,9 +331,107 @@ async function requestSeries(
   }
 }
 
-/** Drop every cached series. Used on logout and in tests. */
+/**
+ * Fetch an asset's current USD price from CoinGecko's `simple/price`
+ * endpoint — the backing for the chart's "Live" view.
+ *
+ * Never throws; every failure mode returns a user-presentable error, exactly
+ * like {@link fetchPriceHistory}. Responses are cached per coin for
+ * {@link SPOT_CACHE_TTL_MS}, and a 429 is negatively cached for the same
+ * span, so the Live poll (every 30s) costs at most one request per minute
+ * per asset and cannot hammer into a rate limit.
+ *
+ * @param coinId - CoinGecko id from `getCoinId`, e.g. `"ethereum"`.
+ * @param signal - Optional cancellation signal.
+ */
+export async function fetchSpotPrice(coinId: string, signal?: AbortSignal): Promise<SpotPriceResult> {
+  if (typeof coinId !== "string" || coinId.length === 0) {
+    return { ok: false, error: "This asset has no live price." }
+  }
+
+  const cached = spotCache.get(coinId)
+  if (cached !== undefined && Date.now() - cached.fetchedAt < SPOT_CACHE_TTL_MS) {
+    return cached.price === null
+      ? { ok: false, error: RATE_LIMITED_MESSAGE }
+      : { ok: true, value: cached.price }
+  }
+
+  const controller = new AbortController()
+  const onAbort = (): void => controller.abort()
+  signal?.addEventListener("abort", onAbort, { once: true })
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS)
+
+  const url = new URL("https://api.coingecko.com/api/v3/simple/price")
+  url.searchParams.set("ids", coinId)
+  url.searchParams.set("vs_currencies", "usd")
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: { Accept: "application/json" },
+    })
+
+    if (response.status === 429) {
+      logger.warn("Spot price rate limited", { coinId })
+      spotCache.set(coinId, { price: null, fetchedAt: Date.now() })
+      return { ok: false, error: RATE_LIMITED_MESSAGE }
+    }
+
+    if (!response.ok) {
+      logger.warn("Spot price request failed", { coinId, status: response.status })
+      return { ok: false, error: "Live price is unavailable right now. Try again shortly." }
+    }
+
+    const payload: unknown = await response.json()
+    const price = parseSpotPrice(payload, coinId)
+    if (price === null) {
+      logger.warn("Spot price response had no usable price", { coinId })
+      return { ok: false, error: "The price service returned no usable price for this asset." }
+    }
+
+    spotCache.set(coinId, { price, fetchedAt: Date.now() })
+    return { ok: true, value: price }
+  } catch (error) {
+    if (signal?.aborted) {
+      logger.debug("Spot price request cancelled")
+      return { ok: false, error: "Live price request was cancelled." }
+    }
+    if (controller.signal.aborted) {
+      logger.warn("Spot price request timed out", { coinId })
+      return { ok: false, error: "The price service took too long to respond. Try again." }
+    }
+    logger.warn("Spot price request failed", { coinId, error })
+    return {
+      ok: false,
+      error: "Could not reach the price service. Check your connection and try again.",
+    }
+  } finally {
+    clearTimeout(timer)
+    signal?.removeEventListener("abort", onAbort)
+  }
+}
+
+/**
+ * Reduce a `simple/price` payload to a number.
+ *
+ * The documented shape is `{ [coinId]: { usd: number } }`. Every level is
+ * validated and the price must be positive and finite — the same rule
+ * {@link toUsablePoint} applies to series points, for the same reason.
+ * Pure and exported for unit tests.
+ */
+export function parseSpotPrice(payload: unknown, coinId: string): number | null {
+  if (typeof payload !== "object" || payload === null) return null
+  const entry = (payload as Record<string, unknown>)[coinId]
+  if (typeof entry !== "object" || entry === null) return null
+  const price = (entry as Record<string, unknown>).usd
+  if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) return null
+  return price
+}
+
+/** Drop every cached series and spot price. Used on logout and in tests. */
 export function clearPriceHistoryCache(): void {
   cache.clear()
+  spotCache.clear()
 }
 
 /** Cache diagnostics, for debugging only. */

@@ -38,7 +38,10 @@ import { Skeleton, SkeletonGroup } from "@/components/ui/Skeleton"
 import { NETWORKS } from "@/lib/ethers"
 import { getCoinId } from "@/lib/priceFeed"
 import {
+  describeRangeGranularity,
   fetchPriceHistory,
+  fetchSpotPrice,
+  getRangeGranularity,
   summarizePriceSeries,
   type PriceHistoryRange,
   type PricePoint,
@@ -98,27 +101,44 @@ const CHART_ASSETS: readonly ChartAsset[] = (() => {
 
 const CHART_ASSET_KEYS: ReadonlySet<string> = new Set(CHART_ASSETS.map((asset) => asset.key))
 
-/** Tab ids double as day counts, keeping the strip and the fetch in one vocabulary. */
-type RangeId = "7" | "30" | "365"
+/** Tab ids: "live" polls the spot price; the rest are day counts. */
+type RangeId = "live" | "1" | "7" | "30" | "90" | "365"
 
+/*
+ * Six ranges is the full granularity ladder CoinGecko's free tier serves:
+ * the 1-day window arrives as 5-minute points, 7/30 days as hourly, 90/365
+ * as daily — so the strip reads as "live, minutes, hours, day, month, year"
+ * without asking the API for anything it will not provide.
+ */
 const RANGE_TABS = [
-  { id: "7", label: "7d" },
-  { id: "30", label: "30d" },
-  { id: "365", label: "1y" },
+  { id: "live", label: "Live" },
+  { id: "1", label: "1D" },
+  { id: "7", label: "7D" },
+  { id: "30", label: "30D" },
+  { id: "90", label: "3M" },
+  { id: "365", label: "1Y" },
 ] as const satisfies readonly TabItem<RangeId>[]
 
-const RANGE_DAYS: Readonly<Record<RangeId, PriceHistoryRange>> = {
+const RANGE_DAYS: Readonly<Record<Exclude<RangeId, "live">, PriceHistoryRange>> = {
+  "1": 1,
   "7": 7,
   "30": 30,
+  "90": 90,
   "365": 365,
 }
 
 /** Spoken labels for announcements and prose. */
 const RANGE_LABELS: Readonly<Record<RangeId, string>> = {
+  live: "live",
+  "1": "24 hours",
   "7": "7 days",
   "30": "30 days",
+  "90": "3 months",
   "365": "1 year",
 }
+
+/** How often the Live view re-polls the spot price. */
+const LIVE_POLL_MS = 30_000
 
 /**
  * Format a percentage change with an explicit sign.
@@ -267,6 +287,15 @@ export default function PriceChartCard() {
   // in which "loaded nothing, quietly" would be honest.
   const [busy, setBusy] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  /*
+   * Live view: the polled spot price and when it arrived. The series in the
+   * Live tab is the 1-day window (5-minute points) — context for the shape
+   * of the day and the 24h change — while the headline number is always the
+   * freshest spot price, which the series' last point can lag by minutes.
+   */
+  const [spotPrice, setSpotPrice] = useState<number | null>(null)
+  const [spotFetchedAt, setSpotFetchedAt] = useState<number | null>(null)
+  const [spotError, setSpotError] = useState<string | null>(null)
   // Bumped to re-run the load effect (retry button, connection recovery).
   const [reloadNonce, setReloadNonce] = useState(0)
   const [showSummary, setShowSummary] = useState(false)
@@ -278,7 +307,8 @@ export default function PriceChartCard() {
     () => CHART_ASSETS.find((entry) => entry.key === assetKey) ?? CHART_ASSETS[0],
     [assetKey]
   )
-  const days = RANGE_DAYS[rangeId]
+  const isLive = rangeId === "live"
+  const days: PriceHistoryRange = isLive ? 1 : RANGE_DAYS[rangeId]
   const summary = useMemo(
     () => (series === null ? null : summarizePriceSeries(series)),
     [series]
@@ -333,7 +363,10 @@ export default function PriceChartCard() {
       cancelled = true
       controller.abort()
     }
-  }, [asset, days, reloadNonce])
+    // `rangeId` (not just `days`) is a dependency: Live and 1D share the same
+    // underlying window, but entering one from the other must still reload —
+    // the state was cleared in selectRange and nothing else would fill it.
+  }, [asset, days, rangeId, reloadNonce])
 
   useEffect(() => {
     // The offline banner names the problem; this quietly heals it. The pair
@@ -341,6 +374,42 @@ export default function PriceChartCard() {
     // only then — a manual "Try again" is not the only path back to a chart.
     if (isOnline && wasOffline) setReloadNonce((value) => value + 1)
   }, [isOnline, wasOffline])
+
+  /*
+   * Live spot poll: only while the Live tab is selected and the page is
+   * visible. fetchSpotPrice's own 60s cache means the 30s interval costs at
+   * most one request per minute per asset — poll cadence and cache cadence
+   * are deliberately different, so a fresh mount after tab-switching is
+   * instant (cache) while a long-lived Live view keeps crawling forward.
+   */
+  useEffect(() => {
+    if (!isLive || asset === undefined) return
+
+    let cancelled = false
+    const poll = async (): Promise<void> => {
+      const result = await fetchSpotPrice(asset.coinId)
+      if (cancelled) return
+      if (result.ok) {
+        setSpotPrice(result.value)
+        setSpotFetchedAt(Date.now())
+        setSpotError(null)
+      } else {
+        setSpotError(result.error)
+      }
+    }
+
+    // Stale state from a previous Live session must not survive a remount.
+    setSpotPrice(null)
+    setSpotFetchedAt(null)
+    setSpotError(null)
+    void poll()
+    const timer = setInterval(() => void poll(), LIVE_POLL_MS)
+
+    return () => {
+      cancelled = true
+      clearInterval(timer)
+    }
+  }, [isLive, asset, reloadNonce])
 
   const selectAsset = (next: string): void => {
     if (next === assetKey || !CHART_ASSET_KEYS.has(next)) return
@@ -378,12 +447,23 @@ export default function PriceChartCard() {
     )
   }
 
-  /** X-axis tick label: month for the 1-year window, month + day below that. */
+  /**
+   * X-axis tick label. Intraday windows need the time of day; the daily
+   * windows need the month; everything between gets month + day.
+   */
   const formatTickDate = (timestamp: number): string => {
     try {
+      if (getRangeGranularity(days) === "5-minute") {
+        return new Date(timestamp).toLocaleTimeString(undefined, {
+          hour: "2-digit",
+          minute: "2-digit",
+        })
+      }
       return new Date(timestamp).toLocaleDateString(
         undefined,
-        rangeId === "365" ? { month: "short" } : { month: "short", day: "numeric" }
+        getRangeGranularity(days) === "daily"
+          ? { month: "short" }
+          : { month: "short", day: "numeric" }
       )
     } catch {
       return ""
@@ -391,14 +471,17 @@ export default function PriceChartCard() {
   }
 
   const asOf = series !== null && series.length > 0 ? series[series.length - 1].timestamp : null
+  // Time-of-day only matters when the points are closer together than a day.
+  const pointsAreIntraday = getRangeGranularity(days) !== "daily"
 
   // The trend sentence is the chart's screen-reader voice. Always mounted so
   // the live region exists before its text arrives — a region that first
   // appears alongside its content is ignored by several screen readers.
+  const headlinePrice = isLive ? (spotPrice ?? summary?.last ?? null) : summary?.last ?? null
   const announcement =
     summary !== null
-      ? `${asset.symbol} price over the past ${RANGE_LABELS[rangeId]}: ${formatFiat(
-          summary.last
+      ? `${asset.symbol} price over the ${isLive ? "last 24 hours, live" : `past ${RANGE_LABELS[rangeId]}`}: ${formatFiat(
+          headlinePrice ?? summary.last
         )}, ${formatChangePct(summary.changePct)} change, high ${formatFiat(
           summary.high
         )}, low ${formatFiat(summary.low)}.`
@@ -471,8 +554,32 @@ export default function PriceChartCard() {
               <div className="min-w-0">
                 <p className="text-xs font-medium text-muted-foreground">{asset.symbol} / USD</p>
                 <p className="text-2xl font-semibold tabular-nums tracking-tight text-foreground">
-                  {formatFiat(summary.last)}
+                  {formatFiat(headlinePrice ?? summary.last)}
                 </p>
+                {isLive && (
+                  <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                    {/*
+                      The pulse is decoration announcing freshness; the text
+                      "Live" and the updated-ago line carry the information,
+                      so the dot alone is never the only signal.
+                    */}
+                    <span className="relative flex h-2 w-2" aria-hidden="true">
+                      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-success opacity-60" />
+                      <span className="relative inline-flex h-2 w-2 rounded-full bg-success" />
+                    </span>
+                    {spotError !== null ? (
+                      <span role="status">{spotError}</span>
+                    ) : spotPrice === null ? (
+                      <span role="status">Fetching live price…</span>
+                    ) : spotFetchedAt !== null ? (
+                      <span role="status">
+                        Live, updated {formatRelativeTime(spotFetchedAt)}
+                      </span>
+                    ) : (
+                      <span role="status">Live</span>
+                    )}
+                  </p>
+                )}
               </div>
               <ChangeBadge changePct={summary.changePct} />
             </div>
@@ -529,7 +636,7 @@ export default function PriceChartCard() {
                   />
                   <Tooltip
                     cursor={{ stroke: "hsl(var(--border))", strokeDasharray: "4 4" }}
-                    content={<ChartTooltip showTime={rangeId !== "365"} />}
+                    content={<ChartTooltip showTime={pointsAreIntraday} />}
                     isAnimationActive={false}
                   />
                   <Area
@@ -586,9 +693,13 @@ export default function PriceChartCard() {
             </div>
 
             <p className="text-xs leading-relaxed text-muted-foreground">
-              USD prices from CoinGecko
-              {asOf !== null ? `, as of ${formatRelativeTime(asOf)}` : ""}. Hourly points for the
-              7- and 30-day ranges, daily for 1 year.
+              USD prices from CoinGecko, {describeRangeGranularity(days)}
+              {isLive
+                ? ", headline price polled every 30 seconds"
+                : asOf !== null
+                  ? `, as of ${formatRelativeTime(asOf)}`
+                  : ""}
+              .
             </p>
           </div>
         )}
