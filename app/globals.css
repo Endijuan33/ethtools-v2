@@ -212,6 +212,19 @@
     box-shadow: 0 0 24px hsl(var(--primary) / 0.35);
   }
 
+  /*
+   * A modal (Radix) dialog sets `pointer-events: none` on <body> for the
+   * duration of its open state, and sonner's toaster container also defaults
+   * to none. Without this rule, a confirmAction toast spawned from inside a
+   * dialog — e.g. approving a keystore export — renders above the overlay but
+   * is completely unclickable, wedging that flow. Only the toast cards get
+   * pointer events back; the empty rest of the toaster stays inert so it
+   * never intercepts clicks meant for the page.
+   */
+  [data-sonner-toast] {
+    pointer-events: auto;
+  }
+
   /* Hairline rule that reads correctly in both themes. */
   .divider-soft {
     background-image: linear-gradient(

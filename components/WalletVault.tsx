@@ -1333,7 +1333,7 @@ export default function WalletVault() {
             it serves watch-only accounts identically.
           */}
           <PortfolioCard
-            key={activeAccount.address}
+            key={`portfolio-${activeAccount.address}`}
             address={activeAccount.address}
             label={activeAccount.label}
             watchOnly={activeAccount.watchOnly}
@@ -1349,7 +1349,7 @@ export default function WalletVault() {
           */}
           {activeAccount.privateKey && !activeAccount.watchOnly && (
             <WalletConnectPanel
-              key={activeAccount.address}
+              key={`walletconnect-${activeAccount.address}`}
               account={{
                 address: activeAccount.address,
                 privateKey: activeAccount.privateKey,

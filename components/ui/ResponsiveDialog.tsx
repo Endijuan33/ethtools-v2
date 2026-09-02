@@ -83,6 +83,17 @@ export default function ResponsiveDialog({
         <Drawer.Portal>
           <Drawer.Overlay className="fixed inset-0 z-50 bg-background/80 backdrop-blur-sm" />
           <Drawer.Content
+            // Same toast rule as the desktop dialog above: vaul is built on
+            // Radix Dialog, so approving a confirmAction toast sitting over the
+            // sheet would otherwise dismiss the sheet mid-flow.
+            onInteractOutside={(event) => {
+              const target = event.target as HTMLElement | null
+              if (target?.closest("[data-sonner-toast]")) {
+                event.preventDefault()
+                return
+              }
+              if (!dismissible) event.preventDefault()
+            }}
             className={cn(
               "fixed inset-x-0 bottom-0 z-50 flex max-h-[92dvh] flex-col",
               "rounded-t-3xl border-t border-border bg-card text-card-foreground",
@@ -138,6 +149,15 @@ export default function ResponsiveDialog({
             if (!dismissible) event.preventDefault()
           }}
           onInteractOutside={(event) => {
+            // A confirmAction toast spawned from inside this dialog renders in
+            // a portal outside it, so approving one counts as an outside
+            // interaction — without this guard the dialog would close itself
+            // in the middle of the flow the toast is confirming.
+            const target = event.target as HTMLElement | null
+            if (target?.closest("[data-sonner-toast]")) {
+              event.preventDefault()
+              return
+            }
             if (!dismissible) event.preventDefault()
           }}
           className={cn(
