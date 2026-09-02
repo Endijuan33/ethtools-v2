@@ -183,7 +183,9 @@ export const EIP155_CHAIN_TO_NETWORK_KEY: Readonly<Record<number, string>> = {
   1284: "moonbeam",
   5000: "mantle",
   5031: "somnia",
-  5042: "arc-mainnet",
+  // 5042 (Arc Mainnet) is intentionally unmapped: the network is absent from
+  // NETWORKS until a keyless public RPC exists, and WalletConnect approval is
+  // only granted for chains the app actually knows.
   7000: "zetachain",
   8217: "kaia",
   8453: "base",

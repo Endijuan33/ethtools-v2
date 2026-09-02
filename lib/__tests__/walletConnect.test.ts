@@ -247,7 +247,9 @@ test("chainIdToNetworkKey maps verified chain ids to NETWORKS keys", () => {
   assert.equal(chainIdToNetworkKey("eip155:137"), "polygon")
   assert.equal(chainIdToNetworkKey("eip155:42161"), "arbitrum")
   assert.equal(chainIdToNetworkKey("eip155:8453"), "base")
-  assert.equal(chainIdToNetworkKey("eip155:5042"), "arc-mainnet")
+  // Arc Mainnet (5042) stays unmapped while the network is absent from
+  // NETWORKS — no keyless public RPC exists for it yet.
+  assert.equal(chainIdToNetworkKey("eip155:5042"), null)
   assert.equal(chainIdToNetworkKey("eip155:5042002"), "arc-testnet")
   // ZetaChain mainnet is 7000; 7001 is its Athens testnet — the classic trap.
   assert.equal(chainIdToNetworkKey("eip155:7000"), "zetachain")
@@ -722,12 +724,16 @@ test("eth_sendTransaction accepts decimal values and calldata", () => {
 })
 
 test("eth_sendTransaction formats values with the chain's own decimals", () => {
-  // Arc's native unit is USDC with 6 decimals — formatting it as 18 would
-  // misstate the amount by 12 orders of magnitude.
-  const view = expectOk(normalizeTx([txFixture({ value: "0x16e360" })], "eip155:5042"))
+  // Arc's native unit is USDC — but Arc mints it with 18 decimals, not the 6
+  // used by USDC elsewhere (verified against live testnet transactions and
+  // docs.arc.io). A 73.27 USDC transfer is 73273025000000000000 base units.
+  const view = expectOk(
+    normalizeTx([txFixture({ value: "73273025000000000000" })], "eip155:5042002")
+  )
   if (view.kind !== "transaction") return assert.fail("wrong kind")
-  assert.equal(view.networkKey, "arc-mainnet")
-  assert.equal(view.valueDisplay, "1.5 USDC")
+  assert.equal(view.networkKey, "arc-testnet")
+  assert.equal(view.currency, "USDC")
+  assert.equal(view.valueDisplay, "73.273025 USDC")
 })
 
 test("eth_sendTransaction flags unknown chains and shows raw base units", () => {

@@ -209,9 +209,11 @@ test("usd conversion truncates toward zero and never rounds up", () => {
 })
 
 test("prices non-18-decimal assets correctly", () => {
-  // Arc-style native USDC: 2.5 units at 6 decimals, worth $1 each.
+  // A user-added custom network with a 6-decimal native token: 2.5 units
+  // at $1 each. (Arc itself is NOT this case — its native USDC uses 18
+  // decimals — so the fixture uses a hypothetical custom chain.)
   const portfolio = aggregatePortfolio([
-    entry("arc-mainnet", 2_500_000n, 1, { decimals: 6, symbol: "USDC" }),
+    entry("custom-stable-chain", 2_500_000n, 1, { decimals: 6, symbol: "USDC" }),
   ])
   assert.equal(portfolio.netUsd, 2.5)
   assert.equal(portfolio.byNetwork[0].usd, 2.5)

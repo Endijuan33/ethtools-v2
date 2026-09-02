@@ -68,12 +68,14 @@ export type BuiltInNetworkKey = keyof typeof NETWORKS
  * Everything else defaults to 18. This exists because amount parsing previously
  * assumed 18 decimals for every chain, which is wrong for any chain whose native
  * unit differs and would misprice a transfer by orders of magnitude.
+ *
+ * Arc is deliberately absent: although its native unit is USDC, Arc mints that
+ * USDC with 18 decimals (verified against live testnet transactions and the
+ * official docs: docs.arc.io, "USDC uses 18 decimals natively (not 6)"). An
+ * earlier 6-decimal override here mispriced Arc balances and fees by 12 orders
+ * of magnitude.
  */
-const NATIVE_DECIMALS_OVERRIDES: Readonly<Record<string, number>> = {
-  // Arc's native unit is USDC, which uses 6 decimals.
-  "arc-mainnet": 6,
-  "arc-testnet": 6,
-}
+const NATIVE_DECIMALS_OVERRIDES: Readonly<Record<string, number>> = {}
 
 /** Decimals of a network's native currency. Defaults to 18. */
 export function getNativeDecimals(network: Network): number {
@@ -227,15 +229,16 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     type: "mainnet",
   },
 
-  "arc-mainnet": {
-    name: "Arc Mainnet",
-    rpcUrls: [
-      "https://arc-mainnet.infura.io/v3/b6bf7d3508c941499b10025c0776eaf8",
-    ],
-    explorerUrl: "https://arc-mainnet.cloud.blockscout.com/",
-    currency: "USDC",
-    type: "mainnet",
-  },
+  /*
+   * Arc Mainnet is intentionally absent. Its only reachable endpoints today
+   * are authenticated or Infura-based (both forbidden here — this app uses
+   * public, keyless RPCs only), and Circle's own docs publish Arc mainnet
+   * endpoints "separately when available" — Arc is documented as
+   * testnet-only at the time of writing. Re-add it the moment a keyless
+   * public endpoint exists; every other part of the app (USDC as the native
+   * currency symbol, 18-decimal native unit, chain-id 5042) is already
+   * supported.
+   */
 
   mantle: {
     name: "Mantle Mainnet",
@@ -394,11 +397,18 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     type: "testnet",
   },
 
+  /*
+   * Arc's native unit is USDC — gas is paid in USDC, not ETH — but Arc mints
+   * it with 18 decimals (confirmed against live testnet transactions and the
+   * official EVM-differences doc), so the default in getNativeDecimals is
+   * already correct and no override is needed.
+   */
   "arc-testnet": {
     name: "Arc Testnet",
     rpcUrls: [
-      "https://arc-testnet.drpc.org",
-      "https://testnet-arc.publicnode.com",
+      "https://rpc.testnet.arc.io",
+      "https://rpc.drpc.testnet.arc.io",
+      "https://rpc.blockdaemon.testnet.arc.io",
     ],
     explorerUrl: "https://testnet.arcscan.app",
     currency: "USDC",
