@@ -9,9 +9,10 @@
     "lint": "next lint",
     "start": "next start",
     "typecheck": "tsc --noEmit",
-    "pretest": "tsc -p tsconfig.test.json",
+    "pretest": "tsc -p tsconfig.test.json --incremental",
     "test": "node --test \".test-build/__tests__/*.test.js\"",
-    "verify": "pnpm typecheck && pnpm lint && pnpm test"
+    "verify": "pnpm typecheck && pnpm lint && pnpm test",
+    "test:clean": "rm -rf .test-build && pnpm test"
   },
   "dependencies": {
     "@emotion/is-prop-valid": "latest",
