@@ -10,6 +10,7 @@ import {
   Wallet,
   Bookmark as BookmarkIcon,
   FileJson,
+  Search,
 } from "lucide-react"
 import { Mnemonic, Wallet as EthersWallet, isError } from "ethers"
 import {
@@ -27,6 +28,7 @@ import {
   type CustomNetwork,
   type NetworkConfig,
 } from "@/lib/ethers"
+import { fetchChainMetadata } from "@/lib/chainMetadata"
 import { RpcError } from "@/lib/multiRpc"
 import { APP_EVENTS, onAppEvent } from "@/lib/appEvents"
 import { QRCodeSVG } from "qrcode.react"
@@ -200,11 +202,78 @@ function AddCustomRpcModal({
   const [currency, setCurrency] = useState("")
   const [isValidating, setIsValidating] = useState(false)
   const [error, setError] = useState("")
+  /*
+   * Auto-fetched metadata. `decimals` is part of the saved network (the
+   * portfolio and send flows price by it), so it rides along with the
+   * prefilled text fields; a null keeps the 18-decimal default.
+   */
+  const [decimals, setDecimals] = useState<number | null>(null)
+  const [isFetchingMeta, setIsFetchingMeta] = useState(false)
+  const [metaNote, setMetaNote] = useState("")
 
   const handleAddRpcUrl = () => setRpcUrls((prev) => [...prev, ""])
   const handleRemoveRpcUrl = (index: number) => {
     if (rpcUrls.length <= 1) return
     setRpcUrls((prev) => prev.filter((_, i) => i !== index))
+  }
+
+  /**
+   * Ask the RPC for its chain id, then look the id up in the public chain
+   * registry and prefill the form. Only EMPTY fields are filled — anything
+   * the user already typed is theirs. The RPC's own chain id is the
+   * authoritative input; the registry only supplies the human metadata.
+   */
+  const handleFetchMetadata = async () => {
+    const firstUrl = rpcUrls.find((url) => url.trim() !== "")
+    if (!firstUrl) {
+      setMetaNote("Enter an RPC URL first, then fetch its metadata.")
+      return
+    }
+
+    setIsFetchingMeta(true)
+    setMetaNote("")
+    try {
+      const validation = await validateRpcUrl(firstUrl.trim())
+      if (!validation.valid) {
+        setMetaNote(`Could not read the RPC: ${validation.error ?? "unreachable."}`)
+        return
+      }
+
+      const lookup = await fetchChainMetadata(validation.chainId ?? 0)
+      if (!lookup.ok) {
+        setMetaNote(lookup.error)
+        return
+      }
+      if (lookup.value === null) {
+        setMetaNote(
+          `Chain ${validation.chainId} is not in the public registry — fill in the details manually.`
+        )
+        return
+      }
+
+      const meta = lookup.value
+      if (name.trim() === "" && meta.name !== "") setName(meta.name)
+      if (currency.trim() === "" && meta.currencySymbol !== "") {
+        setCurrency(meta.currencySymbol)
+      }
+      if (explorerUrl.trim() === "" && meta.explorerUrl !== "") {
+        setExplorerUrl(meta.explorerUrl)
+      }
+      if (meta.decimals !== null) setDecimals(meta.decimals)
+
+      const parts = [
+        meta.name !== "" ? meta.name : null,
+        meta.currencySymbol !== "" ? meta.currencySymbol : null,
+        meta.decimals !== null ? `${meta.decimals} decimals` : null,
+      ].filter(Boolean)
+      setMetaNote(
+        `Chain ${validation.chainId}: ${parts.join(" · ")}${
+          name.trim() !== "" || currency.trim() !== "" ? " (only empty fields were filled)" : ""
+        }`
+      )
+    } finally {
+      setIsFetchingMeta(false)
+    }
   }
 
   const handleSubmit = async () => {
@@ -239,6 +308,7 @@ function AddCustomRpcModal({
       currency: currency.trim().toUpperCase(),
       type: networkType,
       isCustom: true,
+      ...(decimals !== null ? { decimals } : {}),
     }
 
     onAdd(key, network)
@@ -246,6 +316,8 @@ function AddCustomRpcModal({
     setRpcUrls([""])
     setExplorerUrl("")
     setCurrency("")
+    setDecimals(null)
+    setMetaNote("")
     onClose()
   }
 
@@ -329,6 +401,36 @@ function AddCustomRpcModal({
         >
           Add another RPC URL
         </Button>
+
+        {/*
+          One explicit action reads the RPC's chain id and prefills the rest
+          of the form from the public registry. Explicit rather than
+          on-every-keystroke: the RPC URL is sent a request by the user's own
+          hand, and the form stays in control of what gets filled.
+        */}
+        <div className="flex flex-col gap-2 pt-1">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={handleFetchMetadata}
+            disabled={isFetchingMeta || isValidating}
+            isLoading={isFetchingMeta}
+            loadingLabel="Fetching metadata…"
+            icon={<Search size={16} aria-hidden="true" />}
+            className="self-start"
+          >
+            Fetch metadata from RPC
+          </Button>
+          {metaNote !== "" && (
+            <p
+              className="text-xs leading-relaxed text-muted-foreground"
+              role="status"
+              aria-live="polite"
+            >
+              {metaNote}
+            </p>
+          )}
+        </div>
       </fieldset>
 
       <Field label="Explorer URL" hint="Optional.">
