@@ -45,6 +45,12 @@ import { notify } from "./ui/Toast"
 import { truncateHex } from "@/lib/format"
 import { describeError, logger } from "@/lib/logger"
 import { withProvider } from "@/lib/ethers"
+import {
+  collectKnownAddresses,
+  describeSharedPattern,
+  screenAddress,
+  type AddressScreen,
+} from "@/lib/addressGuard"
 import { useOnlineStatus } from "@/lib/useOnlineStatus"
 import {
   buildApprovalNamespaces,
@@ -654,6 +660,17 @@ export default function WalletConnectPanel({ account, onStatus }: WalletConnectP
   const txView = activeDecoded !== null && activeDecoded.ok && activeDecoded.value.kind === "transaction"
     ? activeDecoded.value
     : null
+  /*
+   * Address-poisoning screen for the transaction's recipient: the known set
+   * is every bookmark and past recipient, plus this account's own address,
+   * because a lookalike of your own address plays the same trick. Advisory
+   * only — deliberately kept out of `approveRequestDisabled`, since a warning
+   * must never become a block on a legitimately new address.
+   */
+  const txRecipientScreen = useMemo(() => {
+    if (txView === null) return null
+    return screenAddress(txView.tx.to, [...collectKnownAddresses(), account.address])
+  }, [txView, account.address])
   const txBlockers = txView !== null ? transactionSigningBlockers(txView, enrichment?.fill) : []
   const simulationBlocked = txView !== null && enrichment?.simulationFailed === true
   const approveRequestDisabled =
@@ -993,6 +1010,7 @@ export default function WalletConnectPanel({ account, onStatus }: WalletConnectP
             dapp={requestingSession}
             enrichment={enrichment}
             txBlockers={txBlockers}
+            recipientScreen={txRecipientScreen}
           />
         )}
       </ResponsiveDialog>
@@ -1082,12 +1100,14 @@ function RequestDialogBody({
   dapp,
   enrichment,
   txBlockers,
+  recipientScreen,
 }: {
   entry: PendingRequestEntry
   decoded: { ok: true; value: NormalizedSignRequest } | { ok: false; error: string } | null
   dapp: SessionSummary | null
   enrichment: GasEnrichment | null
   txBlockers: string[]
+  recipientScreen: AddressScreen | null
 }): React.ReactNode {
   return (
     <div className="space-y-4">
@@ -1109,7 +1129,12 @@ function RequestDialogBody({
       ) : decoded.value.kind === "typed-data" ? (
         <TypedDataBody view={decoded.value} />
       ) : (
-        <TransactionBody view={decoded.value} enrichment={enrichment} blockers={txBlockers} />
+        <TransactionBody
+          view={decoded.value}
+          enrichment={enrichment}
+          blockers={txBlockers}
+          recipientScreen={recipientScreen}
+        />
       )}
     </div>
   )
@@ -1168,10 +1193,12 @@ function TransactionBody({
   view,
   enrichment,
   blockers,
+  recipientScreen,
 }: {
   view: TransactionSignView
   enrichment: GasEnrichment | null
   blockers: string[]
+  recipientScreen: AddressScreen | null
 }): React.ReactNode {
   return (
     <div className="space-y-3">
@@ -1181,6 +1208,11 @@ function TransactionBody({
           <CopyButton value={view.tx.to} label="recipient address" />
         </div>
       </DetailRow>
+      {recipientScreen !== null && recipientScreen.suspect && (
+        <Alert tone="warning" title="Possible address poisoning">
+          {`${describeSharedPattern(recipientScreen)} Check the full address character by character before approving.`}
+        </Alert>
+      )}
       <DetailRow label="Amount">
         <p className="font-medium">{view.valueDisplay}</p>
       </DetailRow>

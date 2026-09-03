@@ -14,6 +14,7 @@ import {
 import { getGasOverview, type GasOverview } from "@/lib/gasTracker"
 import { saveTransaction, updateTransactionStatus } from "@/lib/transactionHistory"
 import { getBookmarksByNetwork, isAddressBookmarked } from "@/lib/bookmarks"
+import { collectKnownAddresses, describeSharedPattern, screenAddress } from "@/lib/addressGuard"
 import { formatFiat, parseAmount } from "@/lib/format"
 import { formatUnit } from "@/lib/units"
 import { describeError, logger } from "@/lib/logger"
@@ -101,6 +102,25 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
 
   // Check if current recipient is bookmarked
   const isBookmarked = recipient && isAddress(recipient) && isAddressBookmarked(recipient)
+
+  /*
+   * Address-poisoning screen for the typed recipient, against every bookmark
+   * and past recipient on any network — a lookalike does not care which chain
+   * the real counterparty was saved for. Recomputed as the recipient changes,
+   * and again when the bookmark manager closes, because a bookmark added
+   * mid-dialog makes an exact match safe again. The comparison is pure and
+   * reads only local data, so no debounce is needed. The result only ever
+   * warns: it must never gate the send button, since a legitimately new
+   * address can look similar by chance.
+   */
+  const recipientScreen = useMemo(
+    () => screenAddress(recipient, collectKnownAddresses()),
+    // `showBookmarkManager` is not read inside the memo, but closing the
+    // manager may have changed the stored bookmarks the screen reads, so it
+    // is a recompute trigger the exhaustive-deps rule cannot see.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [recipient, showBookmarkManager]
+  )
 
   // ---- Gas + balance load (once per open) ----
   useEffect(() => {
@@ -564,6 +584,12 @@ export default function SendForm({ network, wallet, onClose, onSuccess }: SendFo
               <Check size={12} aria-hidden="true" />
               Bookmarked address
             </p>
+          )}
+
+          {recipientScreen.suspect && (
+            <Alert tone="warning" title="Possible address poisoning">
+              {`${describeSharedPattern(recipientScreen)} Check the full address character by character before sending.`}
+            </Alert>
           )}
         </div>
 

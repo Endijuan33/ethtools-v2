@@ -47,6 +47,8 @@ import AccountDiscovery from "./AccountDiscovery"
 import BackupManager from "./BackupManager"
 import PortfolioCard from "./PortfolioCard"
 import TokenDiscoveryCard from "./TokenDiscoveryCard"
+import ApprovalManagerCard from "./ApprovalManagerCard"
+import VaultSignCard from "./VaultSignCard"
 import { truncateHex } from "@/lib/format"
 import { assessPassword, isVaultSupported } from "@/lib/vault"
 import { decryptKeystore, MAX_KEYSTORE_BYTES, type RecoveredKeystoreAccount } from "@/lib/keystore"
@@ -1353,6 +1355,38 @@ export default function WalletVault() {
             address={activeAccount.address}
             watchOnly={activeAccount.watchOnly}
           />
+
+          {/*
+            Allowance manager for the active account. The scan needs only the
+            public address (so watch-only accounts see their approvals too);
+            revoking spends gas, which requires the key — the card explains
+            that honestly for watch-only accounts instead of hiding the gap.
+          */}
+          <ApprovalManagerCard
+            key={`allowances-${activeAccount.address}`}
+            address={activeAccount.address}
+            privateKey={activeAccount.privateKey ?? undefined}
+            watchOnly={activeAccount.watchOnly}
+          />
+
+          {/*
+            Sign with the vault account — message and typed data — without
+            ever pasting a key. This closes the last surface in the app where
+            a key had to be typed by hand: the dev-tools signers still accept
+            pasted keys for arbitrary use, but the user's own account never
+            needs one here. Keyed by address; a stale card wired to the
+            previous key would be a signing hazard.
+          */}
+          {activeAccount.privateKey && !activeAccount.watchOnly && (
+            <VaultSignCard
+              key={`vault-sign-${activeAccount.address}`}
+              account={{
+                address: activeAccount.address,
+                privateKey: activeAccount.privateKey,
+              }}
+              label={activeAccount.label}
+            />
+          )}
 
           {/*
             Wallet-side dApp connections for the active account. Keyed by
