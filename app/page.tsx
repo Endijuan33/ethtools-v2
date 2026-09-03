@@ -80,6 +80,11 @@ const PriceChartCard = dynamic(() => import("@/components/PriceChartCard"), {
   loading: () => <Spinner label="Loading price chart…" />,
 })
 
+const PriceAlertsCard = dynamic(() => import("@/components/PriceAlertsCard"), {
+  ssr: false,
+  loading: () => <Spinner label="Loading price alerts…" />,
+})
+
 const DevToolsCard = dynamic(() => import("@/components/DevToolsCard"), {
   ssr: false,
   loading: () => <Spinner label="Loading tools…" />,
@@ -300,6 +305,17 @@ export default function Home() {
                     <ErrorBoundary name="Price chart">
                       <PriceChartCard />
                     </ErrorBoundary>
+
+                    {/*
+                      Price & gas alerts sit with the chart they watch. Own
+                      boundary: alerts are pure presentation plus timers — a
+                      failure here must not take the chart or balances down.
+                    */}
+                    <div className="mt-4">
+                      <ErrorBoundary name="Price alerts">
+                        <PriceAlertsCard />
+                      </ErrorBoundary>
+                    </div>
                   </div>
                 </>
               )}

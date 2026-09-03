@@ -38,6 +38,7 @@ import ResponsiveDialog from "./ui/ResponsiveDialog"
 import { EmptyState, ErrorState } from "./ui/Feedback"
 import { notify } from "./ui/Toast"
 import {
+  estimateAllowanceUsd,
   revokeApproval,
   scanApprovalsAcrossNetworks,
   type ActiveApproval,
@@ -45,7 +46,7 @@ import {
 } from "@/lib/approvals"
 import { EXPLORER_APIS } from "@/lib/tokenDetection"
 import { NETWORKS, getRoutescanUrl } from "@/lib/ethers"
-import { formatBalanceForDisplay, formatRelativeTime, truncateHex } from "@/lib/format"
+import { formatBalanceForDisplay, formatFiat, formatRelativeTime, truncateHex } from "@/lib/format"
 import { cn } from "@/lib/utils"
 
 export interface ApprovalManagerCardProps {
@@ -464,6 +465,23 @@ export default function ApprovalManagerCard({
                                           approval.tokenDecimals
                                         )
                                       : null
+                                  /*
+                                   * USD exposure only for a finite, priced
+                                   * allowance: an unlimited allowance times
+                                   * any price is meaningless, so it shows
+                                   * nothing rather than an invented number,
+                                   * and an unpriced token (no exchange_rate,
+                                   * or metadata enrichment failed) degrades
+                                   * the same way — missing price is missing
+                                   * value, never zero.
+                                   */
+                                  const usdExposure =
+                                    !approval.unlimited && formatted !== null
+                                      ? estimateAllowanceUsd(
+                                          formatted,
+                                          approval.tokenPriceUsd ?? null
+                                        )
+                                      : null
                                   const spenderUrl = getRoutescanUrl(
                                     approval.spender,
                                     approval.networkKey
@@ -518,6 +536,14 @@ export default function ApprovalManagerCard({
                                           )}
                                         </span>
                                       </div>
+                                      {usdExposure !== null && (
+                                        <p
+                                          className="text-right font-mono text-xs tabular-nums text-muted-foreground"
+                                          title="Allowance valued at the token's current USD price from the explorer"
+                                        >
+                                          ≈ {formatFiat(usdExposure)} exposure
+                                        </p>
+                                      )}
                                       <div className="flex items-center justify-between gap-2">
                                         <div className="flex min-w-0 items-center gap-0.5">
                                           <p

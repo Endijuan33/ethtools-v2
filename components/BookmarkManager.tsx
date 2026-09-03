@@ -1,18 +1,22 @@
 "use client"
 
-import { useState, useEffect, useCallback } from "react"
+import { useState, useEffect, useCallback, useRef } from "react"
 import {
   Plus,
   Trash2,
   Bookmark as BookmarkIcon,
   Check,
   ExternalLink,
+  Download,
+  Upload,
 } from "lucide-react"
 import {
   getBookmarks,
   saveBookmark,
   deleteBookmark,
   getBookmarksByNetwork,
+  exportWalletData,
+  importWalletData,
   type Bookmark,
 } from "@/lib/bookmarks"
 import { getRoutescanUrl } from "@/lib/ethers"
@@ -22,10 +26,39 @@ import Card from "./ui/Card"
 import Button from "./ui/Button"
 import Field, { inputClassName, monoInputClassName } from "./ui/Field"
 import Badge from "./ui/Badge"
+import Alert from "./ui/Alert"
 import CopyButton from "./ui/CopyButton"
 import { EmptyState } from "./ui/Feedback"
 import { confirmAction, notify } from "./ui/Toast"
 import { cn } from "@/lib/utils"
+
+/**
+ * Upper bound on an import file's size, checked before the file is read.
+ *
+ * An export of the capped bookmark store plus a sane network set is tens of
+ * kilobytes; anything past this is not a wallet-data file, and refusing it by
+ * size avoids ever reading a hostile multi-gigabyte pick into memory.
+ */
+const MAX_IMPORT_FILE_BYTES = 1024 * 1024
+
+/** Trigger a file download without navigating away. Mirrors BackupManager. */
+function downloadTextFile(filename: string, contents: string): void {
+  const blob = new Blob([contents], { type: "application/json" })
+  const url = URL.createObjectURL(blob)
+  const link = document.createElement("a")
+  link.href = url
+  link.download = filename
+  document.body.appendChild(link)
+  link.click()
+  link.remove()
+  // Revoking synchronously can cancel the download in some browsers, so defer.
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
+/** Export filename with the date, so repeat exports never collide confusingly. */
+function exportFilename(now = new Date()): string {
+  return `ethtools-bookmarks-${now.toISOString().slice(0, 10)}.json`
+}
 
 interface BookmarkManagerProps {
   /** Whether the modal is open */
@@ -50,6 +83,9 @@ export default function BookmarkManager({
   const [addressError, setAddressError] = useState("")
   const [labelError, setLabelError] = useState("")
   const [searchTerm, setSearchTerm] = useState("")
+  /** Import failure, shown as an Alert until the next pick; empty when none. */
+  const [importError, setImportError] = useState("")
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   // Load bookmarks
   const loadBookmarks = useCallback(() => {
@@ -139,6 +175,66 @@ export default function BookmarkManager({
     }
   }
 
+  /**
+   * Export bookmarks and custom networks.
+   *
+   * The file is non-secret by construction (see `exportWalletData`), which is
+   * also why there is no confirmation dialog: unlike a backup export, nothing
+   * in it can spend funds.
+   */
+  const handleExport = () => {
+    downloadTextFile(exportFilename(), exportWalletData())
+    notify.success(
+      "Export downloaded",
+      "Bookmarks and custom networks. No keys or recovery phrase."
+    )
+  }
+
+  /**
+   * Import a picked .json file.
+   *
+   * Bounded before it is read, and the result is either a toast with exact
+   * counts or an Alert carrying the precise rejection sentence — never a
+   * partial import, which the lib guarantees by validating the whole file
+   * first.
+   */
+  const handleImportFile = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    setImportError("")
+    const file = event.target.files?.[0] ?? null
+    // Reset so picking the same file again still fires a change event.
+    event.target.value = ""
+    if (file === null) return
+
+    if (file.size > MAX_IMPORT_FILE_BYTES) {
+      setImportError("That file is too large to be a valid export.")
+      return
+    }
+
+    let text: string
+    try {
+      text = await file.text()
+    } catch {
+      setImportError("Could not read that file.")
+      return
+    }
+
+    const result = importWalletData(text)
+    if (result.ok) {
+      const { bookmarksAdded, bookmarksSkipped, networksAdded, networksSkipped } = result.counts
+      const skipped = bookmarksSkipped + networksSkipped
+      notify.success(
+        "Import complete",
+        `Added ${bookmarksAdded} bookmark${bookmarksAdded !== 1 ? "s" : ""} and ${networksAdded} network${networksAdded !== 1 ? "s" : ""}` +
+          (skipped > 0
+            ? `; skipped ${skipped} duplicate${skipped !== 1 ? "s" : ""}.`
+            : ".")
+      )
+      loadBookmarks()
+    } else {
+      setImportError(result.error)
+    }
+  }
+
   // Filter bookmarks by search term
   const filteredBookmarks = bookmarks.filter(
     (b) =>
@@ -158,12 +254,45 @@ export default function BookmarkManager({
           <span className="text-xs text-muted-foreground">
             {bookmarks.length} bookmark{bookmarks.length !== 1 ? "s" : ""}
           </span>
-          <Button variant="secondary" onClick={onClose}>
-            Close
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              variant="ghost"
+              onClick={handleExport}
+              icon={<Download size={18} aria-hidden="true" />}
+            >
+              Export
+            </Button>
+            <Button
+              variant="ghost"
+              onClick={() => fileInputRef.current?.click()}
+              icon={<Upload size={18} aria-hidden="true" />}
+            >
+              Import
+            </Button>
+            <Button variant="secondary" onClick={onClose}>
+              Close
+            </Button>
+          </div>
         </div>
       }
     >
+      {/* Hidden picker, driven by the Import button; still keyboard reachable
+          so a screen-reader or keyboard user is not locked out of importing. */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="application/json,.json"
+        className="sr-only"
+        aria-label="Import bookmarks and custom networks from a JSON file"
+        onChange={(event) => void handleImportFile(event)}
+      />
+
+      {importError !== "" && (
+        <Alert tone="danger" title="Could not import that file." className="mb-3">
+          {importError}
+        </Alert>
+      )}
+
       {/* Add New Bookmark */}
       <Card variant="inset" padding="sm" className="space-y-3">
         <Field label="Address" required error={addressError || undefined}>

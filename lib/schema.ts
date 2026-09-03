@@ -391,3 +391,56 @@ export function filterValidCustomNetworks(
   }
   return out
 }
+
+// ===== Wallet data export (bookmarks + custom networks) =====
+
+/** Current wallet-data export format version. Bump on breaking changes. */
+export const WALLET_DATA_EXPORT_VERSION = 1
+
+/**
+ * The contents of a bookmarks + custom-networks export file.
+ *
+ * This is the non-secret sibling of the settings backup: it carries exactly the
+ * two stores a user most often wants on a new device — address labels and their
+ * own RPC endpoints — and structurally cannot carry a key. Both field types
+ * ({@link StoredBookmark}, {@link StoredCustomNetwork}) have no secret-bearing
+ * member, and `lib/bookmarks.exportWalletData` rebuilds every record field by
+ * field from those typed shapes, so an unexpected key from a hostile store
+ * cannot ride along into the file. The guarantee is enforced by construction,
+ * not by filtering a serialized blob for the word "privateKey".
+ */
+export interface WalletDataExport {
+  /** Format version, exactly {@link WALLET_DATA_EXPORT_VERSION}. */
+  version: 1
+  /** Unix milliseconds, so a stale file can be recognised on import. */
+  exportedAt: number
+  bookmarks: StoredBookmark[]
+  customNetworks: Record<string, StoredCustomNetwork>
+}
+
+/**
+ * Whether a value is a readable wallet-data export.
+ *
+ * Applied to a hand-picked or downloaded file, so the exact version is part of
+ * the check — a future format must be rejected, not partially read. Unlike the
+ * permissive `filterValid*` guards used for `localStorage`, a single invalid
+ * entry rejects the whole file: an import must be all-or-nothing, because
+ * silently dropping the one entry the user actually cared about is worse than
+ * refusing the file with a precise error.
+ *
+ * `lib/bookmarks.importWalletData` re-walks the same structure to produce that
+ * precise error sentence; the two must agree on every rule.
+ */
+export function isWalletDataExport(value: unknown): value is WalletDataExport {
+  if (!isRecord(value)) return false
+  if (value.version !== WALLET_DATA_EXPORT_VERSION) return false
+  if (!isIntegerInRange(value.exportedAt, 0, Number.MAX_SAFE_INTEGER)) return false
+  if (!Array.isArray(value.bookmarks)) return false
+  if (!value.bookmarks.every(isStoredBookmark)) return false
+  if (!isRecord(value.customNetworks)) return false
+  for (const [key, config] of Object.entries(value.customNetworks)) {
+    if (!/^[a-z0-9-]{1,64}$/.test(key)) return false
+    if (!isStoredCustomNetwork(config)) return false
+  }
+  return true
+}

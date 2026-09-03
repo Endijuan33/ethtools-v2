@@ -49,6 +49,8 @@ import PortfolioCard from "./PortfolioCard"
 import TokenDiscoveryCard from "./TokenDiscoveryCard"
 import ApprovalManagerCard from "./ApprovalManagerCard"
 import VaultSignCard from "./VaultSignCard"
+import SweepCard from "./SweepCard"
+import WatchBalanceNotifier from "./WatchBalanceNotifier"
 import { truncateHex } from "@/lib/format"
 import { assessPassword, isVaultSupported } from "@/lib/vault"
 import { decryptKeystore, MAX_KEYSTORE_BYTES, type RecoveredKeystoreAccount } from "@/lib/keystore"
@@ -65,6 +67,7 @@ import {
 import {
   addAccountsToVault,
   addWatchOnlyAccountToVault,
+  changeVaultPassword,
   createVault,
   detectLegacyWallets,
   getActiveAccountId,
@@ -81,6 +84,7 @@ import {
   hasPasskeyUnlock,
   isPasskeyUnlockAvailable,
   removePasskeyUnlock,
+  rewrapPasskeyUnlock,
   unlockWithPasskey,
 } from "@/lib/webauthnUnlock"
 import { NETWORKS } from "@/lib/ethers"
@@ -177,8 +181,23 @@ export default function WalletVault() {
   const [passkeyError, setPasskeyError] = useState("")
   const [passkeyBusy, setPasskeyBusy] = useState(false)
 
+  // Password-change dialog. The CURRENT password is a secret typed to prove
+  // possession before the vault may be re-sealed; it lives only for the
+  // ceremony — cleared in `finally`, on close, and on lock, never kept around
+  // in component state. The new-password drafts follow the setup screen's
+  // conventions (same assessor, cleared on success and on lock).
+  const [showChangePassword, setShowChangePassword] = useState(false)
+  const [changePwCurrent, setChangePwCurrent] = useState("")
+  const [changePwNext, setChangePwNext] = useState("")
+  const [changePwConfirm, setChangePwConfirm] = useState("")
+  const [changePwError, setChangePwError] = useState("")
+  const [changePwBusy, setChangePwBusy] = useState(false)
+
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const strength = assessPassword(newPassword)
+  // The change dialog reuses the setup screen's assessor so both screens agree
+  // on what "strong enough to encrypt funds" means.
+  const nextStrength = assessPassword(changePwNext)
 
   // ===== Lifecycle =====
 
@@ -206,6 +225,14 @@ export default function WalletVault() {
       setShowPasskeyEnroll(false)
       setPasskeyPassword("")
       setPasskeyError("")
+      // Password-change dialog state, for the same reason: the current
+      // password is a proof secret and the drafts must not outlive the
+      // unlocked session that opened the dialog.
+      setShowChangePassword(false)
+      setChangePwCurrent("")
+      setChangePwNext("")
+      setChangePwConfirm("")
+      setChangePwError("")
       // A recovered keystore key is a secret like any other; never let one
       // outlive the interaction that produced it.
       setSetupKeystore(null)
@@ -770,6 +797,98 @@ export default function WalletVault() {
     setPasskeyEnrolled(false)
     notify.info("Passkey unlock removed")
   }, [])
+
+  // ===== Password change =====
+
+  const closeChangePassword = useCallback(() => {
+    setShowChangePassword(false)
+    setChangePwCurrent("")
+    setChangePwNext("")
+    setChangePwConfirm("")
+    setChangePwError("")
+  }, [])
+
+  /**
+   * Change the vault password from the unlocked view.
+   *
+   * Ordering and failure policy:
+   * - The typed CURRENT password is verified against the stored vault before
+   *   anything else, mirroring the passkey enroll dialog: re-sealing the vault
+   *   must require proof of the password, not momentary access to an unlocked
+   *   screen. `changeVaultPassword` itself also refuses to write until the old
+   *   password decrypts, so a wrong current password can never destroy the
+   *   vault.
+   * - A passkey envelope wraps the OLD password, so after a successful change
+   *   it is stale and must be re-wrapped. A rewrap failure is a WARNING, not a
+   *   failed password change — the vault already answers to the new password —
+   *   and `rewrapPasskeyUnlock` removes the stale envelope itself, so the next
+   *   unlock can never surface a confusing wrong-password error from the
+   *   passkey path.
+   * - The in-memory password (used to re-seal later account changes) is
+   *   updated to the new one, or the next add/remove-account write would seal
+   *   the vault with a password that no longer opens it.
+   */
+  const handleChangePassword = useCallback(async () => {
+    setChangePwError("")
+
+    if (changePwCurrent === "") {
+      setChangePwError("Enter your current vault password.")
+      return
+    }
+    if (!nextStrength.acceptable) {
+      setChangePwError(nextStrength.issues[0] ?? "Choose a stronger password.")
+      return
+    }
+    if (changePwNext !== changePwConfirm) {
+      setChangePwError("The new passwords do not match.")
+      return
+    }
+
+    setChangePwBusy(true)
+    try {
+      // Verify before changing: an unlocked screen must never be enough to
+      // re-seal the vault under a different password.
+      const verified = await unlockVault(changePwCurrent)
+      if (!verified.ok) {
+        setChangePwError("Incorrect vault password.")
+        return
+      }
+
+      const changed = await changeVaultPassword(changePwCurrent, changePwNext)
+      if (!changed.ok) {
+        setChangePwError(changed.error)
+        return
+      }
+
+      // Later re-seals (add/remove account) sign with the in-memory password;
+      // it must follow the change or the next write would fail.
+      setPassword(changePwNext)
+
+      let passkeyNote: string | undefined
+      if (hasPasskeyUnlock()) {
+        const rewrapped = await rewrapPasskeyUnlock(changePwNext)
+        if (rewrapped.ok) {
+          passkeyNote = "Passkey unlock now wraps the new password."
+        } else {
+          // The rewrap removed the stale envelope itself. The password change
+          // itself succeeded, so this is surfaced as a warning — never as a
+          // failed change — with re-enrollment offered from the row below.
+          setPasskeyEnrolled(false)
+          notify.warning(
+            "Passkey unlock removed",
+            "Passkey unlock was removed because it could not be re-wrapped — set it up again if you want it."
+          )
+        }
+      }
+
+      closeChangePassword()
+      notify.success("Vault password changed", passkeyNote)
+    } finally {
+      // The current password must never outlive the ceremony, success or not.
+      setChangePwCurrent("")
+      setChangePwBusy(false)
+    }
+  }, [changePwConfirm, changePwCurrent, changePwNext, closeChangePassword, nextStrength])
 
   const activeAccount = useMemo(
     () => payload?.accounts.find((a) => a.id === activeId) ?? payload?.accounts[0] ?? null,
@@ -1389,6 +1508,33 @@ export default function WalletVault() {
           )}
 
           {/*
+            Balance watcher for the active account: a quiet poll that toasts
+            when the balance moves. Works for watch-only accounts too — it
+            only ever reads the public balance. Keyed by address so a network
+            switch or account switch always starts from a fresh baseline.
+          */}
+          <WatchBalanceNotifier
+            key={`watcher-${activeAccount.address}`}
+            address={activeAccount.address}
+            label={activeAccount.label}
+          />
+
+          {/*
+            Account sweep — moving every asset of this account to one
+            destination — is a key-holding action by definition; watch-only
+            accounts get the honest absence instead of a dead button.
+          */}
+          {activeAccount.privateKey && !activeAccount.watchOnly && (
+            <SweepCard
+              key={`sweep-${activeAccount.address}`}
+              account={{
+                address: activeAccount.address,
+                privateKey: activeAccount.privateKey,
+              }}
+            />
+          )}
+
+          {/*
             Wallet-side dApp connections for the active account. Keyed by
             address like the portfolio card: a session's pending requests and
             signing keys belong to one account, and a stale panel wired to the
@@ -1482,6 +1628,21 @@ export default function WalletVault() {
         ) : (
           <span className="text-muted-foreground/70">Not available in this browser</span>
         )}
+      </div>
+
+      {/*
+        Vault password change, placed beside the other device-local security
+        controls. Re-sealing needs proof of the current password — being
+        unlocked is not enough — which the dialog asks for and never keeps
+        beyond the ceremony.
+      */}
+      <div className="mt-3 flex flex-wrap items-center gap-x-2 gap-y-2 border-t border-border pt-3 text-xs text-muted-foreground">
+        <KeyRound className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+        <span>Vault password</span>
+        <span className="min-w-0 flex-1" aria-hidden="true" />
+        <Button variant="ghost" size="sm" onClick={() => setShowChangePassword(true)}>
+          Change password
+        </Button>
       </div>
 
       <ResponsiveDialog
@@ -1649,6 +1810,128 @@ export default function WalletVault() {
             />
           )}
         </Field>
+      </ResponsiveDialog>
+
+      <ResponsiveDialog
+        isOpen={showChangePassword}
+        onClose={closeChangePassword}
+        title="Change vault password"
+        description="Re-encrypts this vault with a new password. The accounts inside it do not change."
+        footer={
+          <>
+            <Button variant="secondary" onClick={closeChangePassword}>
+              Cancel
+            </Button>
+            <Button
+              onClick={() => void handleChangePassword()}
+              isLoading={changePwBusy}
+              loadingLabel="Re-encrypting…"
+              disabled={
+                changePwCurrent === "" ||
+                changePwNext === "" ||
+                !nextStrength.acceptable ||
+                changePwNext !== changePwConfirm
+              }
+              icon={<KeyRound className="h-4 w-4" aria-hidden="true" />}
+            >
+              Change password
+            </Button>
+          </>
+        }
+      >
+        {/* Dialog-local errors: a card-level banner would sit behind the
+            overlay and never be seen. */}
+        {changePwError && <Alert tone="danger">{changePwError}</Alert>}
+
+        <Alert tone="info" title="This re-encrypts the vault.">
+          The new password encrypts everything in this vault on this device. If it is lost, only a
+          backup (or your written-down recovery phrase) can recover the accounts.
+        </Alert>
+
+        <Field
+          label="Current password"
+          required
+          hint="Typed to prove possession before the vault is re-encrypted, then discarded."
+        >
+          {(props) => (
+            <input
+              {...props}
+              {...secretInputProps}
+              type="password"
+              value={changePwCurrent}
+              onChange={(e) => {
+                setChangePwCurrent(e.target.value)
+                setChangePwError("")
+              }}
+              className={inputClassName}
+            />
+          )}
+        </Field>
+
+        <Field
+          label="New password"
+          required
+          error={
+            changePwNext !== "" && !nextStrength.acceptable ? nextStrength.issues[0] : undefined
+          }
+        >
+          {(props) => (
+            <input
+              {...props}
+              {...secretInputProps}
+              type="password"
+              value={changePwNext}
+              onChange={(e) => {
+                setChangePwNext(e.target.value)
+                setChangePwError("")
+              }}
+              className={inputClassName}
+            />
+          )}
+        </Field>
+
+        <Field
+          label="Confirm new password"
+          required
+          error={
+            changePwConfirm !== "" && changePwNext !== changePwConfirm
+              ? "The new passwords do not match."
+              : undefined
+          }
+        >
+          {(props) => (
+            <input
+              {...props}
+              {...secretInputProps}
+              type="password"
+              value={changePwConfirm}
+              onChange={(e) => {
+                setChangePwConfirm(e.target.value)
+                setChangePwError("")
+              }}
+              className={inputClassName}
+            />
+          )}
+        </Field>
+
+        {changePwNext !== "" && (
+          <p className="text-xs text-muted-foreground">
+            Strength: <span className="font-semibold">{nextStrength.label}</span>
+          </p>
+        )}
+
+        {/*
+          The user must know before confirming that the passkey flow is
+          affected: a declined re-wrap prompt removes passkey unlock entirely
+          rather than leaving an envelope that wraps the old password.
+        */}
+        {passkeyEnrolled && (
+          <Alert tone="warning" title="Passkey unlock will be updated.">
+            Your passkey envelope wraps the current password, so you will be asked to use the
+            passkey once to re-wrap it around the new one. If that is declined or fails, passkey
+            unlock is removed — your password always works, and you can set the passkey up again.
+          </Alert>
+        )}
       </ResponsiveDialog>
 
       <BackupManager

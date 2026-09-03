@@ -9,9 +9,11 @@ import {
   MAX_LOGS_PER_NETWORK,
   chunkBlockRanges,
   decodeAllowanceResult,
+  estimateAllowanceUsd,
   extractApprovalPairs,
   isUnlimitedAllowance,
   needsSplitting,
+  parseTokenPriceUsd,
   splitBlockRange,
 } from "../approvals"
 
@@ -378,4 +380,73 @@ test("the pagination policy constants match the measured explorer behaviour", ()
     MAX_LOGS_PER_NETWORK > LOG_PAGE_CAP,
     "the collected-log cap must exceed a single page"
   )
+})
+
+// ===== parseTokenPriceUsd =====
+
+test("a well-formed exchange_rate string parses to a number", () => {
+  assert.equal(parseTokenPriceUsd("1234.56"), 1234.56)
+  assert.equal(parseTokenPriceUsd("0.000001"), 0.000001)
+  assert.equal(parseTokenPriceUsd(" 7.5 "), 7.5)
+  // Some Blockscout deployments emit a JSON number; both shapes are accepted.
+  assert.equal(parseTokenPriceUsd(3.25), 3.25)
+})
+
+test("garbage exchange_rate values read as null, never as a guessed price", () => {
+  // Zero and negatives are not prices: unknown must not become a phantom $0.
+  for (const bad of [
+    "0",
+    "0.00",
+    "-1",
+    "-0.5",
+    "",
+    "   ",
+    "free",
+    "1,234",
+    "1e3",
+    "12.5.1",
+    "NaN",
+    "Infinity",
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    0,
+    -3,
+    null,
+    undefined,
+    true,
+    {},
+    [],
+  ]) {
+    assert.equal(
+      parseTokenPriceUsd(bad),
+      null,
+      `${String(bad)} must not parse as a price`
+    )
+  }
+})
+
+// ===== estimateAllowanceUsd =====
+
+test("a finite priced allowance estimates to allowance times price", () => {
+  assert.equal(estimateAllowanceUsd("2500", 2), 5000)
+  assert.equal(estimateAllowanceUsd("2500.5", 2), 5001)
+  assert.equal(estimateAllowanceUsd("0.5", 3), 1.5)
+  assert.equal(estimateAllowanceUsd("100", 0.01), 1)
+})
+
+test("a null or unusable price yields null — missing price is missing value", () => {
+  for (const price of [null, 0, -2, Number.NaN, Number.POSITIVE_INFINITY]) {
+    assert.equal(estimateAllowanceUsd("2500", price), null, `price ${String(price)}`)
+  }
+})
+
+test("an unusable allowance string yields null rather than a guessed number", () => {
+  // Includes the display module's dust marker shape, which is not a number.
+  for (const bad of ["", "  ", "abc", "-5", "0", "1e300", "12..3", "<0.000001", "1,234"]) {
+    assert.equal(estimateAllowanceUsd(bad, 2), null, `allowance ${JSON.stringify(bad)}`)
+  }
+})
+
+test("an estimate that overflows to Infinity yields null", () => {
+  assert.equal(estimateAllowanceUsd("1000000", 1e303), null)
 })

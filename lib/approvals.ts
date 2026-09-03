@@ -72,6 +72,12 @@ export interface ActiveApproval {
   tokenName?: string
   /** Token decimals, when the explorer served usable metadata. */
   tokenDecimals?: number
+  /**
+   * Token's USD price from the explorer's `exchange_rate`, or null when the
+   * explorer served none (or garbage). Drives the per-row USD exposure line;
+   * absent entirely when metadata enrichment itself failed.
+   */
+  tokenPriceUsd?: number | null
   /** Spender, EIP-55 checksum form. */
   spender: string
   /** Current allowance in base units, read from the chain seconds ago. */
@@ -814,11 +820,73 @@ function cleanDisplayText(raw: unknown, maxLength: number): string | null {
     : cleaned
 }
 
+/**
+ * Parse a token's USD price from the explorer's `exchange_rate` field.
+ *
+ * The field is a decimal string (or occasionally null) from a hostile
+ * endpoint. Zero, negative, non-finite, and unparsable values all yield null
+ * rather than 0: an unknown price and a free token are different facts, and
+ * conflating them would show a phantom "$0.00" exposure — the same
+ * missing-price-is-missing-value philosophy the portfolio module applies.
+ *
+ * Exported for unit tests.
+ *
+ * @param raw - Candidate `exchange_rate` value. Hostile input.
+ * @returns The price, or null.
+ */
+export function parseTokenPriceUsd(raw: unknown): number | null {
+  let candidate: number
+  if (typeof raw === "number") {
+    // Some Blockscout deployments emit a JSON number where the documented
+    // shape says string; both are accepted, both validated identically.
+    candidate = raw
+  } else if (typeof raw === "string") {
+    const trimmed = raw.trim()
+    if (trimmed === "" || !/^\d+(\.\d+)?$/.test(trimmed)) return null
+    candidate = Number(trimmed)
+  } else {
+    return null
+  }
+  return Number.isFinite(candidate) && candidate > 0 ? candidate : null
+}
+
+/**
+ * Estimate a finite allowance's USD exposure.
+ *
+ * Pure: the UI supplies the already-humanized allowance string and the
+ * validated per-token price; neither the bigint nor the decimals need to be
+ * re-derived here. Any unusable input — a non-finite or non-positive allowance,
+ * or a null/zero price — yields null so the caller renders nothing rather than
+ * inventing a number. An *unlimited* allowance never reaches this function by
+ * convention: infinity times any price is not a fact worth displaying.
+ *
+ * @param allowanceHuman - Human-readable allowance, e.g. `"2500.5"`.
+ * @param priceUsd - Token price in USD, or null when no quote is available.
+ * @returns The exposure in USD, or null.
+ */
+export function estimateAllowanceUsd(
+  allowanceHuman: string,
+  priceUsd: number | null
+): number | null {
+  if (priceUsd === null || !Number.isFinite(priceUsd) || priceUsd <= 0) return null
+  if (typeof allowanceHuman !== "string") return null
+  const trimmed = allowanceHuman.trim()
+  // Plain decimals only — the exact shape `formatBalanceForDisplay` emits.
+  // Anything else (a dust marker like "<0.000001", a locale-grouped number) is
+  // not an estimate-able amount and reads as null.
+  if (!/^\d+(\.\d+)?$/.test(trimmed)) return null
+  const allowance = Number(trimmed)
+  if (!Number.isFinite(allowance) || allowance <= 0) return null
+  const exposure = allowance * priceUsd
+  return Number.isFinite(exposure) ? exposure : null
+}
+
 /** Enrichment metadata for one token, all fields optional by design. */
 interface TokenMetadata {
   tokenSymbol?: string
   tokenName?: string
   tokenDecimals?: number
+  tokenPriceUsd?: number | null
 }
 
 /**
@@ -849,11 +917,16 @@ async function fetchTokenMetadata(
     const symbol = cleanDisplayText(payload.symbol, MAX_SYMBOL_LENGTH)
     const name = cleanDisplayText(payload.name, MAX_NAME_LENGTH)
     const decimals = parseDecimalsField(payload.decimals)
+    const priceUsd = parseTokenPriceUsd(payload.exchange_rate)
 
     const metadata: TokenMetadata = {}
     if (symbol !== null) metadata.tokenSymbol = symbol
     if (name !== null) metadata.tokenName = name
     if (decimals !== null) metadata.tokenDecimals = decimals
+    // Null is meaningful ("the explorer knows the token but not its price") and
+    // is stored, so the row can honestly omit the USD line rather than
+    // re-attempt a price it will not get.
+    metadata.tokenPriceUsd = priceUsd
     return metadata
   } catch {
     return null

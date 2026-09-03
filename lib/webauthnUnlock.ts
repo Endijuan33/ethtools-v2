@@ -579,3 +579,87 @@ export async function unlockWithPasskey(): Promise<PasskeyResult<string>> {
 
   return unwrapPasswordWithPrf(prfBytes, record.envelope)
 }
+
+// ===== Re-wrap after a password change =====
+
+/**
+ * Re-wrap the passkey envelope around a NEW vault password.
+ *
+ * Call immediately after a successful `changeVaultPassword` when a passkey
+ * envelope exists: the stored envelope still wraps the OLD password, so without
+ * this it is stale — it would unwrap a password that no longer opens the vault
+ * and surface as a confusing wrong-password error at the next passkey unlock.
+ *
+ * The ceremony re-uses the SAME credential and salt (a `get()` assertion with
+ * `prf.eval`, exactly like {@link unlockWithPasskey}), re-deriving the same
+ * AES key, and replaces only the wrapped password. The credential itself never
+ * changes, so the user is prompted for the same passkey they enrolled with —
+ * no new enrollment, no new credential on the authenticator.
+ *
+ * Failure policy — fail to REMOVED, never to stale. Any failure (declined
+ * prompt, lost PRF support, crypto error, refused storage write) removes the
+ * envelope via {@link removePasskeyUnlock}. A stale envelope is strictly worse
+ * than none: it can never unlock the vault again, yet looks exactly like an
+ * enrolled passkey to the unlock screen. Removing it degrades cleanly to the
+ * password path; the caller should surface a warning and offer re-enrollment,
+ * NOT report the password change itself as failed — the vault already answers
+ * to the new password at this point.
+ *
+ * @param newPassword - The NEW vault password, already persisted by the caller
+ *   through `changeVaultPassword`.
+ */
+export async function rewrapPasskeyUnlock(newPassword: string): Promise<PasskeyResult<void>> {
+  const record = getPasskeyUnlockEnvelope()
+  if (record === null) {
+    return { ok: false, error: "Passkey unlock is not set up on this device." }
+  }
+
+  const removalError =
+    "Passkey unlock was removed because it could not be re-wrapped — set it up again if you want it."
+
+  const credentials = getCredentialsContainer()
+  const credentialId = decodeBase64Min(record.credentialId, 16)
+  const salt = decodeBase64Exact(record.salt, PRF_SALT_BYTES)
+  if (!credentials || !credentialId || !salt) {
+    // An environment that cannot run the ceremony, or bytes the schema guard
+    // passed but the decoder rejects: either way the envelope can never be
+    // re-wrapped, and after a password change it can never unlock either.
+    removePasskeyUnlock()
+    return { ok: false, error: removalError }
+  }
+
+  let prfBytes: Uint8Array | null
+  try {
+    prfBytes = await evaluatePrf(credentials, credentialId, salt)
+  } catch (error) {
+    logger.warn("Passkey re-wrap ceremony failed; removing the stale envelope", { error })
+    removePasskeyUnlock()
+    return { ok: false, error: removalError }
+  }
+
+  if (prfBytes === null) {
+    logger.warn("Passkey re-wrap produced no PRF output; removing the stale envelope")
+    removePasskeyUnlock()
+    return { ok: false, error: removalError }
+  }
+
+  const wrapped = await wrapPasswordWithPrf(prfBytes, newPassword)
+  if (!wrapped.ok) {
+    logger.warn("Passkey re-wrap could not wrap the new password", { error: wrapped.error })
+    removePasskeyUnlock()
+    return { ok: false, error: removalError }
+  }
+
+  const next: PasskeyUnlockEnvelope = { ...record, envelope: wrapped.value }
+  const written = writeJson(STORAGE_KEYS.VAULT_PASSKEY, next)
+  if (!written.ok) {
+    // The old envelope is stale no matter what — the vault already answers to
+    // the new password — and the replacement could not be stored. Removing is
+    // the only honest state left.
+    logger.warn("Passkey re-wrap could not persist the new envelope", { error: written.error })
+    removePasskeyUnlock()
+    return { ok: false, error: removalError }
+  }
+
+  return { ok: true, value: undefined }
+}
