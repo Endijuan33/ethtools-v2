@@ -229,16 +229,18 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     type: "mainnet",
   },
 
-  /*
-   * Arc Mainnet is intentionally absent. Its only reachable endpoints today
-   * are authenticated or Infura-based (both forbidden here — this app uses
-   * public, keyless RPCs only), and Circle's own docs publish Arc mainnet
-   * endpoints "separately when available" — Arc is documented as
-   * testnet-only at the time of writing. Re-add it the moment a keyless
-   * public endpoint exists; every other part of the app (USDC as the native
-   * currency symbol, 18-decimal native unit, chain-id 5042) is already
-   * supported.
-   */
+  arc: {
+    name: "Arc Mainnet",
+    rpcUrls: [
+      "https://rpc.mainnet.arc.io",
+      "https://rpc.blockdaemon.mainnet.arc.io",
+      "https://rpc.drpc.mainnet.arc.io",
+      "https://rpc.quicknode.mainnet.arc.io",
+    ],
+    explorerUrl: "https://explorer.arc.io",
+    currency: "USDC",
+    type: "mainnet",
+  },
 
   mantle: {
     name: "Mantle Mainnet",
