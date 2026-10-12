@@ -13,6 +13,13 @@
  * is request-independent and stays in the config.
  */
 const securityHeaders = [
+  {
+    // App-level HSTS, equivalent to what the production platform adds at
+    // the edge, so the policy is a property of the app rather than of one
+    // hosting configuration. Two years, subdomains included, preload-ready.
+    key: "Strict-Transport-Security",
+    value: "max-age=63072000; includeSubDomains; preload",
+  },
   { key: "X-Content-Type-Options", value: "nosniff" },
   { key: "Referrer-Policy", value: "no-referrer" },
   {
@@ -26,6 +33,9 @@ const securityHeaders = [
 
 const nextConfig = {
   reactStrictMode: true,
+
+  // Do not advertise the framework in a response header.
+  poweredByHeader: false,
 
   images: {
     unoptimized: true,
