@@ -55,6 +55,14 @@ import {
 } from "@/lib/backup"
 import { assessPassword, isVaultSupported } from "@/lib/vault"
 import { clearAllAppData } from "@/lib/storage"
+import { backupHasSecrets, resealBackupSecrets } from "@/lib/vaultRestore"
+import { hasVault } from "@/lib/vaultStore"
+import { eraseWalletConnectData } from "@/lib/walletConnect"
+import {
+  broadcastVaultSessionEvent,
+  createSessionSourceId,
+  createVaultSessionEvent,
+} from "@/lib/vaultSession"
 import { truncateHex } from "@/lib/format"
 import {
   decryptKeystore,
@@ -64,7 +72,7 @@ import {
   MAX_KEYSTORE_BYTES,
   type RecoveredKeystoreAccount,
 } from "@/lib/keystore"
-import type { VaultAccount } from "@/lib/schema"
+import type { VaultAccount, VaultPayload } from "@/lib/schema"
 
 export interface BackupManagerProps {
   isOpen: boolean
@@ -94,6 +102,22 @@ export interface BackupManagerProps {
   reservedNetworkKeys?: readonly string[]
   /** Called after a successful restore so the host can reload its state. */
   onRestored?: (contents: BackupContents) => void
+  /**
+   * The live unlocked vault session, when the host has one. Lets a restore
+   * seal secrets with the current session password instead of asking again.
+   */
+  getVaultSession?: () => { payload: VaultPayload; password: string } | null
+  /**
+   * Called with the verified vault payload after a restore sealed secrets
+   * into it, so an unlocked host can adopt the restored accounts in memory.
+   */
+  onSecretsRestored?: (payload: VaultPayload) => void
+  /**
+   * Called after erase-all completes. Explicit (rather than inferred from an
+   * empty restore) so the host can reset its in-memory vault state: drop the
+   * decrypted payload and password and return to the setup stage.
+   */
+  onErased?: () => void
 }
 
 type Panel = "menu" | "export" | "qr" | "keystore-export" | "import" | "keystore-import" | "danger"
@@ -163,6 +187,9 @@ export default function BackupManager({
   onImportPrivateKey,
   reservedNetworkKeys = [],
   onRestored,
+  getVaultSession,
+  onSecretsRestored,
+  onErased,
 }: BackupManagerProps) {
   const [panel, setPanel] = useState<Panel>("menu")
   const [busy, setBusy] = useState(false)
@@ -181,6 +208,16 @@ export default function BackupManager({
   const [restoreMode, setRestoreMode] = useState<RestoreMode>("merge")
   const fileInputRef = useRef<HTMLInputElement | null>(null)
 
+  // Restore-secret sealing (RA-03): the vault credential a secret-carrying
+  // restore needs — a NEW vault password when no vault exists yet, or the
+  // EXISTING vault password when the vault is locked. Held only in memory,
+  // cleared on reset and after the restore.
+  const [vaultPassword, setVaultPassword] = useState("")
+  const [vaultConfirmPassword, setVaultConfirmPassword] = useState("")
+  const [erasing, setErasing] = useState(false)
+  // This tab's id for cross-tab session broadcasts (erase/lock sync).
+  const [sessionSourceId] = useState(createSessionSourceId)
+
   // Keystore (V3) exchange. `recovered` holds a decrypted private key between
   // the unlock step and the "add to vault" step; it lives in memory only, is
   // never rendered, and is cleared on add, on re-pick, and on close.
@@ -189,6 +226,20 @@ export default function BackupManager({
   const [keystorePassword, setKeystorePassword] = useState("")
   const [recovered, setRecovered] = useState<RecoveredKeystoreAccount | null>(null)
   const keystoreFileInputRef = useRef<HTMLInputElement | null>(null)
+
+  // What a pending secret-carrying restore needs before it may run.
+  const restoreHasSecrets = pendingRestore ? backupHasSecrets(pendingRestore.contents) : false
+  const vaultSession = getVaultSession?.() ?? null
+  const vaultExistsNow = hasVault()
+  const needsNewVaultPassword = restoreHasSecrets && !vaultExistsNow
+  const needsExistingVaultPassword = restoreHasSecrets && vaultExistsNow && vaultSession === null
+  const vaultPasswordStrength = assessPassword(vaultPassword)
+  const secretsReady =
+    !restoreHasSecrets ||
+    vaultSession !== null ||
+    (needsNewVaultPassword
+      ? vaultPasswordStrength.acceptable && vaultPassword === vaultConfirmPassword
+      : vaultPassword.length > 0)
 
   const secrets = getSecrets?.() ?? null
   const hasSecrets =
@@ -234,6 +285,9 @@ export default function BackupManager({
     setImportPassword("")
     setSelectedFile(null)
     setPendingRestore(null)
+    setVaultPassword("")
+    setVaultConfirmPassword("")
+    setErasing(false)
     setKeystoreFile(null)
     setKeystoreText("")
     setKeystorePassword("")
@@ -413,23 +467,65 @@ export default function BackupManager({
     }
   }, [importPassword, reservedNetworkKeys, selectedFile])
 
-  const handleConfirmRestore = useCallback(() => {
+  const handleConfirmRestore = useCallback(async () => {
     if (!pendingRestore) return
     setError("")
+    const contents = pendingRestore.contents
 
-    const result = applyNonSecretRestore(pendingRestore.contents, restoreMode)
+    // Secrets first (RA-03): seal the accounts/phrase into the encrypted
+    // vault and verify the write BEFORE any success is reported. If sealing
+    // fails, the whole restore stops — a partial "success" here would tell
+    // the user their keys are back when they are not.
+    let sealedPayload: VaultPayload | null = null
+    if (backupHasSecrets(contents)) {
+      const session = getVaultSession?.() ?? null
+      const credential = session?.password ?? vaultPassword
+      if (credential === "") {
+        setError(
+          hasVault()
+            ? "Enter your vault password so the restored accounts can be sealed into the vault."
+            : "Create a vault password so the restored accounts can be sealed into a new vault."
+        )
+        return
+      }
+      setBusy(true)
+      const sealed = await resealBackupSecrets(contents, restoreMode, credential, session)
+      setBusy(false)
+      if (!sealed.ok) {
+        setError(sealed.error)
+        return
+      }
+      sealedPayload = sealed.value.payload
+    }
+
+    const result = applyNonSecretRestore(contents, restoreMode)
     if (!result.ok) {
-      setError(result.error)
+      if (sealedPayload) {
+        onSecretsRestored?.(sealedPayload)
+        setError(
+          `The accounts were sealed into your vault, but the remaining data could not be restored: ${result.error}`
+        )
+      } else {
+        setError(result.error)
+      }
       return
     }
 
-    onRestored?.(pendingRestore.contents)
-    notify.success("Backup restored")
+    if (sealedPayload) onSecretsRestored?.(sealedPayload)
+    onRestored?.(contents)
+    notify.success(
+      "Backup restored",
+      sealedPayload
+        ? "Accounts and any recovery phrase were sealed into your encrypted vault and verified."
+        : undefined
+    )
     setPendingRestore(null)
     setSelectedFile(null)
     setImportPassword("")
+    setVaultPassword("")
+    setVaultConfirmPassword("")
     setPanel("menu")
-  }, [onRestored, pendingRestore, restoreMode])
+  }, [getVaultSession, onRestored, onSecretsRestored, pendingRestore, restoreMode, vaultPassword])
 
   /** Accept a keystore file, bounding its size before it is ever read. */
   const handleKeystoreFileChosen = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
@@ -512,22 +608,30 @@ export default function BackupManager({
     const confirmed = await confirmAction({
       message: "Erase all data from this device?",
       description:
-        "This removes your encrypted vault, accounts, bookmarks, networks, tokens, and history. Without a backup, funds in these accounts cannot be recovered.",
+        "This removes your encrypted vault, accounts, bookmarks, networks, tokens, history, and WalletConnect sessions. Without a backup, funds in these accounts cannot be recovered.",
       confirmLabel: "Erase everything",
     })
     if (!confirmed) return
 
+    setErasing(true)
+    // Tell every other tab first (RA-06): they must drop their in-memory
+    // vault copies, or a surviving tab could re-seal what was just erased.
+    broadcastVaultSessionEvent(createVaultSessionEvent("erase", sessionSourceId, Date.now()))
+    // WalletConnect keeps its own storage outside the app registry (RA-04).
+    const walletConnect = await eraseWalletConnectData()
     clearAllAppData()
-    notify.success("All data erased")
+    setErasing(false)
+
+    if (walletConnect.ok) {
+      notify.success("All data erased")
+    } else {
+      notify.warning("Data erased, with one exception", walletConnect.error)
+    }
     setPanel("menu")
-    onRestored?.({
-      activeAccountId: null,
-      bookmarks: [],
-      transactions: [],
-      customNetworks: {},
-      tokens: [],
-    })
-  }, [onRestored])
+    // Explicit erase signal (RA-01): the host resets its in-memory vault
+    // (payload, password, stage) instead of guessing from restored contents.
+    onErased?.()
+  }, [onErased, sessionSourceId])
 
   // ===== Shared fragments =====
 
@@ -838,6 +942,8 @@ export default function BackupManager({
                 {restoreMode === "replace"
                   ? "Replace mode permanently overwrites your current bookmarks, networks, tokens, and history."
                   : "Merge mode keeps your existing data and adds anything new. Existing entries win on conflict."}
+                {restoreHasSecrets &&
+                  " The accounts and recovery phrase below are sealed into your encrypted vault — never stored in plain text — and the write is verified before this restore reports success."}
               </Alert>
 
               <Card variant="inset" padding="sm">
@@ -905,13 +1011,112 @@ export default function BackupManager({
                 ))}
               </fieldset>
 
+              {restoreHasSecrets && (
+                <Card variant="inset" padding="sm" className="space-y-3">
+                  <p className="text-sm font-medium text-foreground">
+                    Seal the secrets into your vault
+                  </p>
+                  {vaultSession !== null ? (
+                    <p className="text-sm leading-relaxed text-muted-foreground">
+                      Your vault is unlocked, so the restored accounts and recovery phrase are
+                      sealed with your current vault password.
+                    </p>
+                  ) : needsNewVaultPassword ? (
+                    <>
+                      <p className="text-sm leading-relaxed text-muted-foreground">
+                        No vault exists on this device yet. Choose the password for the new
+                        vault that will hold the restored accounts.
+                      </p>
+                      <Field
+                        label="New vault password"
+                        required
+                        error={
+                          vaultPassword !== "" && !vaultPasswordStrength.acceptable
+                            ? vaultPasswordStrength.issues[0]
+                            : undefined
+                        }
+                        action={
+                          vaultPassword !== "" ? (
+                            <Badge tone={vaultPasswordStrength.acceptable ? "success" : "warning"}>
+                              {vaultPasswordStrength.label}
+                            </Badge>
+                          ) : undefined
+                        }
+                      >
+                        {(props) => (
+                          <input
+                            {...props}
+                            {...secretInputProps}
+                            type="password"
+                            value={vaultPassword}
+                            onChange={(event) => setVaultPassword(event.target.value)}
+                            className={inputClassName}
+                          />
+                        )}
+                      </Field>
+                      <Field
+                        label="Confirm vault password"
+                        required
+                        error={
+                          vaultConfirmPassword !== "" && vaultPassword !== vaultConfirmPassword
+                            ? "Passwords do not match."
+                            : undefined
+                        }
+                      >
+                        {(props) => (
+                          <input
+                            {...props}
+                            {...secretInputProps}
+                            type="password"
+                            value={vaultConfirmPassword}
+                            onChange={(event) => setVaultConfirmPassword(event.target.value)}
+                            className={inputClassName}
+                          />
+                        )}
+                      </Field>
+                    </>
+                  ) : (
+                    <>
+                      <p className="text-sm leading-relaxed text-muted-foreground">
+                        Your vault is locked. Enter its password so the restored accounts can be
+                        sealed into it; the password is verified against the vault before
+                        anything is written.
+                      </p>
+                      <Field label="Vault password" required>
+                        {(props) => (
+                          <input
+                            {...props}
+                            {...secretInputProps}
+                            type="password"
+                            value={vaultPassword}
+                            onChange={(event) => setVaultPassword(event.target.value)}
+                            className={inputClassName}
+                          />
+                        )}
+                      </Field>
+                    </>
+                  )}
+                </Card>
+              )}
+
               <div className="flex gap-3">
-                <Button variant="secondary" onClick={() => setPendingRestore(null)} fullWidth>
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setPendingRestore(null)
+                    setVaultPassword("")
+                    setVaultConfirmPassword("")
+                  }}
+                  fullWidth
+                >
                   Cancel
                 </Button>
                 <Button
                   variant={restoreMode === "replace" ? "danger" : "primary"}
                   onClick={handleConfirmRestore}
+                  isLoading={busy}
+                  loadingLabel="Restoring…"
+                  disabled={!secretsReady}
                   fullWidth
                 >
                   {restoreMode === "replace" ? "Overwrite" : "Restore"}
@@ -1101,14 +1306,16 @@ export default function BackupManager({
         <div className="space-y-4">
           <Alert tone="danger" title="This cannot be undone.">
             Erasing removes your encrypted vault, accounts, bookmarks, custom networks, tracked
-            tokens, and transaction history from this device. If you have no backup, any funds in
-            these accounts become permanently inaccessible.
+            tokens, transaction history, and WalletConnect sessions from this device. If you have
+            no backup, any funds in these accounts become permanently inaccessible.
           </Alert>
 
           <Button
             variant="danger"
             fullWidth
             onClick={handleErase}
+            isLoading={erasing}
+            loadingLabel="Erasing…"
             icon={<ShieldAlert className="h-4 w-4" aria-hidden="true" />}
           >
             Erase everything
