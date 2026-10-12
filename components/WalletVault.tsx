@@ -435,10 +435,17 @@ export default function WalletVault() {
     if (legacyCount > 0) {
       const migrated = await migrateLegacyWallets(newPassword, created.value)
       if (migrated.ok) {
-        setLegacyCount(0)
-        setNotice(
-          `Secured ${migrated.value.migrated} wallet(s) that were previously stored unencrypted.`
-        )
+        setLegacyCount(migrated.value.skipped)
+        if (migrated.value.migrated > 0) {
+          setNotice(
+            `Secured ${migrated.value.migrated} wallet(s) that were previously stored unencrypted.`
+          )
+        }
+        if (migrated.value.skipped > 0) {
+          setError(
+            `${migrated.value.skipped} older wallet record(s) could not be migrated because their key data is not usable. They were left untouched so nothing is lost; remove or repair them from the Balances panel.`
+          )
+        }
       }
     }
 
@@ -492,16 +499,23 @@ export default function WalletVault() {
     async (candidate: string, opened: VaultPayload): Promise<void> => {
       if (legacyCount > 0) {
         const migrated = await migrateLegacyWallets(candidate, opened)
-        if (migrated.ok && migrated.value.migrated > 0) {
-          setLegacyCount(0)
-          setNotice(
-            `Secured ${migrated.value.migrated} wallet(s) that were previously stored unencrypted.`
-          )
-          const refreshed = await unlockVault(candidate)
-          if (refreshed.ok) {
-            setPayload(refreshed.value)
-            setStage("unlocked")
-            return
+        if (migrated.ok) {
+          setLegacyCount(migrated.value.skipped)
+          if (migrated.value.skipped > 0) {
+            setError(
+              `${migrated.value.skipped} older wallet record(s) could not be migrated because their key data is not usable. They were left untouched so nothing is lost.`
+            )
+          }
+          if (migrated.value.migrated > 0) {
+            setNotice(
+              `Secured ${migrated.value.migrated} wallet(s) that were previously stored unencrypted.`
+            )
+            const refreshed = await unlockVault(candidate)
+            if (refreshed.ok) {
+              setPayload(refreshed.value)
+              setStage("unlocked")
+              return
+            }
           }
         }
       }
