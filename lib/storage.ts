@@ -15,6 +15,14 @@ export const STORAGE_KEYS = {
   VAULT: "ethtools_vault",
   /** Legacy cleartext wallet array, read only for one-time migration. */
   LEGACY_WALLETS: "ethtools_wallets",
+  /**
+   * Address-only watch entries added from the Balances panel.
+   *
+   * Deliberately a separate key from {@link LEGACY_WALLETS}: records here hold
+   * an address and a label and nothing else, so persisting them can never
+   * persist a secret. Secret-bearing imports belong in the encrypted vault.
+   */
+  WATCH_ADDRESSES: "ethtools_watch_addresses",
   ACTIVE_WALLET: "ethtools_active_wallet",
   /**
    * Vault idle auto-lock timeout in minutes. A validated preference, never a
