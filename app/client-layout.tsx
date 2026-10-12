@@ -11,6 +11,7 @@
 
 import { useCallback, useEffect, useState } from "react"
 import { logger } from "@/lib/logger"
+import { postMiniAppClose } from "@/lib/frameEmbed"
 
 /**
  * The Mini App SDK's own type, derived from the module rather than declared by
@@ -130,15 +131,17 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
     }
 
     // Fallback for a host that embeds the app without injecting the SDK.
-    // Gated on the detected Mini App context: outside an embed there is no
-    // host listening, and broadcasting window messages from a top-level page
-    // would be needless surface. Inside the embed the target origin stays
-    // "*" — a documented, deliberate exception: a sandboxed frame has an
-    // opaque origin that no explicit target matches, the payload is a
-    // constant non-sensitive close signal, and the button that reaches this
-    // code only renders after `detectMiniApp()` confirmed an embed.
+    // Gated on the detected Mini App context: outside an embed there is
+    // no host listening, and posting window messages from a top-level
+    // page would be needless surface. Inside the embed, the close signal
+    // is posted to the parent frame once per known host origin — never
+    // to "*" (RA-12). A wildcard self-post both exposed the signal to
+    // any script in the page and never reached a cross-origin parent at
+    // all; origin-targeted posts are delivered by the browser to exactly
+    // the host whose origin matches. See `postMiniAppClose` in
+    // `lib/frameEmbed.ts`.
     if (!isMiniApp) return
-    window.postMessage({ type: "farcaster:close" }, "*")
+    postMiniAppClose(window)
   }, [isMiniApp])
 
   return (
