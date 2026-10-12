@@ -17,7 +17,7 @@
  * - **Watch-only accounts see everything except the revoke button**, with the
  *   honest reason: revoking requires a signature, and a signature requires the
  *   private key a watch-only account does not have.
- * - **Revoking mirrors SendForm's ceremony exactly** — confirm dialog, gas
+ * - **Revoking mirrors the send ceremony exactly** — confirm dialog, gas
  *   estimate (a revert aborts before any fee is spent), local signing,
  *   broadcast exactly once, history record, real receipt status — because a
  *   revoke is a transaction with exactly the same failure modes as a send.
