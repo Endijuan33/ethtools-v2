@@ -14,6 +14,7 @@
  * that is always shouting gets tuned out, which is exactly when it stops working.
  */
 
+import Link from "next/link"
 import { Lock } from "lucide-react"
 import Badge from "./ui/Badge"
 import BrandMark from "./BrandMark"
@@ -31,7 +32,7 @@ export default function AppHeader({ actions, isLocked }: AppHeaderProps) {
     <header className="sticky top-0 z-40 border-b border-border/60 surface-glass">
       <div className="mx-auto flex h-16 w-full max-w-6xl items-center gap-3 px-4 sm:px-6">
         {/* Identity */}
-        <a
+        <Link
           href="/"
           className="flex min-w-0 items-center gap-2.5 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
@@ -44,7 +45,7 @@ export default function AppHeader({ actions, isLocked }: AppHeaderProps) {
               Ethereum wallet utility
             </span>
           </span>
-        </a>
+        </Link>
 
         <div className="ml-auto flex items-center gap-2">
           {/* Quiet, always-present statement of the security model. */}
