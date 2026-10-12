@@ -86,29 +86,37 @@ export function getNativeDecimals(network: Network): number {
 
 
 /**
- * The shared Infura project id used by the built-in network table.
+ * Optional Infura project id, supplied ONLY through the environment.
  *
- * A project id is a PUBLIC client identifier — it names this app to
- * Infura, appears in every RPC request URL, and is visible to anyone who
- * opens devtools. It is not a secret, and shipping it as a fallback
- * constant is safe for the same reason the WalletConnect project id is.
- * Forks and other deployments can substitute their own project with
- * `NEXT_PUBLIC_INFURA_PROJECT_ID` without touching the network table; the
- * RPC order (which drives failover priority) never changes.
+ * Earlier versions embedded a shared project id in the source as a
+ * fallback (RA-13). A project id is a public client identifier rather
+ * than a secret, but a shared one cannot be rotated without a release,
+ * and anyone scraping it can spend the project's quota from any origin
+ * unless the account holder restricts it in the Infura dashboard. It is
+ * therefore no longer embedded at all:
  *
- * Residual that cannot be fixed from this repository: the project owner
- * should restrict the id to this app's domains in the Infura dashboard
- * (Settings > Security > Domain allowlist), so a scraped copy of the id
- * cannot spend the project's quota from other origins.
+ * - `NEXT_PUBLIC_INFURA_PROJECT_ID` unset (the default): the built-in
+ *   network table contains no Infura endpoints. Every network keeps at
+ *   least two public, no-key endpoints (the chains' own RPCs,
+ *   PublicNode, Ankr, BlastAPI, Forno), so nothing depends on a key.
+ * - Set: an Infura endpoint built from that id joins the list of each
+ *   Infura-supported network, in the final position it occupied before,
+ *   so failover priority among the public endpoints never changes.
  */
-export const FALLBACK_INFURA_PROJECT_ID = "9aa3d95b3bc440fa88ea12eaa4456161"
-
-const infuraProjectId =
-  process.env.NEXT_PUBLIC_INFURA_PROJECT_ID || FALLBACK_INFURA_PROJECT_ID
+const infuraProjectId = process.env.NEXT_PUBLIC_INFURA_PROJECT_ID || ""
 
 /** An Infura RPC endpoint for a chain host, using the configured project. */
 function infuraRpc(host: string): string {
   return `https://${host}.infura.io/v3/${infuraProjectId}`
+}
+
+/**
+ * The Infura endpoint for a host as list entries: one entry when a
+ * project id is configured, none when it is not. Spread into the
+ * network table so the configured/unconfigured shapes stay in one place.
+ */
+function infuraEntry(host: string): string[] {
+  return infuraProjectId ? [infuraRpc(host)] : []
 }
 
 // ===== Built-in Networks with Multiple RPCs =====
@@ -121,7 +129,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
       "https://eth-mainnet.public.blastapi.io",
       "https://rpc.ankr.com/eth",
       "https://cloudflare-eth.com",
-      infuraRpc("mainnet"),
+      ...infuraEntry("mainnet"),
     ],
     explorerUrl: "https://etherscan.io",
     currency: "ETH",
@@ -133,7 +141,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     rpcUrls: [
       "https://mainnet.optimism.io",
       "https://rpc.ankr.com/optimism",
-      infuraRpc("optimism-mainnet"),
+      ...infuraEntry("optimism-mainnet"),
     ],
     explorerUrl: "https://optimistic.etherscan.io",
     currency: "ETH",
@@ -145,7 +153,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     rpcUrls: [
       "https://arb1.arbitrum.io/rpc",
       "https://rpc.ankr.com/arbitrum",
-      infuraRpc("arbitrum-mainnet"),
+      ...infuraEntry("arbitrum-mainnet"),
     ],
     explorerUrl: "https://arbiscan.io",
     currency: "ETH",
@@ -193,7 +201,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     rpcUrls: [
       "https://api.avax.network/ext/bc/C/rpc",
       "https://rpc.ankr.com/avalanche",
-      infuraRpc("avalanche-mainnet"),
+      ...infuraEntry("avalanche-mainnet"),
     ],
     explorerUrl: "https://snowtrace.io",
     currency: "AVAX",
@@ -215,8 +223,9 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
   celo: {
     name: "Celo Mainnet",
     rpcUrls: [
+      "https://forno.celo.org",
       "https://rpc.ankr.com/celo",
-      infuraRpc("celo-mainnet"),
+      ...infuraEntry("celo-mainnet"),
     ],
     explorerUrl: "https://celoscan.io",
     currency: "CELO",

@@ -57,8 +57,9 @@ export default function PrivacyDisclosure({
         <Section title="Blockchain RPC endpoints">
           <p>
             Balances, gas prices, ENS lookups, token detection, and broadcasting use public RPC
-            endpoints — including Infura, PublicNode, Ankr, BlastAPI, and the chains&apos; own
-            public RPCs — plus any custom RPC you add yourself. The endpoint you query receives
+            endpoints — including PublicNode, Ankr, BlastAPI, and the chains&apos; own public
+            RPCs, plus Infura when this deployment is configured with its own project id — and
+            any custom RPC you add yourself. The endpoint you query receives
             the addresses and transactions involved in that request.
           </p>
           <p>

@@ -68,6 +68,56 @@ export function buildMiniAppEmbed(origin: string): string {
   })
 }
 
+/**
+ * Origins of the hosts that may embed this app as a Farcaster Mini App.
+ *
+ * These are the apex origins behind the `frame-ancestors` allowlist in
+ * `lib/csp.ts`. `postMessage` target origins cannot express subdomain
+ * wildcards, so the deliverable set is the apex origins themselves —
+ * which are where the known hosts serve their embeds from.
+ */
+export const FARCASTER_HOST_ORIGINS: readonly string[] = [
+  "https://warpcast.com",
+  "https://farcaster.xyz",
+  "https://base.org",
+]
+
+/** The close signal sent to the host when the Mini App SDK is unavailable. */
+export const MINIAPP_CLOSE_MESSAGE = { type: "farcaster:close" } as const
+
+/** Structural minimum of a window, for posting to its parent frame. */
+export interface MiniAppHostWindow {
+  parent: {
+    postMessage: (message: unknown, targetOrigin: string) => void
+  }
+}
+
+/**
+ * Ask the embedding host to close the Mini App, without the SDK.
+ *
+ * The pre-fix fallback posted the signal to the app's OWN window with a
+ * `"*"` target: any script running in the page could observe it, and a
+ * cross-origin host parent — the only listener that can act on it —
+ * never received it at all, because a frame cannot hear messages posted
+ * to itself. This posts to `window.parent` once per known host origin
+ * instead. `postMessage` delivery is origin-matched by the browser, so
+ * exactly the real host receives the signal and every other attempt is
+ * silently dropped; there is no wildcard in the sequence. When the app
+ * is not embedded, `parent` is the window itself and the foreign
+ * targets are dropped the same way, making the call a safe no-op.
+ *
+ * @param win - The window to post from (its `parent` is the addressee).
+ * @returns How many targeted posts were made (one per known host).
+ */
+export function postMiniAppClose(win: MiniAppHostWindow): number {
+  let posted = 0
+  for (const origin of FARCASTER_HOST_ORIGINS) {
+    win.parent.postMessage({ ...MINIAPP_CLOSE_MESSAGE }, origin)
+    posted++
+  }
+  return posted
+}
+
 /** The complete frame HTML document for a site origin. */
 export function buildFrameHtml(origin: string): string {
   const miniappEmbed = buildMiniAppEmbed(origin)

@@ -5,9 +5,12 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import {
+  FARCASTER_HOST_ORIGINS,
+  MINIAPP_CLOSE_MESSAGE,
   PRODUCTION_SITE_ORIGIN,
   buildFrameHtml,
   buildMiniAppEmbed,
+  postMiniAppClose,
   resolveSiteOrigin,
 } from "../frameEmbed"
 
@@ -49,4 +52,64 @@ test("the embed and HTML use the resolved origin everywhere", () => {
   const html = buildFrameHtml(origin)
   assert.ok(html.includes(`content="${origin}/apple-icon.png"`))
   assert.equal(html.includes("ethtools.vercel.app"), false, "no hardcoded production origin remains")
+})
+
+// ===== RA-12: targeted close signal, no wildcard =====
+
+test("host origins are explicit https origins with no wildcard anywhere", () => {
+  assert.ok(FARCASTER_HOST_ORIGINS.length >= 3)
+  for (const origin of FARCASTER_HOST_ORIGINS) {
+    assert.equal(origin.includes("*"), false, `wildcard in ${origin}`)
+    const url = new URL(origin)
+    assert.equal(url.protocol, "https:")
+    assert.equal(url.origin, origin, "entries are bare origins")
+  }
+  // The deliverable set covers the hosts the CSP frame-ancestors names.
+  assert.ok(FARCASTER_HOST_ORIGINS.includes("https://warpcast.com"))
+  assert.ok(FARCASTER_HOST_ORIGINS.includes("https://farcaster.xyz"))
+  assert.ok(FARCASTER_HOST_ORIGINS.includes("https://base.org"))
+})
+
+test("postMiniAppClose posts the close signal to the parent once per host origin", () => {
+  const calls: Array<{ message: unknown; targetOrigin: string }> = []
+  const fakeWindow = {
+    parent: {
+      postMessage: (message: unknown, targetOrigin: string) => {
+        calls.push({ message, targetOrigin })
+      },
+    },
+  }
+
+  const posted = postMiniAppClose(fakeWindow)
+
+  assert.equal(posted, FARCASTER_HOST_ORIGINS.length)
+  assert.deepEqual(
+    calls.map((c) => c.targetOrigin),
+    [...FARCASTER_HOST_ORIGINS]
+  )
+  assert.ok(calls.every((c) => c.targetOrigin !== "*"), "no wildcard target is ever used")
+  for (const call of calls) {
+    assert.deepEqual(call.message, { ...MINIAPP_CLOSE_MESSAGE })
+    assert.deepEqual(call.message, { type: "farcaster:close" })
+  }
+})
+
+test("postMiniAppClose addresses the parent, never the window itself", () => {
+  let selfCalled = false
+  const parentCalls: string[] = []
+  const fakeWindow = {
+    postMessage: () => {
+      selfCalled = true
+    },
+    parent: {
+      postMessage: (_message: unknown, targetOrigin: string) => {
+        parentCalls.push(targetOrigin)
+      },
+    },
+  }
+
+  postMiniAppClose(fakeWindow)
+
+  assert.equal(selfCalled, false)
+  assert.equal(parentCalls.length, FARCASTER_HOST_ORIGINS.length)
 })
