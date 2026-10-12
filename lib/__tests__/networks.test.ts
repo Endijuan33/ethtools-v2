@@ -29,29 +29,51 @@ test("every built-in network keeps at least two public HTTPS endpoints", () => {
   }
 })
 
+test("no built-in network uses a key-gated or call-limited endpoint", () => {
+  // Endpoint hygiene (2026-10-13): Ankr's public hosts now reject keyless
+  // requests ("Unauthorized: You must authenticate your request with an
+  // API key"), cloudflare-eth.com answers chain reads but fails eth_call
+  // (it broke ENS resolution in production), and BlastAPI's Fantom host
+  // is shut down. None of them may re-enter the built-in table.
+  for (const [key, network] of Object.entries(NETWORKS)) {
+    for (const url of network.rpcUrls) {
+      assert.equal(url.includes("ankr.com"), false, `${key} uses key-gated Ankr endpoint: ${url}`)
+      assert.equal(
+        url.includes("cloudflare-eth.com"),
+        false,
+        `${key} uses call-limited Cloudflare endpoint: ${url}`
+      )
+    }
+  }
+})
+
 test("the formerly Infura-backed networks keep their public endpoints, in order", () => {
   assert.deepEqual(NETWORKS.mainnet.rpcUrls.slice(0, 3), [
+    "https://ethereum-rpc.publicnode.com",
     "https://eth-mainnet.public.blastapi.io",
-    "https://rpc.ankr.com/eth",
-    "https://cloudflare-eth.com",
+    "https://eth.drpc.org",
   ])
-  assert.deepEqual(NETWORKS.optimism.rpcUrls.slice(0, 2), [
+  assert.deepEqual(NETWORKS.optimism.rpcUrls.slice(0, 3), [
     "https://mainnet.optimism.io",
-    "https://rpc.ankr.com/optimism",
+    "https://optimism-rpc.publicnode.com",
+    "https://optimism.drpc.org",
   ])
-  assert.deepEqual(NETWORKS.arbitrum.rpcUrls.slice(0, 2), [
+  assert.deepEqual(NETWORKS.arbitrum.rpcUrls.slice(0, 3), [
     "https://arb1.arbitrum.io/rpc",
-    "https://rpc.ankr.com/arbitrum",
+    "https://arbitrum-one-rpc.publicnode.com",
+    "https://arbitrum.drpc.org",
   ])
-  assert.deepEqual(NETWORKS.avalanche.rpcUrls.slice(0, 2), [
+  assert.deepEqual(NETWORKS.avalanche.rpcUrls.slice(0, 3), [
     "https://api.avax.network/ext/bc/C/rpc",
-    "https://rpc.ankr.com/avalanche",
+    "https://avalanche-c-chain-rpc.publicnode.com",
+    "https://avalanche.drpc.org",
   ])
-  // Celo had only Ankr + Infura before; Forno (the chain's official
-  // public RPC) is the second always-on endpoint now.
-  assert.deepEqual(NETWORKS.celo.rpcUrls.slice(0, 2), [
+  // Celo had only Ankr + Infura before RA-13; Forno (the chain's official
+  // public RPC) plus PublicNode and dRPC keep it at three public endpoints.
+  assert.deepEqual(NETWORKS.celo.rpcUrls.slice(0, 3), [
     "https://forno.celo.org",
-    "https://rpc.ankr.com/celo",
+    "https://celo-rpc.publicnode.com",
+    "https://celo.drpc.org",
   ])
-  assert.equal(NETWORKS.celo.rpcUrls.length, 2)
+  assert.equal(NETWORKS.celo.rpcUrls.length, 3)
 })
