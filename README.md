@@ -83,7 +83,7 @@ All variables are optional and all are `NEXT_PUBLIC_*`, meaning they are **inlin
 | `NEXT_PUBLIC_ROUTESCAN_TESTNET_URL` | Testnet explorer | `https://testnet.routescan.io` |
 | `NEXT_PUBLIC_SITE_URL` | Canonical origin for metadata | Vercel host, else production URL |
 | `NEXT_PUBLIC_WALLETCONNECT_PROJECT_ID` | Reown (WalletConnect) project id — a public identifier, not a secret | Project owner's id |
-| `NEXT_PUBLIC_INFURA_PROJECT_ID` | Infura project id for built-in RPC lists — a public identifier, not a secret | Project owner's id |
+| `NEXT_PUBLIC_INFURA_PROJECT_ID` | Optional Infura project id for built-in RPC lists — a public identifier, not a secret | Unset — public no-key endpoints only |
 | `PNPM_APPROVE_BUILD` | Lets pnpm run dependency build scripts on Vercel | — |
 
 The `_URL` suffix matters. An earlier version of this file documented the names without it, so the values silently never applied.
@@ -101,11 +101,12 @@ The `_URL` suffix matters. An earlier version of this file documented the names 
 | `pnpm audit:osv` | Scan every lockfile package against OSV; fails on unignored advisories |
 | `pnpm typecheck` | `tsc --noEmit` across the app |
 | `pnpm test` | Compile `lib/` to CommonJS and run the unit suite |
-| `pnpm verify` | typecheck + lint + test |
+| `pnpm test:components` | Vitest suite: components (jsdom), middleware, and the frame route |
+| `pnpm verify` | typecheck + lint + test + test:components |
 
 ### Tests
 
-716 unit tests across 43 files cover the logic layer — the pure `lib/` modules directly, plus source-structure regression guards for critical component wiring (erase/restore/sweep/session sync), which is the layer the current harness can reach; there is no DOM component-test layer yet. They compile `lib/` to CommonJS in `.test-build/` and run on the Node built-in test runner, so no test framework is installed. Largest suites:
+747 tests across 52 files, in two harnesses that both run under `pnpm verify`. The unit suite — 722 tests across 44 files — covers the logic layer: the pure `lib/` modules directly, plus source-structure regression guards for critical component wiring (erase/restore/sweep/session sync). It compiles `lib/` to CommonJS in `.test-build/` and runs on the Node built-in test runner. The component suite — 25 tests across 8 files, Vitest + Testing Library in jsdom — covers what the unit harness cannot: the vault lifecycle in the real `WalletVault`/`BackupManager` components (create → lock → unlock, erase-while-unlocked, restore resealing), the sweep plan binding in `SweepCard`, pasted-key clearing in the standalone signers, the Farcaster close fallback, the middleware's per-request CSP, the frame route, and the network table with and without a configured Infura id. Largest unit suites:
 
 | Module | Tests | Focus |
 |---|---:|---|
@@ -206,7 +207,7 @@ Keys, phrases, and passwords never leave the browser - but **addresses and queri
 
 Those services can correlate an address with a visitor's IP address and the time of the request. That is inherent to a client-side tool with public infrastructure; use a VPN or your own RPC endpoints if that correlation matters to you. The same disclosure is available in the app itself (footer → **Privacy**), including the honest limitation that there is no mode that routes every request exclusively through an RPC you control.
 
-The app also ships shared **public** project identifiers (an Infura project id and a Reown/WalletConnect project id). They name the app to those services and appear in request URLs; they are not credentials. The project owner should restrict the Infura id to this app's domains in the Infura dashboard — that allowlist lives in the Infura account and cannot be set from this repository. Explorer pages are only opened when you tap a link or start a scan, never in the background.
+The app ships one shared **public** project identifier (a Reown/WalletConnect project id). It names the app to that service and appears in request URLs; it is not a credential. No Infura project id is embedded: Infura endpoints join the built-in RPC lists only when a deployment sets `NEXT_PUBLIC_INFURA_PROJECT_ID` to its own project id (and whoever does should restrict that id to their domains in the Infura dashboard — the allowlist lives in the Infura account and cannot be set from this repository). Explorer pages are only opened when you tap a link or start a scan, never in the background.
 
 ### What is not protected — read this
 
