@@ -1,4 +1,5 @@
 import type { Metadata, Viewport } from "next"
+import { headers } from "next/headers"
 import { Inter } from "next/font/google"
 import "./globals.css"
 import ClientLayout from "./client-layout"
@@ -78,13 +79,20 @@ export const metadata: Metadata = {
   },
 }
 
-export default function RootLayout({ children }: { children: React.ReactNode }) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
+  // The CSP nonce minted by middleware. next-themes renders an inline
+  // bootstrap script (it sets the theme class before first paint); under the
+  // nonce-based `script-src` that script only runs if it carries the same
+  // nonce, so it is threaded through here. Reading headers also opts this
+  // layout into dynamic rendering, which the per-request nonce requires.
+  const nonce = (await headers()).get("x-nonce") ?? undefined
+
   return (
     // suppressHydrationWarning is required by next-themes: it sets the theme class
     // on <html> before React hydrates, which is an intentional mismatch.
     <html lang="en" suppressHydrationWarning className={inter.variable}>
       <body className={inter.className}>
-        <ThemeProvider>
+        <ThemeProvider nonce={nonce}>
           <ClientLayout>{children}</ClientLayout>
           <Toaster />
         </ThemeProvider>
