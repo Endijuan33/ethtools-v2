@@ -138,22 +138,26 @@ function parseQuantity(value: unknown): bigint | null {
 }
 
 /**
- * Valid base fees from a fee history, oldest first.
+ * The next block's base fee from a fee history.
  *
  * The RPC array is one entry longer than the block range: the final entry is
  * the node's prediction for the *next* block, which is the right base fee to
- * combine with reward percentiles for a transaction submitted now. Entries may
- * be `null` when the range straddles the London fork, so each is parsed
- * individually and unusable ones dropped.
+ * combine with reward percentiles for a transaction submitted now.
+ *
+ * Only the raw LAST entry is authoritative. An earlier revision filtered out
+ * unusable entries and then took the last surviving one, which silently
+ * substituted an older block's base fee whenever the final entry was `null`
+ * or malformed (the range straddling the London fork can produce those). The
+ * estimate then looked precise while being stale. Now an unusable final
+ * entry yields null, and the caller falls back explicitly to legacy
+ * `eth_gasPrice` pricing instead of inventing a base fee.
  *
  * @param baseFeePerGas - The `baseFeePerGas` field of an `eth_feeHistory` result.
- * @returns Parsed base fees in order; empty when nothing is usable.
+ * @returns The parsed final entry, or null when it is missing or unusable.
  */
-function validBaseFees(baseFeePerGas: unknown): bigint[] {
-  if (!Array.isArray(baseFeePerGas)) return []
-  return baseFeePerGas
-    .map((entry) => parseQuantity(entry))
-    .filter((entry): entry is bigint => entry !== null)
+export function nextBlockBaseFee(baseFeePerGas: unknown): bigint | null {
+  if (!Array.isArray(baseFeePerGas) || baseFeePerGas.length === 0) return null
+  return parseQuantity(baseFeePerGas[baseFeePerGas.length - 1])
 }
 
 /**
@@ -243,11 +247,10 @@ export function estimateGasLevels(
       ? (feeHistory as { baseFeePerGas?: unknown; reward?: unknown })
       : {}
 
-  const baseFees = validBaseFees(history.baseFeePerGas)
+  const latestBaseFee = nextBlockBaseFee(history.baseFeePerGas)
   const medians = rewardColumns(history.reward).map((column) => medianOf(column))
 
-  if (baseFees.length > 0 && medians.every((median): median is bigint => median !== null)) {
-    const latestBaseFee = baseFees[baseFees.length - 1]
+  if (latestBaseFee !== null && medians.every((median): median is bigint => median !== null)) {
 
     // A hostile or buggy endpoint could emit percentiles out of order; clamp so
     // the slow ≤ standard ≤ fast invariant the UI relies on always holds.
