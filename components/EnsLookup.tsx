@@ -12,7 +12,7 @@
  * that verification explicitly rather than presenting an unverified name as fact.
  */
 
-import { useCallback, useState } from "react"
+import { useCallback, useRef, useState } from "react"
 import { Search, ShieldCheck } from "lucide-react"
 import Field, { monoInputClassName } from "./ui/Field"
 import Button from "./ui/Button"
@@ -70,7 +70,16 @@ export default function EnsLookup() {
   const [error, setError] = useState("")
   const [result, setResult] = useState<EnsLookupResult | null>(null)
 
+  // Generation guard (P4): lookups are async and a slower earlier request
+  // must never overwrite a newer one's result. The pooled provider API
+  // takes no AbortSignal, so staleness is enforced here — only the latest
+  // generation may write state, including the busy flag.
+  const lookupGeneration = useRef(0)
+
   const handleLookup = useCallback(async () => {
+    const generation = ++lookupGeneration.current
+    const isLatest = (): boolean => lookupGeneration.current === generation
+
     setError("")
     setResult(null)
 
@@ -81,8 +90,10 @@ export default function EnsLookup() {
 
     setBusy(true)
     try {
-      setResult(await lookupEns(mainnetEnsProvider, input))
+      const outcome = await lookupEns(mainnetEnsProvider, input)
+      if (isLatest()) setResult(outcome)
     } catch (error) {
+      if (!isLatest()) return
       logger.warn("ENS lookup failed", { error })
       setError(
         error instanceof RpcError
@@ -90,7 +101,7 @@ export default function EnsLookup() {
           : describeError(error, "Could not reach an Ethereum mainnet node. Check your connection.")
       )
     } finally {
-      setBusy(false)
+      if (isLatest()) setBusy(false)
     }
   }, [input])
 
