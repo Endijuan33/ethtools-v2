@@ -24,10 +24,16 @@ const NEW_PASSWORD = "Another-Horse-8?"
 const PHRASE = "test test test test test test test test test test test junk"
 const A = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 const B = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-const KEY_A = `0x${"11".repeat(32)}`
+// Public Hardhat test keys: KEY_A controls A, KEY_B controls B. The schema
+// now verifies that a stored key actually derives its account's address, so
+// fixtures must use real key/address pairs.
+const KEY_A = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+const KEY_B = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 
 function account(id: string, address: string): VaultAccount {
-  return { id, label: `Account ${id}`, address, privateKey: KEY_A }
+  // The key must derive the address (schema-enforced), so pick the pair.
+  const privateKey = address.toLowerCase() === B.toLowerCase() ? KEY_B : KEY_A
+  return { id, label: `Account ${id}`, address, privateKey }
 }
 
 function useStore(): void {
@@ -68,7 +74,7 @@ test("stored vault contains no readable secret", async () => {
 
     const raw = readRaw(STORAGE_KEYS.VAULT) ?? ""
     assert.ok(raw.length > 0)
-    for (const secret of ["junk", "privateKey", "1111111111", A]) {
+    for (const secret of ["junk", "privateKey", "ac0974bec39a17e3", A]) {
       assert.equal(raw.includes(secret), false, `"${secret}" must not be readable at rest`)
     }
   } finally {
@@ -264,7 +270,7 @@ test("migration merges into an existing vault without duplicating", async () => 
 
     writeJson(STORAGE_KEYS.LEGACY_WALLETS, [
       { id: "1", label: "Old", address: A, privateKey: KEY_A },
-      { id: "9", label: "Other", address: B, privateKey: KEY_A },
+      { id: "9", label: "Other", address: B, privateKey: KEY_B },
     ])
 
     const migrated = await migrateLegacyWallets(PASSWORD, created.value)
