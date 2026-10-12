@@ -13,7 +13,7 @@
  *
  * Native amount rule: balance minus a gas RESERVE, never the full balance. The
  * reserve is the estimated fee for every transfer in the plan plus 50% headroom
- * (the same margin `components/SendForm.tsx` uses), because the base fee can
+ * (a 120% margin), because the base fee can
  * rise between estimate and inclusion and OP-stack chains add an L1 data fee
  * the estimate does not include. A sweep that bounces its last transfer for
  * insufficient funds is worse than one that leaves a little dust behind.
@@ -47,6 +47,14 @@ export interface SweepTokenInput {
 export interface PlanSweepInput {
   /** The account being swept. Must not equal the destination. */
   from: string
+  /**
+   * Network key the plan is prepared against.
+   *
+   * Bound into the plan so execution can never drift onto another network:
+   * preparing is async, and a plan that re-read the live network selection at
+   * execution time could send on a chain the user never reviewed.
+   */
+  network: string
   destination: string
   /** Native balance in base units. */
   nativeBalance: bigint
@@ -81,6 +89,8 @@ export interface PlannedTransfer {
 
 /** The ordered plan the card reviews and executes. */
 export interface SweepPlan {
+  /** Network key captured at prepare time; execution must use this, never live state. */
+  network: string
   /** Destination in exact EIP-55 form. */
   destination: string
   /** Token transfers first, native transfer last. May be empty: nothing to sweep. */
@@ -111,6 +121,9 @@ export type SweepPlanResult = { ok: true; value: SweepPlan } | { ok: false; erro
  *   sweep"), or a user-presentable error.
  */
 export function planSweep(input: PlanSweepInput): SweepPlanResult {
+  if (typeof input.network !== "string" || input.network === "" || input.network.length > 64) {
+    return { ok: false, error: "The network for this sweep is not valid." }
+  }
   if (typeof input.from !== "string" || !isAddress(input.from)) {
     return { ok: false, error: "The account being swept is not a valid address." }
   }
@@ -227,6 +240,7 @@ export function planSweep(input: PlanSweepInput): SweepPlanResult {
   return {
     ok: true,
     value: {
+      network: input.network,
       destination,
       transfers,
       totalGasLimit,
