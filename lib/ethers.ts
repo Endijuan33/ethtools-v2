@@ -330,6 +330,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
   kaia: {
     name: "KAIA Mainnet",
     rpcUrls: [
+      "https://public-en.node.klaytnapi.com/v1/klaytn",
       "https://kaia.drpc.org",
       "https://kaia-mainnet.publicnode.com",
     ],
