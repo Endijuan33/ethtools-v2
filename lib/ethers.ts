@@ -126,9 +126,9 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
   mainnet: {
     name: "Ethereum Mainnet",
     rpcUrls: [
+      "https://ethereum-rpc.publicnode.com",
       "https://eth-mainnet.public.blastapi.io",
-      "https://rpc.ankr.com/eth",
-      "https://cloudflare-eth.com",
+      "https://eth.drpc.org",
       ...infuraEntry("mainnet"),
     ],
     explorerUrl: "https://etherscan.io",
@@ -140,7 +140,8 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     name: "Optimism",
     rpcUrls: [
       "https://mainnet.optimism.io",
-      "https://rpc.ankr.com/optimism",
+      "https://optimism-rpc.publicnode.com",
+      "https://optimism.drpc.org",
       ...infuraEntry("optimism-mainnet"),
     ],
     explorerUrl: "https://optimistic.etherscan.io",
@@ -152,7 +153,8 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     name: "Arbitrum One",
     rpcUrls: [
       "https://arb1.arbitrum.io/rpc",
-      "https://rpc.ankr.com/arbitrum",
+      "https://arbitrum-one-rpc.publicnode.com",
+      "https://arbitrum.drpc.org",
       ...infuraEntry("arbitrum-mainnet"),
     ],
     explorerUrl: "https://arbiscan.io",
@@ -177,7 +179,8 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     rpcUrls: [
       "https://bsc-dataseed1.binance.org",
       "https://bsc-dataseed2.binance.org",
-      "https://rpc.ankr.com/bsc",
+      "https://bsc-rpc.publicnode.com",
+      "https://bsc.drpc.org",
     ],
     explorerUrl: "https://bscscan.com",
     currency: "BNB",
@@ -200,7 +203,8 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     name: "Avalanche C-Chain Mainnet",
     rpcUrls: [
       "https://api.avax.network/ext/bc/C/rpc",
-      "https://rpc.ankr.com/avalanche",
+      "https://avalanche-c-chain-rpc.publicnode.com",
+      "https://avalanche.drpc.org",
       ...infuraEntry("avalanche-mainnet"),
     ],
     explorerUrl: "https://snowtrace.io",
@@ -212,8 +216,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     name: "Fantom Opera Mainnet",
     rpcUrls: [
       "https://rpc.fantom.network",
-      "https://fantom-mainnet.public.blastapi.io",
-      "https://rpc.ankr.com/fantom",
+      "https://fantom.drpc.org",
     ],
     explorerUrl: "https://explorer.fantom.network",
     currency: "FTM",
@@ -224,7 +227,8 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     name: "Celo Mainnet",
     rpcUrls: [
       "https://forno.celo.org",
-      "https://rpc.ankr.com/celo",
+      "https://celo-rpc.publicnode.com",
+      "https://celo.drpc.org",
       ...infuraEntry("celo-mainnet"),
     ],
     explorerUrl: "https://celoscan.io",
@@ -236,7 +240,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     name: "Scroll Mainnet",
     rpcUrls: [
       "https://scroll-rpc.publicnode.com",
-      "https://rpc.ankr.com/scroll",
+      "https://scroll.drpc.org",
     ],
     explorerUrl: "https://scrollscan.com",
     currency: "ETH",
@@ -246,7 +250,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
   zksyncera: {
     name: "zkSync Era Mainnet",
     rpcUrls: [
-      "https://rpc.ankr.com/zksync_era",
+      "https://zksync.drpc.org",
       "https://zksync-era-mainnet.publicnode.com",
     ],
     explorerUrl: "https://era.zksync.network",
@@ -258,7 +262,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     name: "Gnosis Chain (xDai) Mainnet",
     rpcUrls: [
       "https://gnosis-rpc.publicnode.com",
-      "https://rpc.ankr.com/gnosis",
+      "https://gnosis.drpc.org",
     ],
     explorerUrl: "https://gnosisscan.io",
     currency: "XDAI",
@@ -282,7 +286,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     name: "Mantle Mainnet",
     rpcUrls: [
       "https://mantle-rpc.publicnode.com",
-      "https://rpc.ankr.com/mantle",
+      "https://mantle.drpc.org",
     ],
     explorerUrl: "https://mantlescan.xyz",
     currency: "MNT",
@@ -303,6 +307,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
   moonbeam: {
     name: "Moonbeam Mainnet",
     rpcUrls: [
+      "https://moonbeam.drpc.org",
       "https://moonbeam-rpc.publicnode.com",
       "https://rpc.api.moonbeam.network",
     ],
@@ -325,7 +330,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
   kaia: {
     name: "KAIA Mainnet",
     rpcUrls: [
-      "https://rpc.ankr.com/kaia",
+      "https://kaia.drpc.org",
       "https://kaia-mainnet.publicnode.com",
     ],
     explorerUrl: "https://kaiascan.io",

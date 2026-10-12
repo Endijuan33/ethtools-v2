@@ -40,13 +40,14 @@ describe("built-in networks with NEXT_PUBLIC_INFURA_PROJECT_ID set (RA-13)", () 
 
   it("keeps the public endpoints ahead of Infura (failover priority unchanged)", () => {
     expect(NETWORKS.mainnet.rpcUrls.slice(0, 3)).toEqual([
+      "https://ethereum-rpc.publicnode.com",
       "https://eth-mainnet.public.blastapi.io",
-      "https://rpc.ankr.com/eth",
-      "https://cloudflare-eth.com",
+      "https://eth.drpc.org",
     ])
-    expect(NETWORKS.celo.rpcUrls.slice(0, 2)).toEqual([
+    expect(NETWORKS.celo.rpcUrls.slice(0, 3)).toEqual([
       "https://forno.celo.org",
-      "https://rpc.ankr.com/celo",
+      "https://celo-rpc.publicnode.com",
+      "https://celo.drpc.org",
     ])
   })
 

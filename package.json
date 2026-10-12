@@ -1,6 +1,6 @@
 {
   "name": "ethtools",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "private": true,
   "description": "Client-side Ethereum wallet utility. Keys are encrypted in the browser and never sent to a server.",
   "scripts": {
