@@ -38,6 +38,12 @@ export const STORAGE_KEYS = {
    * schema guard instead of trusting `localStorage` blindly.
    */
   VAULT_PASSKEY: "vault.passkey",
+  /**
+   * Cross-tab vault-session sync fallback (lock/erase broadcasts for engines
+   * without BroadcastChannel). Holds one non-secret JSON event; registered
+   * here like every other key so erase-all removes it too.
+   */
+  SESSION_SYNC: "ethtools_session_sync",
   CUSTOM_NETWORKS: "ethtools_custom_networks",
   TRANSACTION_HISTORY: "ethtools_transaction_history",
   BOOKMARKS: "ethtools_bookmarks",
