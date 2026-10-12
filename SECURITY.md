@@ -8,7 +8,7 @@ branches. If you self-host, track `main` and rebuild after security fixes.
 
 | Version | Supported |
 |---|---|
-| `main` (2.0.x line) | Yes |
+| `main` (2.1.x line) | Yes |
 | Anything older | No |
 
 ## Reporting a vulnerability
