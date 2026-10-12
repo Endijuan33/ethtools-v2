@@ -13,7 +13,10 @@ import {
 
 const PRIVATE_KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 const BARE_KEY = PRIVATE_KEY.slice(2)
-const INFURA_URL = "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161"
+// A placeholder in the shape of a project id — deliberately NOT a real
+// one (the shared id was removed from the tree entirely, RA-13 closure).
+const INFURA_PROJECT_ID = "0000000000000000000000000000dead"
+const INFURA_URL = `https://mainnet.infura.io/v3/${INFURA_PROJECT_ID}`
 
 /** Capture emitted entries instead of writing to the console. */
 function withCapture(
@@ -40,7 +43,7 @@ test("redacts a private key in either form", () => {
 
 test("redacts an API key embedded in an RPC URL", () => {
   const out = redactString(INFURA_URL)
-  assert.equal(out.includes("9aa3d95b3bc440fa88ea12eaa4456161"), false)
+  assert.equal(out.includes(INFURA_PROJECT_ID), false)
   assert.ok(out.startsWith("https://mainnet.infura.io"), "the host stays diagnosable")
 })
 
@@ -119,7 +122,7 @@ test("logger scrubs both the message and the context", () => {
 
     const serialized = JSON.stringify(entry.context)
     assert.equal(serialized.includes(BARE_KEY), false)
-    assert.equal(serialized.includes("9aa3d95b3bc440fa88ea12eaa4456161"), false)
+    assert.equal(serialized.includes(INFURA_PROJECT_ID), false)
     assert.ok(serialized.includes("mainnet"), "non-secret context is preserved")
   })
 })
