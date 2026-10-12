@@ -14,6 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react"
 import { Check, Copy, X } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { confirmAction, notify } from "./Toast"
+import { SECRET_CLIPBOARD_CLEAR_MS, scheduleSecretClipboardClear } from "@/lib/clipboard"
 
 type CopyState = "idle" | "copied" | "failed"
 
@@ -24,6 +25,12 @@ export interface CopyButtonProps {
   label: string
   /** When set, the user must confirm before the value reaches the clipboard. */
   confirmMessage?: string
+  /**
+   * Treat the value as a secret: after a successful copy, schedule a
+   * best-effort clipboard clear (see `lib/clipboard.ts`). The clear only
+   * fires when the clipboard still holds exactly this value.
+   */
+  clearAfterCopy?: boolean
   /** Show the label text beside the icon. */
   showText?: boolean
   className?: string
@@ -33,6 +40,7 @@ export default function CopyButton({
   value,
   label,
   confirmMessage,
+  clearAfterCopy = false,
   showText = false,
   className,
 }: CopyButtonProps) {
@@ -61,6 +69,7 @@ export default function CopyButton({
       if (!navigator.clipboard?.writeText) throw new Error("Clipboard unavailable")
       await navigator.clipboard.writeText(value)
       setState("copied")
+      if (clearAfterCopy) scheduleSecretClipboardClear(value)
     } catch {
       setState("failed")
       notify.error("Could not copy", "Your browser blocked clipboard access. Select and copy manually.")
@@ -68,7 +77,7 @@ export default function CopyButton({
 
     if (timer.current) clearTimeout(timer.current)
     timer.current = setTimeout(() => setState("idle"), 2000)
-  }, [confirmMessage, label, value])
+  }, [clearAfterCopy, confirmMessage, label, value])
 
   const Icon = state === "copied" ? Check : state === "failed" ? X : Copy
   const text = state === "copied" ? "Copied" : state === "failed" ? "Copy failed" : `Copy ${label}`

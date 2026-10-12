@@ -10,12 +10,12 @@
  *   transfers — which all burn native gas — can never be left unfunded.
  *
  * Security posture: the private key arrives as a prop from the unlocked vault
- * and is used only to sign, locally, exactly like `components/SendForm.tsx`.
+ * and is used only to sign, locally.
  * It is never rendered, persisted, or echoed in an error. Address-poisoning
  * screening is deliberately absent here: the send dialog owns that warning
  * surface, and a second, divergent implementation would only drift.
  *
- * Execution mirrors SendForm's broadcast-once pattern per transfer: estimate →
+ * Execution follows a broadcast-once pattern per transfer: estimate →
  * sign → send exactly once (no failover — an ambiguous retry could double-send)
  * → save history → wait for the receipt → update the status. Transfers run
  * SEQUENTIALLY; the first failure stops the queue and every remaining transfer
@@ -105,7 +105,7 @@ const ERC20 = new Interface(["function transfer(address to, uint256 amount) retu
 /** Fallback gas limit when a plan-time token estimate cannot run. */
 const TOKEN_TRANSFER_GAS_FALLBACK = 65_000n
 
-/** Gas-limit headroom over the node estimate, matching SendForm's 120%. */
+/** Gas-limit headroom over the node estimate: a 120% margin. */
 const GAS_HEADROOM_PERCENT = 120n
 
 /** Padded gas limit for a transfer, mirroring the send form's margin. */
@@ -179,14 +179,19 @@ export default function SweepCard({ account }: SweepCardProps) {
   const handlePrepare = useCallback(async () => {
     setError("")
     setPhase("preparing")
+    // Snapshot the context NOW: prepare is async, and the plan must bind the
+    // network/destination as they were when the user asked, not as they are
+    // whenever each await happens to resolve.
+    const selectedNetwork = network
+    const destinationSnapshot = destinationTrimmed
     try {
       // Validated by the field; the planner normalizes and re-validates it.
-      const destinationAddress = destinationTrimmed
-      const tracked = readTrackedTokens(network).slice(0, MAX_SWEEP_TOKENS)
+      const destinationAddress = destinationSnapshot
+      const tracked = readTrackedTokens(selectedNetwork).slice(0, MAX_SWEEP_TOKENS)
 
       const [nativeBalance, feeData] = await Promise.all([
-        getBalanceWei(account.address, network),
-        withProvider(network, (provider) => provider.getFeeData()),
+        getBalanceWei(account.address, selectedNetwork),
+        withProvider(selectedNetwork, (provider) => provider.getFeeData()),
       ])
       // Node-suggested price per gas unit. No tier UI here by design: the
       // sweep uses whatever the node suggests at send time.
@@ -194,13 +199,13 @@ export default function SweepCard({ account }: SweepCardProps) {
 
       let nativeGasLimit = 21_000n
       try {
-        const estimated = await withProvider(network, (provider) =>
+        const estimated = await withProvider(selectedNetwork, (provider) =>
           provider.estimateGas({ from: account.address, to: destinationAddress, value: 1n })
         )
         nativeGasLimit = padGasLimit(estimated)
       } catch (cause) {
         logger.warn("Sweep native gas estimate failed; using the plain-transfer limit", {
-          network,
+          network: selectedNetwork,
           error: cause,
         })
       }
@@ -210,13 +215,13 @@ export default function SweepCard({ account }: SweepCardProps) {
         const { value, decimals } = await getTokenBalanceRaw(
           token.address,
           account.address,
-          network
+          selectedNetwork
         )
         if (value <= 0n) continue
 
         let gasLimit = TOKEN_TRANSFER_GAS_FALLBACK
         try {
-          const estimated = await withProvider(network, (provider) =>
+          const estimated = await withProvider(selectedNetwork, (provider) =>
             provider.estimateGas({
               from: account.address,
               to: token.address,
@@ -228,7 +233,7 @@ export default function SweepCard({ account }: SweepCardProps) {
           // Estimate failure is not fatal at plan time: the send-time estimate
           // surfaces a genuine revert before anything is broadcast.
           logger.warn("Sweep token gas estimate failed; using the standard transfer limit", {
-            network,
+            network: selectedNetwork,
             token: token.symbol,
             error: cause,
           })
@@ -245,6 +250,7 @@ export default function SweepCard({ account }: SweepCardProps) {
 
       const planned = planSweep({
         from: account.address,
+        network: selectedNetwork,
         destination: destinationAddress,
         nativeBalance,
         nativeDecimals,
@@ -274,7 +280,7 @@ export default function SweepCard({ account }: SweepCardProps) {
       )
       setPhase("review")
     } catch (cause) {
-      logger.warn("Sweep preparation failed", { network, error: cause })
+      logger.warn("Sweep preparation failed", { network: selectedNetwork, error: cause })
       setError(
         cause instanceof RpcError
           ? cause.userMessage
@@ -303,17 +309,18 @@ export default function SweepCard({ account }: SweepCardProps) {
    */
   const freshNativeAmount = useCallback(async (): Promise<bigint | null> => {
     if (!plan) return null
+    const planNetwork = plan.network as Network
     try {
       const [balance, feeData] = await Promise.all([
-        getBalanceWei(account.address, network),
-        withProvider(network, (provider) => provider.getFeeData()),
+        getBalanceWei(account.address, planNetwork),
+        withProvider(planNetwork, (provider) => provider.getFeeData()),
       ])
       const perGas = feeData.maxFeePerGas ?? feeData.gasPrice
       if (perGas === null || perGas <= 0n) return null
 
       let gasLimit = 21_000n
       try {
-        const estimated = await withProvider(network, (provider) =>
+        const estimated = await withProvider(planNetwork, (provider) =>
           provider.estimateGas({ from: account.address, to: plan.destination, value: 1n })
         )
         gasLimit = padGasLimit(estimated)
@@ -326,13 +333,13 @@ export default function SweepCard({ account }: SweepCardProps) {
       const reserve = fee + fee / 2n
       return balance > reserve ? balance - reserve : 0n
     } catch (cause) {
-      logger.warn("Sweep native amount recomputation failed", { network, error: cause })
+      logger.warn("Sweep native amount recomputation failed", { network: planNetwork, error: cause })
       return null
     }
-  }, [account.address, network, plan])
+  }, [account.address, plan])
 
   /**
-   * Execute ONE transfer, SendForm's broadcast-once pattern verbatim:
+   * Execute ONE transfer, broadcast-once:
    * estimate → sign → send exactly once → save history → wait receipt →
    * update status. Never retries: an ambiguous timeout retry could submit the
    * same transaction twice.
@@ -342,6 +349,8 @@ export default function SweepCard({ account }: SweepCardProps) {
       transfer: PlannedTransfer
     ): Promise<{ outcome: "sent" | "pending" | "failed" | "not-attempted"; hash?: string; note?: string }> => {
       if (!plan) return { outcome: "failed", note: "The plan is no longer available." }
+      const planNetwork = plan.network as Network
+      const planNativeDecimals = getNativeDecimals(planNetwork)
 
       const request: TransactionRequest = { from: account.address }
       // Captured so the history record shows the exact value that was sent.
@@ -371,14 +380,14 @@ export default function SweepCard({ account }: SweepCardProps) {
       }
 
       try {
-        const estimated = await withProvider(network, (provider) =>
+        const estimated = await withProvider(planNetwork, (provider) =>
           provider.estimateGas(request)
         )
         request.gasLimit = padGasLimit(estimated)
       } catch (cause) {
         // A failed estimate usually means the transaction would revert. Surface
         // it rather than broadcasting blind and burning the fee.
-        logger.warn("Sweep gas estimation failed", { network, error: cause })
+        logger.warn("Sweep gas estimation failed", { network: planNetwork, error: cause })
         return {
           outcome: "failed",
           note:
@@ -392,7 +401,7 @@ export default function SweepCard({ account }: SweepCardProps) {
       try {
         // Broadcast exactly once. Retrying an ambiguous timeout could submit
         // the same transaction twice, so this deliberately does not fail over.
-        const response = await withProviderOnce(network, async (provider) => {
+        const response = await withProviderOnce(planNetwork, async (provider) => {
           const signer = new EthersWallet(account.privateKey, provider)
           return signer.sendTransaction(request)
         })
@@ -400,12 +409,12 @@ export default function SweepCard({ account }: SweepCardProps) {
 
         const amountLabel =
           transfer.kind === "native"
-            ? formatBalanceForDisplay(nativeAmountSent, nativeDecimals)
+            ? formatBalanceForDisplay(nativeAmountSent, planNativeDecimals)
             : formatBalanceForDisplay(transfer.amount, transfer.decimals)
 
         const saved = saveTransaction({
           hash,
-          network,
+          network: planNetwork,
           from: account.address,
           to: plan.destination,
           amount: amountLabel,
@@ -432,7 +441,7 @@ export default function SweepCard({ account }: SweepCardProps) {
           updateTransactionStatus(hash, "failed")
           return { outcome: "failed", hash, note: "Reverted on-chain. The fee was still spent." }
         } catch (confirmError) {
-          logger.warn("Sweep confirmation wait failed", { network, error: confirmError })
+          logger.warn("Sweep confirmation wait failed", { network: planNetwork, error: confirmError })
           updateTransactionStatus(hash, "unknown")
           return {
             outcome: "pending",
@@ -441,7 +450,7 @@ export default function SweepCard({ account }: SweepCardProps) {
           }
         }
       } catch (sendError) {
-        logger.error("Sweep transfer failed", { network, error: sendError })
+        logger.error("Sweep transfer failed", { network: planNetwork, error: sendError })
         return {
           outcome: "failed",
           note:
@@ -451,7 +460,7 @@ export default function SweepCard({ account }: SweepCardProps) {
         }
       }
     },
-    [account.address, account.privateKey, freshNativeAmount, nativeDecimals, network, plan]
+    [account.address, account.privateKey, freshNativeAmount, plan]
   )
 
   /** Update one row without disturbing the others. */
@@ -470,14 +479,32 @@ export default function SweepCard({ account }: SweepCardProps) {
   const handleConfirm = useCallback(async () => {
     if (!plan || plan.transfers.length === 0) return
 
+    // The plan is bound to the network and destination captured at prepare
+    // time. If live state no longer matches it, executing would send
+    // somewhere the user never reviewed: abort and force a fresh prepare.
+    if (network !== plan.network || destinationTrimmed !== plan.destination) {
+      setError(
+        "The network or destination changed after this sweep was prepared. Prepare the sweep again to review the new plan."
+      )
+      setPlan(null)
+      setRows([])
+      setPhase("form")
+      return
+    }
+
+    const planNetwork = plan.network as Network
+    const planNetworkInfo = NETWORKS[planNetwork]
+    const planNativeDecimals = getNativeDecimals(planNetwork)
+    const planNativeSymbol = planNetworkInfo?.currency ?? "ETH"
+
     const totalFeeLabel =
       plan.totalEstimatedFeeWei === null
         ? "unknown (node-suggested at send time)"
-        : `${formatBalanceForDisplay(plan.totalEstimatedFeeWei, nativeDecimals)} ${nativeSymbol}`
+        : `${formatBalanceForDisplay(plan.totalEstimatedFeeWei, planNativeDecimals)} ${planNativeSymbol}`
 
     const confirmed = await confirmAction({
       message: "Sweep all funds?",
-      description: `Send ${plan.transfers.length} transfer(s) to ${plan.destination} on ${networkInfo?.name ?? network}. Estimated gas: ${totalFeeLabel}. Token transfers go first; the native balance is sent last minus a gas reserve.`,
+      description: `Send ${plan.transfers.length} transfer(s) to ${plan.destination} on ${planNetworkInfo?.name ?? planNetwork}. Estimated gas: ${totalFeeLabel}. Token transfers go first; the native balance is sent last minus a gas reserve.`,
       confirmLabel: "Sweep",
     })
     if (!confirmed) return
@@ -515,15 +542,7 @@ export default function SweepCard({ account }: SweepCardProps) {
         `${sentCount} transfer(s) sent to ${truncateHex(plan.destination, 10, 8)}.`
       )
     }
-  }, [
-    executeTransfer,
-    nativeDecimals,
-    nativeSymbol,
-    network,
-    networkInfo?.name,
-    patchRow,
-    plan,
-  ])
+  }, [destinationTrimmed, executeTransfer, network, patchRow, plan])
 
   /** Back to the form, keeping the destination for a retry. */
   const reset = useCallback(() => {
@@ -572,9 +591,16 @@ export default function SweepCard({ account }: SweepCardProps) {
       fee:
         plan.totalEstimatedFeeWei === null
           ? null
-          : formatBalanceForDisplay(plan.totalEstimatedFeeWei, nativeDecimals),
+          : formatBalanceForDisplay(
+              plan.totalEstimatedFeeWei,
+              getNativeDecimals(plan.network as Network)
+            ),
     }
-  }, [plan, nativeDecimals])
+  }, [plan])
+
+  const planNetworkInfo = plan ? NETWORKS[plan.network as Network] : undefined
+  const planNetwork = plan?.network
+  const planNativeSymbol = planNetworkInfo?.currency ?? nativeSymbol
 
   return (
     <Card variant="inset" padding="sm" as="section" aria-label="Sweep funds">
@@ -604,6 +630,7 @@ export default function SweepCard({ account }: SweepCardProps) {
               <select
                 {...props}
                 value={network}
+                disabled={phase === "preparing"}
                 onChange={(e) => setNetwork(e.target.value)}
                 className={inputClassName}
               >
@@ -633,6 +660,7 @@ export default function SweepCard({ account }: SweepCardProps) {
                 {...props}
                 type="text"
                 value={destination}
+                disabled={phase === "preparing"}
                 onChange={(e) => setDestination(e.target.value)}
                 placeholder="0x..."
                 autoComplete="off"
@@ -662,7 +690,7 @@ export default function SweepCard({ account }: SweepCardProps) {
               icon={<WalletIcon className="h-5 w-5" />}
               title="Nothing to sweep"
               description={`This account holds no tracked tokens with a balance on ${
-                networkInfo?.name ?? network
+                planNetworkInfo?.name ?? planNetwork
               }, and its ${
                 plan?.nativeAmount === 0n ? "native balance is zero or only covers gas" : "native balance is zero"
               }.`}
@@ -671,13 +699,13 @@ export default function SweepCard({ account }: SweepCardProps) {
             <>
               <p className="text-xs text-muted-foreground">
                 Sweeping <span className="font-mono">{plan?.destination}</span> on{" "}
-                {networkInfo?.name ?? network}
+                {planNetworkInfo?.name ?? planNetwork}
                 {totals?.fee !== null && totals !== null && (
                   <>
                     {" "}
                     · estimated gas{" "}
                     <span className="font-medium text-foreground">
-                      {totals.fee} {nativeSymbol}
+                      {totals.fee} {planNativeSymbol}
                     </span>
                   </>
                 )}

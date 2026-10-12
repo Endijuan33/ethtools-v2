@@ -129,11 +129,17 @@ export default function ClientLayout({ children }: { children: React.ReactNode }
       return
     }
 
-    // Fallback for a host that embeds the app without injecting the SDK. The
-    // target origin stays "*" because a sandboxed frame has an opaque origin
-    // that no explicit value matches; the payload carries no sensitive data.
+    // Fallback for a host that embeds the app without injecting the SDK.
+    // Gated on the detected Mini App context: outside an embed there is no
+    // host listening, and broadcasting window messages from a top-level page
+    // would be needless surface. Inside the embed the target origin stays
+    // "*" — a documented, deliberate exception: a sandboxed frame has an
+    // opaque origin that no explicit target matches, the payload is a
+    // constant non-sensitive close signal, and the button that reaches this
+    // code only renders after `detectMiniApp()` confirmed an embed.
+    if (!isMiniApp) return
     window.postMessage({ type: "farcaster:close" }, "*")
-  }, [])
+  }, [isMiniApp])
 
   return (
     <>

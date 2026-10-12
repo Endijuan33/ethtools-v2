@@ -66,6 +66,16 @@ import {
   unlockWithPasskey,
 } from "@/lib/webauthnUnlock"
 import { NETWORKS } from "@/lib/ethers"
+import { APP_EVENTS, emitAppEvent } from "@/lib/appEvents"
+import { STORAGE_KEYS } from "@/lib/storage"
+import {
+  broadcastVaultSessionEvent,
+  createSessionSourceId,
+  createVaultSessionEvent,
+  isRemoteSessionEvent,
+  shouldLockAfterHidden,
+  subscribeVaultSessionEvents,
+} from "@/lib/vaultSession"
 import {
   DEFAULT_AUTOLOCK_MINUTES,
   isChecksummedAddress,
@@ -81,6 +91,10 @@ const RESERVED_NETWORK_KEYS = Object.keys(NETWORKS)
 
 export default function WalletVault() {
   const [stage, setStage] = useState<Stage>("checking")
+  // This tab's id for cross-tab session broadcasts (RA-06).
+  const [sessionSourceId] = useState(createSessionSourceId)
+  const stageRef = useRef<Stage>("checking")
+  stageRef.current = stage
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
   const [notice, setNotice] = useState("")
@@ -169,7 +183,13 @@ export default function WalletVault() {
     setStage(hasVault() ? "locked" : "setup")
   }, [])
 
-  const lock = useCallback(
+  /**
+   * Drop every in-memory secret and return to the locked/setup stage.
+   *
+   * This internal half never broadcasts: remote lock/erase handlers call it
+   * too, and a received event must not echo back out (RA-06 loop guard).
+   */
+  const lockInternal = useCallback(
     (reason?: string) => {
       setPayload(null)
       setPassword("")
@@ -203,6 +223,54 @@ export default function WalletVault() {
     []
   )
 
+  /**
+   * Lock, and tell the rest of the app — and every other tab — about it.
+   *
+   * The app event drops pasted keys in the standalone signers (RA-05); the
+   * broadcast makes other tabs drop their decrypted payloads too (RA-06).
+   * Manual locks and the idle/hidden auto-locks all go through here, so
+   * they all propagate.
+   */
+  const lock = useCallback(
+    (reason?: string) => {
+      lockInternal(reason)
+      emitAppEvent(APP_EVENTS.VAULT_LOCKED)
+      broadcastVaultSessionEvent(createVaultSessionEvent("lock", sessionSourceId, Date.now()))
+    },
+    [lockInternal, sessionSourceId]
+  )
+
+  /**
+   * Erase-all completed (in this tab's BackupManager): reset in memory.
+   *
+   * The vault is already gone from storage, so `lockInternal` lands on the
+   * setup stage with payload and password dropped (RA-01). BackupManager
+   * already broadcast the erase to other tabs.
+   */
+  const handleErased = useCallback(() => {
+    lockInternal("All data was erased from this device.")
+    setLegacyCount(detectLegacyWallets().length)
+    setPasskeyEnrolled(hasPasskeyUnlock())
+    emitAppEvent(APP_EVENTS.VAULT_LOCKED)
+  }, [lockInternal])
+
+  /**
+   * A restore sealed secrets into the vault: adopt the verified payload when
+   * this tab is unlocked, and leave the setup stage when a vault now exists.
+   */
+  const handleSecretsRestored = useCallback(
+    (restored: VaultPayload) => {
+      if (stageRef.current === "unlocked") setPayload(restored)
+      if (stageRef.current === "setup" && hasVault()) setStage("locked")
+    },
+    []
+  )
+
+  /** The live session BackupManager may seal restores with, when unlocked. */
+  const getVaultSession = useCallback((): { payload: VaultPayload; password: string } | null => {
+    return stageRef.current === "unlocked" && payload ? { payload, password } : null
+  }, [payload, password])
+
   // Idle auto-lock. Any interaction restarts the countdown.
   useEffect(() => {
     if (stage !== "unlocked") return
@@ -229,6 +297,87 @@ export default function WalletVault() {
       if (idleTimer.current) clearTimeout(idleTimer.current)
     }
   }, [stage, lock, autolockMinutes])
+
+  // Cross-tab session sync (RA-06). A lock in another tab drops this tab's
+  // decrypted payload; an erase additionally resets it to the setup stage.
+  // Received events use `lockInternal`, never the broadcasting `lock`, and
+  // events carrying this tab's own source id are ignored — no echo loops.
+  useEffect(() => {
+    const applyRemote = (type: "lock" | "erase"): void => {
+      lockInternal(
+        type === "erase"
+          ? "All data was erased in another tab."
+          : "Locked because the vault was locked in another tab."
+      )
+      setLegacyCount(detectLegacyWallets().length)
+      setPasskeyEnrolled(hasPasskeyUnlock())
+      emitAppEvent(APP_EVENTS.VAULT_LOCKED)
+    }
+
+    const offSession = subscribeVaultSessionEvents((event) => {
+      if (!isRemoteSessionEvent(event, sessionSourceId)) return
+      applyRemote(event.type)
+    })
+
+    // Storage fallback for the vault key itself: a removal (erase/delete in
+    // a tab whose broadcast could not run) or a change under an unlocked
+    // tab (account added, password changed) must not leave this tab holding
+    // a stale decrypted payload. Storage events never fire in the tab that
+    // made the change, so this cannot self-trigger.
+    const onStorage = (event: StorageEvent): void => {
+      if (event.key !== STORAGE_KEYS.VAULT) return
+      if (event.newValue === null) {
+        applyRemote("erase")
+      } else if (stageRef.current === "unlocked") {
+        lockInternal("The vault changed in another tab, so this tab locked.")
+        emitAppEvent(APP_EVENTS.VAULT_LOCKED)
+      }
+    }
+    window.addEventListener("storage", onStorage)
+
+    return () => {
+      offSession()
+      window.removeEventListener("storage", onStorage)
+    }
+  }, [lockInternal, sessionSourceId])
+
+  // Hidden-tab lock (RA-11). Lock when the tab comes back after being hidden
+  // past the threshold; a brief switch to a password manager or authenticator
+  // app never trips it. pagehide/pageshow cover the bfcache path, where the
+  // page is frozen rather than unloaded.
+  const hiddenAt = useRef<number | null>(null)
+  useEffect(() => {
+    if (stage !== "unlocked") return
+
+    const lockIfHiddenLongEnough = (): void => {
+      if (shouldLockAfterHidden(hiddenAt.current, Date.now())) {
+        lock("Locked because the tab was hidden for over a minute.")
+      }
+      hiddenAt.current = null
+    }
+    const onVisibilityChange = (): void => {
+      if (document.visibilityState === "hidden") {
+        if (hiddenAt.current === null) hiddenAt.current = Date.now()
+      } else {
+        lockIfHiddenLongEnough()
+      }
+    }
+    const onPageHide = (): void => {
+      if (hiddenAt.current === null) hiddenAt.current = Date.now()
+    }
+    const onPageShow = (event: PageTransitionEvent): void => {
+      if (event.persisted) lockIfHiddenLongEnough()
+    }
+
+    document.addEventListener("visibilitychange", onVisibilityChange)
+    window.addEventListener("pagehide", onPageHide)
+    window.addEventListener("pageshow", onPageShow)
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange)
+      window.removeEventListener("pagehide", onPageHide)
+      window.removeEventListener("pageshow", onPageShow)
+    }
+  }, [stage, lock])
 
   // ===== Setup =====
 
@@ -964,6 +1113,8 @@ export default function WalletVault() {
             isOpen={showBackup}
             onClose={() => setShowBackup(false)}
             reservedNetworkKeys={RESERVED_NETWORK_KEYS}
+            onSecretsRestored={handleSecretsRestored}
+            onErased={handleErased}
           />
         }
       />
@@ -1044,6 +1195,9 @@ export default function WalletVault() {
         isOpen={showBackup}
         onClose={() => setShowBackup(false)}
         reservedNetworkKeys={RESERVED_NETWORK_KEYS}
+        getVaultSession={getVaultSession}
+        onSecretsRestored={handleSecretsRestored}
+        onErased={handleErased}
         getSecrets={() =>
           payload
             ? {

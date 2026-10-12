@@ -14,6 +14,7 @@ const GWEI = 10n ** 9n
 function baseInput(overrides: Partial<PlanSweepInput> = {}): PlanSweepInput {
   return {
     from: FROM,
+    network: "mainnet",
     destination: DESTINATION,
     nativeBalance: ETH,
     nativeDecimals: 18,
@@ -213,4 +214,17 @@ test("the destination is normalized to EIP-55 checksum form", () => {
   const plan = expectPlan(baseInput({ destination: DESTINATION.toLowerCase() }))
   assert.equal(plan.destination, DESTINATION)
   assert.equal(plan.transfers[0].to, DESTINATION)
+})
+
+// ===== Network binding (RA-02) =====
+
+test("the plan is bound to the network it was prepared against", () => {
+  const plan = expectPlan(baseInput({ network: "polygon" }))
+  assert.equal(plan.network, "polygon")
+  assert.equal(plan.destination, DESTINATION)
+})
+
+test("a plan without a valid network is rejected", () => {
+  assert.match(expectError(baseInput({ network: "" })), /network/i)
+  assert.match(expectError(baseInput({ network: "x".repeat(65) })), /network/i)
 })

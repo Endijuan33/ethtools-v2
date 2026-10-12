@@ -2,7 +2,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 
 import type { GasResult } from "../gasTracker"
-import { estimateGasLevels } from "../gasTracker"
+import { estimateGasLevels, nextBlockBaseFee } from "../gasTracker"
 
 /**
  * These tests cover the pure estimator only. `estimateGasLevels` takes raw
@@ -226,4 +226,33 @@ test("fails with a user-presentable error when no source is usable", () => {
     const error = expectError(estimateGasLevels(history, gasPrice))
     assert.equal(error.length > 0, true, `no message for ${JSON.stringify(history)}`)
   }
+})
+
+// ---------- P5: the next-block base fee is the RAW last entry ----------
+
+test("nextBlockBaseFee reads only the final fee-history entry", () => {
+  assert.equal(nextBlockBaseFee([hex(5n * GWEI), hex(7n * GWEI), hex(9n * GWEI)]), 9n * GWEI)
+  assert.equal(nextBlockBaseFee([hex(9n * GWEI), null]), null)
+  assert.equal(nextBlockBaseFee([hex(9n * GWEI), "junk"]), null)
+  assert.equal(nextBlockBaseFee([]), null)
+  assert.equal(nextBlockBaseFee("0x1"), null)
+  assert.equal(nextBlockBaseFee(null), null)
+})
+
+test("an unusable final base-fee entry falls back explicitly instead of shifting to an older entry", () => {
+  // Older entries are perfectly valid — the old code silently used the 10
+  // gwei entry when the final (next-block) entry was null. The estimate
+  // must now take the explicit legacy path with the live gas price.
+  const history = {
+    baseFeePerGas: [hex(10n * GWEI), null],
+    reward: [[hex(1n * GWEI), hex(2n * GWEI), hex(3n * GWEI)]],
+  }
+  const estimate = expectOk(estimateGasLevels(history, hex(20n * GWEI)))
+  assert.equal(estimate.isEip1559, false)
+  assert.equal(estimate.standard, 20n * GWEI)
+
+  // And with no gas price available, it fails honestly rather than pricing
+  // off the stale entry.
+  const error = expectError(estimateGasLevels(history))
+  assert.equal(error.length > 0, true)
 })

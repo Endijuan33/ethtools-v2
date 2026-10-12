@@ -16,6 +16,7 @@
 import { useCallback, useEffect, useRef, useState } from "react"
 import { Eye, EyeOff, ShieldAlert } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { SECRET_CLIPBOARD_CLEAR_MS } from "@/lib/clipboard"
 import CopyButton from "./CopyButton"
 import { confirmAction } from "./Toast"
 
@@ -118,7 +119,10 @@ export default function SecretField({
             <CopyButton
               value={value}
               label={label.toLowerCase()}
-              confirmMessage="The system clipboard is readable by other applications and is often synced across devices and kept in clipboard history."
+              clearAfterCopy
+              confirmMessage={`The system clipboard is readable by other applications and is often synced across devices and kept in clipboard history. This copy is cleared automatically after ${Math.round(
+                SECRET_CLIPBOARD_CLEAR_MS / 1000
+              )} seconds when the clipboard still holds it.`}
             />
           )}
           <button

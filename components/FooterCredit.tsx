@@ -1,4 +1,8 @@
-import { Github, Send } from "lucide-react"
+"use client"
+
+import { useState } from "react"
+import { Github, Send, ShieldCheck } from "lucide-react"
+import PrivacyDisclosure from "./PrivacyDisclosure"
 
 /**
  * Footer credit and project links.
@@ -9,6 +13,8 @@ import { Github, Send } from "lucide-react"
  * third-party brand assets.
  */
 export default function FooterCredit() {
+  const [showPrivacy, setShowPrivacy] = useState(false)
+
   return (
     <footer className="mt-10 border-t border-border/60 px-4 pb-24 pt-6 text-center text-muted-foreground lg:pb-6">
       <p className="text-xs">
@@ -38,7 +44,19 @@ export default function FooterCredit() {
           <Send className="h-5 w-5 opacity-80" aria-hidden="true" />
           <span className="text-xs">Contact</span>
         </a>
+
+        <button
+          type="button"
+          onClick={() => setShowPrivacy(true)}
+          aria-label="Read the privacy disclosure"
+          className="flex min-h-[44px] flex-col items-center justify-center gap-1 rounded-lg px-3 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        >
+          <ShieldCheck className="h-5 w-5 opacity-80" aria-hidden="true" />
+          <span className="text-xs">Privacy</span>
+        </button>
       </div>
+
+      <PrivacyDisclosure isOpen={showPrivacy} onClose={() => setShowPrivacy(false)} />
     </footer>
   )
 }

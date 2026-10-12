@@ -26,6 +26,7 @@ import {
   isStoredBookmark,
   isStoredToken,
   isStoredTransaction,
+  isValidMnemonicPhrase,
   isVaultAccount,
   type StoredBookmark,
   type StoredCustomNetwork,
@@ -369,7 +370,17 @@ export function sanitizeBackupContents(
     dropped += Math.max(0, submitted - Object.keys(validated).length)
   }
 
-  const mnemonic = typeof raw.mnemonic === "string" && raw.mnemonic.length > 0 ? raw.mnemonic : undefined
+  // A mnemonic that fails the BIP-39 checksum is dropped and counted, never
+  // carried into a restore: sealing it into a vault would preserve a phrase
+  // that derives a different (empty) wallet than the user believes they have.
+  let mnemonic: string | undefined
+  if (raw.mnemonic !== undefined) {
+    if (isValidMnemonicPhrase(raw.mnemonic)) {
+      mnemonic = raw.mnemonic.trim().replace(/\s+/g, " ")
+    } else {
+      dropped++
+    }
+  }
   const mnemonicPassphrase =
     typeof raw.mnemonicPassphrase === "string" ? raw.mnemonicPassphrase : undefined
 

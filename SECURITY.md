@@ -19,12 +19,10 @@ encryption, signing, or storage.**
 Preferred channel: GitHub's private vulnerability reporting for this
 repository (the **Report a vulnerability** button under the repository's
 Security tab), which keeps the report private until a fix is available.
-
-> Repository configuration note: private vulnerability reporting must be
-> enabled by the repository owner under **Settings → Security → Private
-> vulnerability reporting** before that button exists. Until it is enabled,
-> there is no verified private reporting channel for this project — do not
-> send wallet-related vulnerability details through public issues.
+Private vulnerability reporting **is enabled** on this repository (owner
+Settings → Security → Private vulnerability reporting), and that button
+is the verified private channel — do not send wallet-related
+vulnerability details through public issues.
 
 A useful report includes:
 
@@ -47,3 +45,12 @@ to reproduce every class of issue in this codebase.
   of the README for what leaves the device).
 - Findings in the deployed site that do not reproduce on current `main`
   may already be fixed; please check the commit history before reporting.
+
+## Dependency integrity
+
+CI pins every GitHub Action to a full commit SHA and runs a dependency
+audit gate (`pnpm audit:osv`, implemented in `scripts/osv-audit.mjs`)
+that scans every package in the pnpm lockfile against the OSV database.
+The gate fails on any advisory that is not covered by a justified,
+unexpired entry in `.osv-ignore.json`; each ignore names the advisory,
+why it is not reachable in this app, and when the exception lapses.

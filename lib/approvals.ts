@@ -21,7 +21,7 @@
  * validated as addresses, log data is bounded before `BigInt` ever sees it, and
  * a bad entry is discarded silently rather than erroring a whole network.
  *
- * Revocation mirrors `components/SendForm.tsx` end to end — gas estimate first
+ * Revocation mirrors the send flow end to end — gas estimate first
  * (a revert aborts before any fee is spent), then sign locally, then broadcast
  * exactly once through `withProviderOnce` (retrying an ambiguous broadcast
  * could double-submit), then record in history and resolve the real receipt
@@ -127,7 +127,7 @@ export interface ApprovalScanSnapshot {
  * Outcome of a revoke attempt.
  *
  * `ok: true` means the transaction was broadcast; `status` then reports the
- * receipt outcome exactly like `SendForm` — a missing receipt is `"unknown"`,
+ * receipt outcome exactly like the send flow — a missing receipt is `"unknown"`,
  * never a silent success, because claiming a revoke happened when it may not
  * have is the one lie this feature must never tell.
  */
@@ -1156,7 +1156,7 @@ export async function scanApprovalsAcrossNetworks(
 /**
  * Revoke one approval by sending `approve(spender, 0)`.
  *
- * Mirrors `SendForm`'s ceremony exactly, because the same failure modes and
+ * Mirrors the send ceremony exactly, because the same failure modes and
  * the same safety properties apply:
  *
  * 1. **Estimate first.** `estimateGas` through the pooled provider; a revert

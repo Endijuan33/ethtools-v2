@@ -14,6 +14,7 @@
 
 import { Toaster as SonnerToaster, toast } from "sonner"
 import { useIsDesktop } from "./useMediaQuery"
+import { createConfirmationGate } from "@/lib/confirmDedupe"
 
 /** Mount once, near the root. */
 export function Toaster() {
@@ -85,7 +86,23 @@ export const notify = {
  *
  * @param options - Copy for the prompt and its actions.
  */
+/** Shared gate so identical pending confirmations never stack (RA-08). */
+const confirmationGate = createConfirmationGate()
+
 export function confirmAction(options: {
+  message: string
+  description?: string
+  confirmLabel?: string
+  cancelLabel?: string
+}): Promise<boolean> {
+  // A second identical call while one is pending (double-click, two
+  // handlers reacting to the same gesture) joins the pending prompt
+  // instead of stacking a duplicate toast the user must dismiss again —
+  // and which would run the destructive action a second time.
+  return confirmationGate.run(options, () => openConfirmation(options))
+}
+
+function openConfirmation(options: {
   message: string
   description?: string
   confirmLabel?: string

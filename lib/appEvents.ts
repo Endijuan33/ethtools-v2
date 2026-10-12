@@ -25,6 +25,14 @@ export const APP_EVENTS = {
    * would stay invisible until a manual page reload.
    */
   DATA_RESTORED: "ethtools:data-restored",
+  /**
+   * The vault was locked (manually, by idle auto-lock, by the hidden-tab
+   * lock, or by an erase).
+   *
+   * Anything holding key material outside the vault — the standalone
+   * signers' pasted private keys above all — must drop it when this fires.
+   */
+  VAULT_LOCKED: "ethtools:vault-locked",
 } as const
 
 /** An event name the application can dispatch. */

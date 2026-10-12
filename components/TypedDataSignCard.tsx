@@ -21,6 +21,7 @@ import Card from "./ui/Card"
 import Alert from "./ui/Alert"
 import Badge from "./ui/Badge"
 import CopyButton from "./ui/CopyButton"
+import { usePastedKeyLifecycle } from "./usePastedKeyLifecycle"
 import Tabs from "./ui/Tabs"
 import { classifySecret, deriveFromPrivateKey } from "@/lib/hdWallet"
 import {
@@ -81,6 +82,10 @@ export default function TypedDataSignCard() {
   const [mode, setMode] = useState<Mode>("sign")
   const [payload, setPayload] = useState("")
   const [privateKey, setPrivateKey] = useState("")
+  const clearPrivateKey = useCallback((): void => setPrivateKey(""), [])
+  // RA-05: a pasted key is borrowed, not held — it is dropped after signing
+  // (below), after an idle window, and whenever the vault locks anywhere.
+  usePastedKeyLifecycle(privateKey.trim() !== "", privateKey, clearPrivateKey)
   const [address, setAddress] = useState("")
   const [signature, setSignature] = useState("")
   const [error, setError] = useState("")
@@ -157,6 +162,8 @@ export default function TypedDataSignCard() {
         signature: result.value,
         signer: signer.ok ? signer.value.address : null,
       })
+      // The signature exists now; the key has no further job in this tab.
+      setPrivateKey("")
     } finally {
       setSigning(false)
     }
@@ -244,7 +251,7 @@ export default function TypedDataSignCard() {
           <Field
             label="Private key"
             action={keyFeedback}
-            hint="64 hexadecimal characters, with or without the 0x prefix. Used once, in memory, and cleared when you switch modes."
+            hint="64 hexadecimal characters, with or without the 0x prefix. Held only in this tab's memory and never stored; cleared after signing, after 5 idle minutes, when the vault locks, and when you switch modes."
           >
             {(props) => (
               <input

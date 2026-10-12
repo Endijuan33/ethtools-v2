@@ -14,13 +14,18 @@ import {
   isStoredToken,
   isStoredTransaction,
   isTxHash,
+  isValidMnemonicPhrase,
+  isValidPrivateKeyForAddress,
   isVaultAccount,
   isVaultPayload,
 } from "../schema"
 
 const ADDRESS = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 const OTHER_ADDRESS = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8"
-const KEY = `0x${"11".repeat(32)}`
+// Public Hardhat test key for ADDRESS (account 0). A stored key must derive
+// the account's address, so the fixture is a real pair.
+const KEY = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+const PHRASE = "test test test test test test test test test test test junk"
 const HASH = "0x" + "ab".repeat(32)
 
 test("accepts https URLs only", () => {
@@ -69,7 +74,7 @@ test("validates a vault account", () => {
 test("validates a vault payload", () => {
   assert.equal(isVaultPayload({ accounts: [] }), true)
   assert.equal(
-    isVaultPayload({ mnemonic: "a b c", accounts: [{ id: "1", label: "M", address: ADDRESS }] }),
+    isVaultPayload({ mnemonic: PHRASE, accounts: [{ id: "1", label: "M", address: ADDRESS }] }),
     true
   )
   // One bad account invalidates the payload, since accounts control funds.
@@ -248,4 +253,58 @@ test("custom network map drops invalid entries and malformed keys", () => {
   assert.deepEqual(Object.keys(result), ["good-chain"])
   assert.deepEqual(filterValidCustomNetworks(null), {})
   assert.deepEqual(filterValidCustomNetworks([1, 2]), {})
+})
+
+// ===== RA-09: secret material is validated cryptographically =====
+
+test("a stored private key must derive the account's address", () => {
+  assert.equal(isValidPrivateKeyForAddress(KEY, ADDRESS), true)
+  // The other Hardhat key is a valid key — for a different account.
+  assert.equal(
+    isValidPrivateKeyForAddress(
+      "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d",
+      ADDRESS
+    ),
+    false
+  )
+  // Bare hex (no 0x) stays acceptable, matching how keys are pasted in.
+  assert.equal(isValidPrivateKeyForAddress(KEY.slice(2), ADDRESS), true)
+
+  const hostile: unknown[] = [
+    `0x${"11".repeat(32)}`, // valid scalar, wrong account
+    `0x${"00".repeat(32)}`, // zero key
+    `0x${"ff".repeat(32)}`, // out of range (above the curve order)
+    "0x1234", // far too short
+    `0x${"11".repeat(31)}`, // 31 bytes
+    `0x${"zz".repeat(32)}`, // non-hex
+    "",
+    null,
+    42,
+  ]
+  assert.equal(isValidPrivateKeyForAddress(undefined, ADDRESS), false)
+  for (const bad of hostile) {
+    assert.equal(isValidPrivateKeyForAddress(bad, ADDRESS), false, String(bad))
+    assert.equal(
+      isVaultAccount({ id: "1", label: "Main", address: ADDRESS, privateKey: bad }),
+      false,
+      `account with key ${String(bad)} must be rejected`
+    )
+  }
+})
+
+test("a mnemonic must pass the BIP-39 checksum and wordlist", () => {
+  assert.equal(isValidMnemonicPhrase(PHRASE), true)
+  assert.equal(isValidMnemonicPhrase(PHRASE.replace(/\s+/g, "  ")), true, "extra whitespace is normalized")
+  // One word swapped for another wordlist word: checksum fails.
+  assert.equal(isValidMnemonicPhrase(PHRASE.replace("junk", "zoo")), false)
+  // A word outside the wordlist.
+  assert.equal(isValidMnemonicPhrase(PHRASE.replace("junk", "notaword")), false)
+  // Wrong word counts.
+  assert.equal(isValidMnemonicPhrase("test test test"), false)
+  assert.equal(isValidMnemonicPhrase("a b c"), false)
+  assert.equal(isValidMnemonicPhrase(""), false)
+  assert.equal(isValidMnemonicPhrase(null), false)
+  // A payload carrying a bad phrase is not a valid payload.
+  assert.equal(isVaultPayload({ mnemonic: "a b c", accounts: [] }), false)
+  assert.equal(isVaultPayload({ mnemonic: PHRASE, accounts: [] }), true)
 })

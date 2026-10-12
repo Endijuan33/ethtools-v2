@@ -9,7 +9,7 @@
  * drop records that fail.
  */
 
-import { getAddress, isAddress } from "ethers"
+import { Mnemonic, Wallet, getAddress, isAddress } from "ethers"
 
 // ===== Primitives =====
 
@@ -76,6 +76,54 @@ export function isTxHash(value: unknown): value is string {
 }
 
 /**
+ * Whether a private key is a valid secp256k1 key AND controls `address`.
+ *
+ * A non-empty string is not enough: a stored vault record whose key is
+ * truncated, non-hex, out of range, or simply belongs to a different account
+ * would surface later as a failed (or wrong-account) signature. Deriving the
+ * address with ethers checks the full range rules and the match in one step.
+ * Both `0x`-prefixed and bare 64-hex forms are accepted; stored vault keys
+ * are written `0x`-prefixed by ethers.
+ */
+export function isValidPrivateKeyForAddress(privateKey: unknown, address: unknown): boolean {
+  if (typeof privateKey !== "string") return false
+  if (!/^(0x)?[0-9a-fA-F]{64}$/.test(privateKey)) return false
+  if (!isEthAddress(address)) return false
+  try {
+    const wallet = new Wallet(privateKey.startsWith("0x") ? privateKey : `0x${privateKey}`)
+    return wallet.address === getAddress(address)
+  } catch {
+    // Zero or out-of-range scalar: not a usable key.
+    return false
+  }
+}
+
+/** Word counts BIP-39 permits. */
+const MNEMONIC_WORD_COUNTS: readonly number[] = [12, 15, 18, 21, 24]
+
+/**
+ * Whether a value is a checksum-valid BIP-39 mnemonic.
+ *
+ * `Mnemonic.isValidMnemonic` checks every word against the English wordlist
+ * and verifies the embedded checksum, so a phrase with a mistyped word —
+ * which would derive an entirely different, empty wallet — is rejected at
+ * the boundary instead of being sealed into a vault or restored from a
+ * backup. Whitespace runs are normalized first, matching how phrases are
+ * handled everywhere else in the app.
+ */
+export function isValidMnemonicPhrase(value: unknown): value is string {
+  if (typeof value !== "string") return false
+  const normalized = value.trim().replace(/\s+/g, " ")
+  const wordCount = normalized.length === 0 ? 0 : normalized.split(" ").length
+  if (!MNEMONIC_WORD_COUNTS.includes(wordCount)) return false
+  try {
+    return Mnemonic.isValidMnemonic(normalized)
+  } catch {
+    return false
+  }
+}
+
+/**
  * Keep only the array entries that satisfy a guard.
  *
  * Preferred over rejecting a whole payload: one corrupt bookmark should not
@@ -135,7 +183,12 @@ export function isVaultAccount(value: unknown): value is VaultAccount {
   if (!isNonEmptyString(value.id, 128)) return false
   if (!isNonEmptyString(value.label, 128)) return false
   if (!isEthAddress(value.address)) return false
-  if (value.privateKey !== undefined && !isNonEmptyString(value.privateKey, 200)) return false
+  if (
+    value.privateKey !== undefined &&
+    !isValidPrivateKeyForAddress(value.privateKey, value.address)
+  ) {
+    return false
+  }
   if (
     value.derivationIndex !== undefined &&
     !isIntegerInRange(value.derivationIndex, 0, 2_147_483_647)
@@ -164,7 +217,7 @@ export function isVaultAccount(value: unknown): value is VaultAccount {
 /** Whether a value is a valid decrypted vault payload. */
 export function isVaultPayload(value: unknown): value is VaultPayload {
   if (!isRecord(value)) return false
-  if (value.mnemonic !== undefined && !isNonEmptyString(value.mnemonic, 1024)) return false
+  if (value.mnemonic !== undefined && !isValidMnemonicPhrase(value.mnemonic)) return false
   if (
     value.mnemonicPassphrase !== undefined &&
     typeof value.mnemonicPassphrase !== "string"

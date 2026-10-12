@@ -84,6 +84,33 @@ export function getNativeDecimals(network: Network): number {
   return NATIVE_DECIMALS_OVERRIDES[network] ?? 18
 }
 
+
+/**
+ * The shared Infura project id used by the built-in network table.
+ *
+ * A project id is a PUBLIC client identifier — it names this app to
+ * Infura, appears in every RPC request URL, and is visible to anyone who
+ * opens devtools. It is not a secret, and shipping it as a fallback
+ * constant is safe for the same reason the WalletConnect project id is.
+ * Forks and other deployments can substitute their own project with
+ * `NEXT_PUBLIC_INFURA_PROJECT_ID` without touching the network table; the
+ * RPC order (which drives failover priority) never changes.
+ *
+ * Residual that cannot be fixed from this repository: the project owner
+ * should restrict the id to this app's domains in the Infura dashboard
+ * (Settings > Security > Domain allowlist), so a scraped copy of the id
+ * cannot spend the project's quota from other origins.
+ */
+export const FALLBACK_INFURA_PROJECT_ID = "9aa3d95b3bc440fa88ea12eaa4456161"
+
+const infuraProjectId =
+  process.env.NEXT_PUBLIC_INFURA_PROJECT_ID || FALLBACK_INFURA_PROJECT_ID
+
+/** An Infura RPC endpoint for a chain host, using the configured project. */
+function infuraRpc(host: string): string {
+  return `https://${host}.infura.io/v3/${infuraProjectId}`
+}
+
 // ===== Built-in Networks with Multiple RPCs =====
 
 export const NETWORKS: Record<string, BuiltInNetwork> = {
@@ -94,7 +121,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
       "https://eth-mainnet.public.blastapi.io",
       "https://rpc.ankr.com/eth",
       "https://cloudflare-eth.com",
-      "https://mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+      infuraRpc("mainnet"),
     ],
     explorerUrl: "https://etherscan.io",
     currency: "ETH",
@@ -106,7 +133,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     rpcUrls: [
       "https://mainnet.optimism.io",
       "https://rpc.ankr.com/optimism",
-      "https://optimism-mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+      infuraRpc("optimism-mainnet"),
     ],
     explorerUrl: "https://optimistic.etherscan.io",
     currency: "ETH",
@@ -118,7 +145,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     rpcUrls: [
       "https://arb1.arbitrum.io/rpc",
       "https://rpc.ankr.com/arbitrum",
-      "https://arbitrum-mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+      infuraRpc("arbitrum-mainnet"),
     ],
     explorerUrl: "https://arbiscan.io",
     currency: "ETH",
@@ -166,7 +193,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     rpcUrls: [
       "https://api.avax.network/ext/bc/C/rpc",
       "https://rpc.ankr.com/avalanche",
-      "https://avalanche-mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+      infuraRpc("avalanche-mainnet"),
     ],
     explorerUrl: "https://snowtrace.io",
     currency: "AVAX",
@@ -189,7 +216,7 @@ export const NETWORKS: Record<string, BuiltInNetwork> = {
     name: "Celo Mainnet",
     rpcUrls: [
       "https://rpc.ankr.com/celo",
-      "https://celo-mainnet.infura.io/v3/9aa3d95b3bc440fa88ea12eaa4456161",
+      infuraRpc("celo-mainnet"),
     ],
     explorerUrl: "https://celoscan.io",
     currency: "CELO",

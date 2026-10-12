@@ -456,3 +456,41 @@ test("summarizes a restore for confirmation", () => {
   assert.equal(summary.includedMnemonic, true)
   assert.equal(summary.droppedRecords, 3)
 })
+
+// ===== RA-09 / RA-03: sanitize drops secrets that fail validation =====
+
+test("sanitize drops a mnemonic that fails the BIP-39 checksum and counts it", () => {
+  const sanitized = sanitizeBackupContents({
+    activeAccountId: null,
+    bookmarks: [],
+    transactions: [],
+    tokens: [],
+    customNetworks: {},
+    mnemonic: PHRASE.replace("junk", "zoo"),
+  })
+  assert.equal(sanitized.ok, true)
+  if (!sanitized.ok) return
+  assert.equal(sanitized.value.contents.mnemonic, undefined)
+  assert.ok(sanitized.value.dropped >= 1, "the dropped phrase must be counted")
+})
+
+test("sanitize drops an account whose key does not derive its address", () => {
+  const sanitized = sanitizeBackupContents({
+    activeAccountId: null,
+    bookmarks: [],
+    transactions: [],
+    tokens: [],
+    customNetworks: {},
+    accounts: [
+      { id: "good", label: "Good", address: ADDRESS, privateKey: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" },
+      { id: "bad", label: "Bad", address: ADDRESS, privateKey: `0x${"11".repeat(32)}` },
+    ],
+  })
+  assert.equal(sanitized.ok, true)
+  if (!sanitized.ok) return
+  assert.deepEqual(
+    sanitized.value.contents.accounts?.map((a) => a.id),
+    ["good"]
+  )
+  assert.ok(sanitized.value.dropped >= 1)
+})
