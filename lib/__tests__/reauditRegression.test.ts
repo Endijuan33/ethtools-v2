@@ -96,10 +96,17 @@ test("RA-07: the privacy disclosure is reachable from the footer", () => {
   }
 })
 
-test("RA-12: the Farcaster close fallback is gated on the detected mini-app context", () => {
+test("RA-12: the Farcaster close fallback is gated, targeted, and wildcard-free", () => {
   const layout = readRepoFile("app/client-layout.tsx")
+  // Still gated on the detected mini-app context…
   assert.ok(layout.includes("if (!isMiniApp) return"))
-  assert.ok(layout.includes('window.postMessage({ type: "farcaster:close" }, "*")'))
+  // …still sends the close signal, now via the targeted helper…
+  assert.ok(layout.includes("postMiniAppClose(window)"))
+  assert.ok(layout.includes('from "@/lib/frameEmbed"'))
+  // …and no direct postMessage call remains in the layout at all; the
+  // helper's targets are pinned (no "*") by the frameEmbed unit tests.
+  assert.equal(layout.includes("window.postMessage"), false)
+  assert.equal(/postMessage\([^)]*"\*"/.test(layout), false)
 })
 
 test("Info: SendForm stays deleted and nothing imports it", () => {
