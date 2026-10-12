@@ -8,9 +8,9 @@
     "version": "1",
     "name": "EthTools",
     "description": "Ethereum tools for developers",
-    "iconUrl": "https://ethtools.vercel.app/placeholder-logo.png",
+    "iconUrl": "https://ethtools.vercel.app/apple-icon.png",
     "homeUrl": "https://ethtools.vercel.app",
-    "imageUrl": "https://ethtools.vercel.app/placeholder-logo.png",
+    "imageUrl": "https://ethtools.vercel.app/apple-icon.png",
     "buttonTitle": "Open App"
   }
 }

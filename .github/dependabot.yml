@@ -1,0 +1,29 @@
+version: 2
+updates:
+  # Runtime and build dependencies (pnpm lockfile is managed by the npm
+  # ecosystem updater). Security-sensitive packages - the framework, the
+  # signing library, and the WalletConnect stack - are grouped so each of
+  # their updates arrives as one reviewable pull request instead of being
+  # mixed into a bulk bump.
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      next-framework:
+        patterns:
+          - "next"
+          - "eslint-config-next"
+          - "@next/swc-wasm-nodejs"
+      web3-stack:
+        patterns:
+          - "ethers"
+          - "@walletconnect/*"
+          - "@reown/*"
+          - "@farcaster/*"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"

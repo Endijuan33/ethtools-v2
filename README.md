@@ -1,6 +1,6 @@
 # EthTools
 
-A client-side Ethereum wallet utility. Derive addresses, generate wallets, manage encrypted accounts across 30+ networks, send native transfers, and decode calldata — entirely in the browser.
+A client-side Ethereum wallet utility. Derive addresses, generate wallets, manage encrypted accounts across 30 networks, send native transfers, and decode calldata — entirely in the browser.
 
 **All cryptography runs locally.** No key, recovery phrase, or password is transmitted to any server. Read [Security model](#security-model) before using this with real funds — it states plainly what is and is not protected.
 
@@ -21,7 +21,7 @@ A client-side Ethereum wallet utility. Derive addresses, generate wallets, manag
 - Derivation is verified against the published Hardhat test vectors.
 
 ### Multi-network balances
-- 30+ built-in networks, mainnet and testnet.
+- 30 built-in networks (20 mainnet, 10 testnet), plus custom networks.
 - Add custom networks. RPC and explorer URLs must be `https:`; anything else is rejected.
 - Per-network RPC pools with **real per-request retry and failover**, plus a health indicator derived from actual request outcomes.
 - Balance polling pauses entirely while the tab is hidden.
@@ -101,20 +101,26 @@ The `_URL` suffix matters. An earlier version of this file documented the names 
 
 ### Tests
 
-227 unit tests cover the logic layer. They compile `lib/` to CommonJS in `.test-build/` and run on the Node built-in test runner, so no test framework is installed.
+669 unit tests across 37 files cover the logic layer. They compile `lib/` to CommonJS in `.test-build/` and run on the Node built-in test runner, so no test framework is installed. Largest suites:
 
 | Module | Tests | Focus |
 |---|---:|---|
+| `walletConnect` | 56 | Session requests, signing methods, broadcast-once signing |
+| `approvals` | 40 | Allowance discovery, revocation ceremony |
 | `calldata` | 38 | Selector extraction, ABI decode, revert reasons |
 | `units` | 32 | Bigint-exact conversion, truncation direction |
+| `priceHistory` / `multiRpc` | 58 | Price series handling; failover, benching, timeouts, abort, no-retry broadcast |
+| `addressGuard` | 24 | Address-poisoning screening |
 | `hdWallet` | 23 | Published BIP-44 vectors, all five phrase lengths, passphrases |
+| `vault` / `vaultStore` | 38 | AES-GCM round trip, wrong password, plaintext migration |
+| `legacyMigration` | 7 | Idempotent migration, invalid-record quarantine, derived-address correction, failure rollback, undetected-entry preservation |
+| `arcDecimals` | 3 | Arc native USDC pinned to 18 decimals (not the ERC-20 6) |
 | `backup` | 19 | Encryption round trip, malicious-import rejection |
-| `multiRpc` | 19 | Failover, benching, timeouts, abort, no-retry broadcast |
 | `ens` | 18 | Result-union contract, forward confirmation, late rejections |
-| `vault` / `vaultStore` | 30 | AES-GCM round trip, wrong password, plaintext migration |
-| `format` | 14 | Never rounds a balance up; dust is distinguishable from zero |
-| `storage` / `schema` | 23 | Quota handling, atomic rollback, hostile-URL rejection |
+| `format` | 15 | Never rounds a balance up; dust is distinguishable from zero |
+| `storage` / `schema` | 28 | Quota handling, atomic rollback, hostile-URL rejection |
 | `logger` | 11 | Redaction of keys, API keys, and nested error stacks |
+| `noPlaintextStorage` | 4 | Structural guard: no component may write the legacy cleartext key |
 
 ---
 
@@ -179,10 +185,21 @@ lib/
 - Copying a secret to the clipboard requires an explicit confirmation that names the risk.
 - Revealed secrets auto-hide on a visible countdown.
 
+### What leaves the device
+
+Keys, phrases, and passwords never leave the browser - but **addresses and queries do**, because the app has no backend of its own:
+
+- Public RPC providers see the addresses whose balances and allowances are read, and the transactions that are broadcast.
+- Blockscout-family explorers see addresses scanned for token discovery and approval history.
+- CoinGecko sees the assets whose prices are requested.
+- WalletConnect relays see session metadata for dApp connections, and `chainid.network` is fetched when pre-filling custom-RPC metadata.
+
+Those services can correlate an address with a visitor's IP address. That is inherent to a client-side tool with public infrastructure; use a VPN or your own RPC endpoints if that correlation matters to you.
+
 ### What is not protected — read this
 
-- **`components/WalletCard.tsx` still writes private keys to `localStorage` in cleartext.** The encrypted vault (the **Vault** panel) is a separate, safe path. The legacy Balances panel has not been migrated. Use the Vault panel, and treat anything imported through the legacy path as exposed.
-- **No Content-Security-Policy is deployed.** Any successful XSS would have full access to `localStorage`.
+- **Wallets imported by pre-vault versions may still sit in `localStorage` in cleartext until they are migrated.** The Balances panel no longer creates, reads into state, or signs with those keys: it displays only their public addresses. Creating or unlocking the encrypted vault (the **Vault** panel) migrates them automatically - records are validated, the encrypted copy is written and verified first, and only then is the plaintext removed. Records whose key data is unusable are left untouched and reported, never silently discarded. Until migration happens, treat those specific wallets as exposed.
+- **A Content-Security-Policy is deployed, but it is not a complete XSS defence.** The production policy (see `next.config.mjs`) still allows `'unsafe-inline'` for scripts, which Next.js requires for its inline bootstrap; a nonce-based policy is the documented next step. Any successful XSS would still have full access to `localStorage`, including the encrypted vault ciphertext.
 - **A password cannot be recovered.** Lose it and the accounts in that vault are unrecoverable.
 - **An encrypted backup file plus its password equals full control of the funds.** Store them separately.
 - **`localStorage` is not secure storage.** It is readable by any script on the origin and by browser extensions with storage permission. Encryption at rest raises the bar; it does not make a shared or compromised device safe.
@@ -207,11 +224,11 @@ lib/
 
 `pnpm verify` should pass before every deployment.
 
-### Recommended security headers
+### Security headers
 
-The repository ships **no** `headers()` configuration, so no CSP, `X-Frame-Options`, `X-Content-Type-Options`, or `Referrer-Policy` is sent. For a production deployment holding real funds, add them to `next.config.mjs`.
+`next.config.mjs` ships a `headers()` configuration that sends a Content-Security-Policy, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, a restrictive `Permissions-Policy`, and `X-DNS-Prefetch-Control: off` on every route. The development and production CSPs differ deliberately: the dev server requires `'unsafe-eval'` and a local WebSocket, and neither relaxation is shipped to production.
 
-Note that `frame-ancestors` must be an allowlist rather than `DENY`: this app is intended to be embedded by Farcaster Mini App clients, and `DENY` would break that.
+Note that `frame-ancestors` is an allowlist rather than `DENY`: this app is intended to be embedded by Farcaster Mini App clients, and `DENY` would break that while leaving it open to every other embedder. The remaining known limitation is `script-src 'unsafe-inline'` (required by Next's inline bootstrap scripts); removing it needs a nonce threaded through the document.
 
 ---
 
