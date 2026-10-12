@@ -1,68 +1,38 @@
-export const dynamic = 'force-dynamic';
+import { FRAME_CSP } from "@/lib/csp"
+import { buildFrameHtml, resolveSiteOrigin } from "@/lib/frameEmbed"
 
-export async function GET() {
-  const miniappEmbed = JSON.stringify({
-    version: "1",
-    imageUrl: "https://ethtools.vercel.app/apple-icon.png",
-    buttons: [
-      {
-        title: "Open App",
-        action: {
-          type: "launch_miniapp",
-          url: "https://ethtools.vercel.app",
-          name: "EthTools",
-          splashImageUrl: "https://ethtools.vercel.app/apple-icon.png",
-          splashBackgroundColor: "#8B5CF6"
-        }
-      },
-      {
-        title: "GitHub",
-        action: {
-          type: "link",
-          url: "https://github.com/endijuan33"
-        }
-      }
-    ]
-  });
+export const dynamic = "force-dynamic"
 
-  return new Response(
-    `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>EthTools MiniApp</title>
-
-  <!-- Farcaster Mini App Embed (PRIMARY) -->
-  <meta name="fc:miniapp" content='${miniappEmbed}' />
-
-  <!-- Legacy Frames v1 Fallback (MUST use name, not property) -->
-  <meta name="fc:frame" content="vNext" />
-  <meta name="fc:frame:image" content="https://ethtools.vercel.app/apple-icon.png" />
-  <meta name="fc:frame:image:aspect_ratio" content="1.91:1" />
-  <meta name="fc:frame:button:1" content="Open App" />
-  <meta name="fc:frame:button:1:action" content="link" />
-  <meta name="fc:frame:button:1:target" content="https://ethtools.vercel.app" />
-  <meta name="fc:frame:button:2" content="GitHub" />
-  <meta name="fc:frame:button:2:action" content="link" />
-  <meta name="fc:frame:button:2:target" content="https://github.com/endijuan33" />
-
-  <!-- OpenGraph (still uses property) -->
-  <meta property="og:title" content="EthTools MiniApp" />
-  <meta property="og:description" content="Tools for Ethereum users" />
-  <meta property="og:image" content="https://ethtools.vercel.app/apple-icon.png" />
-</head>
-<body>
-  <h1>Welcome to EthTools</h1>
-  <p>Open this in Warpcast for the full Mini App experience.</p>
-</body>
-</html>`,
-    {
-      status: 200,
-      headers: {
-        "Content-Type": "text/html; charset=utf-8",
-        "Cache-Control": "public, max-age=300"
-      },
+/**
+ * Farcaster frame / Mini App embed document.
+ *
+ * The HTML is built by the pure helpers in `lib/frameEmbed.ts` and points at
+ * the site's own origin — the configured `NEXT_PUBLIC_SITE_URL` when set,
+ * otherwise the origin this request arrived on, otherwise the canonical
+ * production origin — instead of a hardcoded production URL, so preview
+ * deployments embed themselves rather than production.
+ *
+ * The response is publicly cacheable for five minutes, which is exactly why
+ * it must not carry a per-request CSP nonce: middleware answers this route
+ * with the static, nonce-free `FRAME_CSP`, and the same header is set here
+ * as a second layer so the route stays safe even if the matcher changes.
+ */
+export async function GET(request: Request) {
+  const requestOrigin = (() => {
+    try {
+      return new URL(request.url).origin
+    } catch {
+      return null
     }
-  );
+  })()
+  const origin = resolveSiteOrigin(process.env.NEXT_PUBLIC_SITE_URL, requestOrigin)
+
+  return new Response(buildFrameHtml(origin), {
+    status: 200,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+      "Content-Security-Policy": FRAME_CSP,
+    },
+  })
 }
