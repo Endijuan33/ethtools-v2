@@ -12,11 +12,11 @@ import {
   FileJson,
   Search,
 } from "lucide-react"
-import { Mnemonic, Wallet as EthersWallet, isError } from "ethers"
+import { getAddress, isAddress } from "ethers"
+import { classifySecret } from "@/lib/hdWallet"
 import {
   getBalanceWei,
   getNativeDecimals,
-  getRoutescanUrl,
   NETWORKS,
   getCustomNetworks,
   saveCustomNetwork,
@@ -32,7 +32,6 @@ import { fetchChainMetadata } from "@/lib/chainMetadata"
 import { RpcError } from "@/lib/multiRpc"
 import { APP_EVENTS, onAppEvent } from "@/lib/appEvents"
 import { QRCodeSVG } from "qrcode.react"
-import SendForm from "./SendForm"
 import BookmarkManager from "./BookmarkManager"
 import BackupManager from "./BackupManager"
 import { getPricesForNetworks } from "@/lib/priceFeed"
@@ -49,22 +48,30 @@ import { STORAGE_KEYS, readRaw, removeKey, readJson, writeJson, writeRaw } from 
 import Card, { CardHeader, CardTitle } from "./ui/Card"
 import Button from "./ui/Button"
 import ResponsiveDialog from "./ui/ResponsiveDialog"
-import Field, { inputClassName, monoInputClassName, secretInputProps } from "./ui/Field"
+import Field, { inputClassName, monoInputClassName } from "./ui/Field"
 import Alert from "./ui/Alert"
 import Badge from "./ui/Badge"
 import CopyButton from "./ui/CopyButton"
-import SecretField from "./ui/SecretField"
 import Tabs, { TabPanel, type TabItem } from "./ui/Tabs"
 import { SkeletonList } from "./ui/Skeleton"
 import { cn } from "@/lib/utils"
 
 // ===== Types =====
 
-interface ImportedWallet {
+/**
+ * An address this panel can display balances for.
+ *
+ * Deliberately has no privateKey field: this panel never holds, persists,
+ * or signs with a secret. Legacy records contribute only their (public)
+ * address here; their keys stay untouched in the legacy store until the
+ * Vault panel moves them into encrypted storage on unlock. Watch entries
+ * are address-only by construction.
+ */
+interface AddressEntry {
   id: string
   label: string
   address: string
-  privateKey: string
+  source: "legacy" | "watch"
 }
 
 /** One network's balance, or the reason it could not be read. */
@@ -81,9 +88,11 @@ interface BalanceEntry {
   /**
    * Decimals of this network's native unit.
    *
-   * Carried per entry rather than assumed to be 18: Arc's native unit is USDC at 6
-   * decimals, and formatting it as 18 understated the balance by a factor of a
-   * trillion and mispriced the fiat column by the same amount.
+   * Carried per entry rather than assumed globally, so a chain whose native
+   * unit differs is priced by its own configuration (see
+   * `getNativeDecimals` in lib/ethers). Note Arc's native USDC uses 18
+   * decimals - not the 6 decimals of ERC-20 USDC: an earlier 6-decimal
+   * override understated Arc balances by a factor of a trillion.
    */
   decimals: number
   /** Already-sanitised, user-presentable failure message. */
@@ -155,14 +164,15 @@ function isDocumentHidden(): boolean {
   return typeof document !== "undefined" && document.hidden
 }
 
-/** Whether a stored value is a usable legacy wallet record. */
-function isImportedWallet(value: unknown): value is ImportedWallet {
+/** Whether a stored value carries a usable id, label, and address. */
+function isAddressRecord(
+  value: unknown
+): value is { id: string; label: string; address: string } {
   if (!isRecord(value)) return false
   return (
     isNonEmptyString(value.id, 128) &&
     isNonEmptyString(value.label, 128) &&
-    isEthAddress(value.address) &&
-    isNonEmptyString(value.privateKey, 200)
+    isEthAddress(value.address)
   )
 }
 
@@ -172,15 +182,39 @@ function isUnknownArray(value: unknown): value is unknown[] {
 }
 
 /**
- * Read the legacy wallet list.
+ * Read the address list this panel may display.
  *
- * Routed through `lib/storage` so a blocked or corrupted store degrades to an
- * empty list instead of throwing during render, and validated per record so one
- * malformed entry does not discard the rest.
+ * Two sources, neither of which puts a secret into component state:
+ * - Legacy records contribute only id, label, and address. Their
+ *   `privateKey` field is never copied out of storage by this panel; the
+ *   keys are migrated by the Vault panel (see `migrateLegacyWallets`).
+ * - Watch entries are address-only records this panel owns.
+ *
+ * Routed through `lib/storage` so a blocked or corrupted store degrades to
+ * an empty list instead of throwing during render, and validated per record
+ * so one malformed entry does not discard the rest.
  */
-function readStoredWallets(): ImportedWallet[] {
-  const raw = readJson<unknown[]>(STORAGE_KEYS.LEGACY_WALLETS, isUnknownArray, [])
-  return filterValid(raw, isImportedWallet)
+function readStoredWallets(): AddressEntry[] {
+  const legacyRaw = readJson<unknown[]>(STORAGE_KEYS.LEGACY_WALLETS, isUnknownArray, [])
+  const legacy: AddressEntry[] = filterValid(legacyRaw, isAddressRecord).map((record) => ({
+    id: record.id,
+    label: record.label,
+    address: record.address,
+    source: "legacy" as const,
+  }))
+
+  const watchRaw = readJson<unknown[]>(STORAGE_KEYS.WATCH_ADDRESSES, isUnknownArray, [])
+  const known = new Set(legacy.map((entry) => entry.address.toLowerCase()))
+  const watch: AddressEntry[] = filterValid(watchRaw, isAddressRecord)
+    .filter((record) => !known.has(record.address.toLowerCase()))
+    .map((record) => ({
+      id: record.id,
+      label: record.label,
+      address: record.address,
+      source: "watch" as const,
+    }))
+
+  return [...legacy, ...watch]
 }
 
 // ===== AddCustomRpcModal (Inline) =====
@@ -473,9 +507,9 @@ function WalletSelector({
   onAddNew,
   onDelete,
 }: {
-  wallets: ImportedWallet[]
-  activeWallet: ImportedWallet | null
-  onSelect: (wallet: ImportedWallet) => void
+  wallets: AddressEntry[]
+  activeWallet: AddressEntry | null
+  onSelect: (wallet: AddressEntry) => void
   onAddNew: () => void
   onDelete: (id: string) => void
 }) {
@@ -538,7 +572,7 @@ function WalletSelector({
                     {wallet.address.slice(0, 10)}...{wallet.address.slice(-8)}
                   </span>
                 </button>
-                {wallets.length > 1 && (
+                {wallet.source === "watch" && (
                   <Button
                     variant="ghost"
                     size="icon"
@@ -570,7 +604,7 @@ function WalletSelector({
               )}
             >
               <Plus size={18} aria-hidden="true" />
-              <span>Add Another Wallet</span>
+              <span>Add Watch Address</span>
             </button>
           </div>
         </div>
@@ -583,7 +617,7 @@ function WalletSelector({
 
 export default function WalletCard() {
   // --- State ---
-  const [wallets, setWallets] = useState<ImportedWallet[]>([])
+  const [wallets, setWallets] = useState<AddressEntry[]>([])
   const [activeWalletId, setActiveWalletId] = useState<string | null>(null)
   const [isAddingWallet, setIsAddingWallet] = useState(false)
   const [networkView, setNetworkView] = useState<"mainnet" | "testnet">("mainnet")
@@ -593,8 +627,7 @@ export default function WalletCard() {
   const [walletLabel, setWalletLabel] = useState("")
   const [error, setError] = useState("")
   const [showReceive, setShowReceive] = useState(false)
-  const [sendFromNetwork, setSendFromNetwork] = useState<NetworkType | null>(null)
-  const [txSuccess, setTxSuccess] = useState<{ hash: string; network: NetworkType } | null>(null)
+  const [showSendHelp, setShowSendHelp] = useState(false)
   const [showLogoutConfirmation, setShowLogoutConfirmation] = useState(false)
   const [isMounted, setIsMounted] = useState(false)
   const [showAddRpc, setShowAddRpc] = useState(false)
@@ -629,15 +662,6 @@ export default function WalletCard() {
   /** Monotonic id for price fetches. Same contract as {@link balanceRequestId}. */
   const priceRequestId = useRef(0)
 
-  /**
-   * Mirrors `sendFromNetwork` for reads from inside timer callbacks.
-   *
-   * The idle teardown must not release RPC pools while a send dialog is open, and
-   * a callback created once per effect run would otherwise close over a stale
-   * value.
-   */
-  const sendFromNetworkRef = useRef<NetworkType | null>(null)
-
   // --- Derived ---
   const activeWallet = useMemo(
     () => wallets.find((w) => w.id === activeWalletId) || null,
@@ -645,12 +669,6 @@ export default function WalletCard() {
   )
 
   const isUnlocked = wallets.length > 0 && !isAddingWallet
-
-  const { wordCount, isMnemonic } = useMemo(() => {
-    const words = inputValue.trim().split(/\s+/).filter(Boolean)
-    const count = words.length
-    return { wordCount: count, isMnemonic: [12, 18, 24].includes(count) }
-  }, [inputValue])
 
   const displayedNetworks = useMemo(() => {
     const allNetworks = { ...NETWORKS, ...customNetworks }
@@ -690,7 +708,7 @@ export default function WalletCard() {
    * Shared by the initial load and the backup-import listener so both paths agree
    * on what happens when the previously active id is no longer present.
    */
-  const adoptWallets = useCallback((storedWallets: ImportedWallet[]) => {
+  const adoptWallets = useCallback((storedWallets: AddressEntry[]) => {
     setWallets(storedWallets)
     if (storedWallets.length === 0) {
       setActiveWalletId(null)
@@ -729,11 +747,6 @@ export default function WalletCard() {
   }, [adoptWallets])
 
   // --- Refresh primitives ---
-
-  // Keep the ref in step so timer callbacks read the current dialog state.
-  useEffect(() => {
-    sendFromNetworkRef.current = sendFromNetwork
-  }, [sendFromNetwork])
 
   /**
    * Discard cached balances when the active wallet changes.
@@ -969,7 +982,7 @@ export default function WalletCard() {
         setIsLoadingPrices(false)
         cancelTeardown()
         teardownTimer = setTimeout(() => {
-          if (!isDocumentHidden() || sendFromNetworkRef.current !== null) return
+          if (!isDocumentHidden()) return
           cleanupRpcPools()
         }, IDLE_TEARDOWN_MS)
         return
@@ -1039,73 +1052,89 @@ export default function WalletCard() {
 
   const handleImport = () => {
     setError("")
-    if (!inputValue.trim()) {
-      setError("Please enter a mnemonic phrase or private key.")
+    const trimmedInput = inputValue.trim()
+    if (!trimmedInput) {
+      setError("Please enter an Ethereum address to watch.")
       return
     }
-    try {
-      const trimmedInput = inputValue.trim()
-      const importedWallet = isMnemonic
-        ? (() => {
-            const mnemonic = Mnemonic.fromPhrase(trimmedInput)
-            return EthersWallet.fromPhrase(mnemonic.phrase)
-          })()
-        : new EthersWallet(trimmedInput)
 
-      if (wallets.some((w) => w.address.toLowerCase() === importedWallet.address.toLowerCase())) {
-        setError("This wallet is already imported.")
-        return
-      }
-
-      const newWallet: ImportedWallet = {
-        id: crypto.randomUUID(),
-        label: walletLabel.trim() || `Wallet ${wallets.length + 1}`,
-        address: importedWallet.address,
-        privateKey: importedWallet.privateKey,
-      }
-
-      const updatedWallets = [...wallets, newWallet]
-      // Persisted through lib/storage: a bare setItem throws when the quota is
-      // full, which used to abort the import after the wallet was already in
-      // state, leaving the two out of step until the next reload.
-      const write = writeJson(STORAGE_KEYS.LEGACY_WALLETS, updatedWallets)
-      if (!write.ok) {
-        logger.error("Could not persist the imported wallet", { reason: write.reason })
-        setError(write.error)
-        return
-      }
-      writeRaw(STORAGE_KEYS.ACTIVE_WALLET, newWallet.id)
-
-      setWallets(updatedWallets)
-      setActiveWalletId(newWallet.id)
-      setInputValue("")
-      setWalletLabel("")
-      setIsAddingWallet(false)
-    } catch (e) {
-      if (isError(e, "INVALID_ARGUMENT")) {
-        setError("Invalid mnemonic phrase or private key.")
-      } else {
-        // Never the raw message: an ethers error routinely embeds the offending
-        // argument, which here is a mnemonic or a private key.
-        logger.warn("Wallet import failed")
-        setError("Invalid mnemonic phrase or private key.")
-      }
+    // A secret pasted here is never persisted by this panel. classifySecret
+    // is the same classifier the Converter uses, so a phrase or key gets a
+    // precise redirect instead of a generic "invalid address".
+    const classified = classifySecret(trimmedInput)
+    if (classified.kind === "mnemonic" || classified.kind === "private-key") {
+      setError(
+        "That is a recovery phrase or private key. This panel never stores secrets: " +
+          "import it in the Vault panel instead, where it is stored encrypted. " +
+          "Wallets imported by older versions are moved into the vault automatically when you unlock it."
+      )
+      return
     }
+
+    if (!isAddress(trimmedInput)) {
+      setError("That is not a valid Ethereum address.")
+      return
+    }
+    const address = getAddress(trimmedInput)
+
+    if (wallets.some((w) => w.address.toLowerCase() === address.toLowerCase())) {
+      setError("This address is already in the list.")
+      return
+    }
+
+    const newEntry: AddressEntry = {
+      id: crypto.randomUUID(),
+      label: walletLabel.trim() || `Watch ${wallets.length + 1}`,
+      address,
+      source: "watch",
+    }
+
+    // Only watch records are written, and they contain no secret material.
+    const watchRecords = wallets
+      .filter((w) => w.source === "watch")
+      .map((w) => ({ id: w.id, label: w.label, address: w.address }))
+    const write = writeJson(STORAGE_KEYS.WATCH_ADDRESSES, [
+      ...watchRecords,
+      { id: newEntry.id, label: newEntry.label, address: newEntry.address },
+    ])
+    if (!write.ok) {
+      logger.error("Could not persist the watch address", { reason: write.reason })
+      setError(write.error)
+      return
+    }
+    writeRaw(STORAGE_KEYS.ACTIVE_WALLET, newEntry.id)
+
+    setWallets((prev) => [...prev, newEntry])
+    setActiveWalletId(newEntry.id)
+    setInputValue("")
+    setWalletLabel("")
+    setIsAddingWallet(false)
   }
 
-  const handleSelectWallet = (wallet: ImportedWallet) => {
+  const handleSelectWallet = (wallet: AddressEntry) => {
     setActiveWalletId(wallet.id)
     writeRaw(STORAGE_KEYS.ACTIVE_WALLET, wallet.id)
   }
 
   const handleDeleteWallet = (walletId: string) => {
-    const updatedWallets = wallets.filter((w) => w.id !== walletId)
-    const write = writeJson(STORAGE_KEYS.LEGACY_WALLETS, updatedWallets)
+    // Only watch entries can be removed individually: they are address-only
+    // records this panel owns. A legacy record carries key material and is
+    // removed either by vault migration (the safe path) or by the explicit
+    // erase-all below - never by rewriting the remaining plaintext records
+    // from this panel.
+    const target = wallets.find((w) => w.id === walletId)
+    if (!target || target.source !== "watch") return
+
+    const updatedWatch = wallets
+      .filter((w) => w.source === "watch" && w.id !== walletId)
+      .map((w) => ({ id: w.id, label: w.label, address: w.address }))
+    const write = writeJson(STORAGE_KEYS.WATCH_ADDRESSES, updatedWatch)
     if (!write.ok) {
-      logger.error("Could not persist the wallet removal", { reason: write.reason })
+      logger.error("Could not persist the watch removal", { reason: write.reason })
       setError(write.error)
       return
     }
+    const updatedWallets = wallets.filter((w) => w.id !== walletId)
     setWallets(updatedWallets)
 
     if (activeWalletId === walletId) {
@@ -1121,6 +1150,7 @@ export default function WalletCard() {
 
   const handleLogout = () => {
     removeKey(STORAGE_KEYS.LEGACY_WALLETS)
+    removeKey(STORAGE_KEYS.WATCH_ADDRESSES)
     removeKey(STORAGE_KEYS.ACTIVE_WALLET)
     setWallets([])
     setActiveWalletId(null)
@@ -1139,14 +1169,6 @@ export default function WalletCard() {
     setIsLoadingPrices(false)
     setShowLogoutConfirmation(false)
     cleanupRpcPools()
-  }
-
-  const handleSendSuccess = (hash: string) => {
-    if (sendFromNetwork) {
-      setTxSuccess({ hash, network: sendFromNetwork })
-      setSendFromNetwork(null)
-      void refreshBalances()
-    }
   }
 
   /**
@@ -1180,8 +1202,6 @@ export default function WalletCard() {
   }
 
   if (isUnlocked && activeWallet) {
-    const txExplorerUrl = txSuccess ? getRoutescanUrl(txSuccess.hash, txSuccess.network) : ""
-
     return (
       <Card className="w-full max-w-lg">
         <div className="mb-4">
@@ -1363,7 +1383,7 @@ export default function WalletCard() {
                         <Button
                           variant="success"
                           size="sm"
-                          onClick={() => setSendFromNetwork(networkKey)}
+                          onClick={() => setShowSendHelp(true)}
                           disabled={!canSend}
                           icon={<Send size={14} aria-hidden="true" />}
                           aria-label={`Send ${networkInfo.currency} on ${networkInfo.name}`}
@@ -1405,9 +1425,20 @@ export default function WalletCard() {
             </p>
           </div>
 
-          {/* Was plaintext under a `blur-sm` filter, so the key stayed in the DOM
-              and was readable via DevTools, select-all, or a screen reader. */}
-          <SecretField label="Private key" value={activeWallet.privateKey} allowCopy />
+          {activeWallet.source === "legacy" ? (
+            <Alert tone="warning" title="This wallet is not encrypted yet.">
+              It was imported by an older version and its key is still stored unencrypted on
+              this device. Open the Vault panel and create or unlock your vault: the wallet
+              will be moved into encrypted storage automatically and the unencrypted copy
+              deleted. Sending from this panel is disabled until then.
+            </Alert>
+          ) : (
+            <Alert tone="info" title="Watch-only address.">
+              No private key is stored for this address, so it can be monitored and
+              receive funds, but nothing can be sent from it here. To spend from an
+              account, import it in the Vault panel.
+            </Alert>
+          )}
         </div>
 
         {/* Modals */}
@@ -1446,64 +1477,30 @@ export default function WalletCard() {
           }
         >
           <p className="text-sm text-muted-foreground">
-            Are you sure? This will remove all {wallets.length} wallet
-            {wallets.length > 1 ? "s" : ""} from this device.
+            Are you sure? This will remove all {wallets.length} address
+            {wallets.length > 1 ? "es" : ""} from this device. Any older wallet that has not
+            been migrated into the encrypted vault yet will be permanently lost, because its
+            only copy is the unencrypted one stored here.
           </p>
         </ResponsiveDialog>
 
-        {sendFromNetwork && (
-          <SendForm
-            wallet={activeWallet}
-            network={sendFromNetwork}
-            onClose={() => setSendFromNetwork(null)}
-            onSuccess={handleSendSuccess}
-          />
-        )}
-
-        {txSuccess && (
-          <ResponsiveDialog
-            isOpen
-            onClose={() => setTxSuccess(null)}
-            title="Transaction Sent!"
-            size="sm"
-            footer={
-              <Button variant="secondary" onClick={() => setTxSuccess(null)} fullWidth>
-                Close
-              </Button>
-            }
-          >
-            <div className="space-y-1.5">
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-sm font-medium text-foreground">Transaction hash</span>
-                <CopyButton
-                  value={txSuccess.hash}
-                  label="transaction hash"
-                  className="h-11 w-11 justify-center"
-                />
-              </div>
-              <p className="break-all rounded-lg border border-border bg-muted/40 p-3 font-mono text-sm">
-                {txSuccess.hash}
-              </p>
-            </div>
-
-            {/* An <a href=""> reloads the page, so the link is only rendered when
-                the network actually has an explorer configured. */}
-            {txExplorerUrl ? (
-              <a
-                href={txExplorerUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="inline-flex min-h-[44px] items-center text-sm font-semibold text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                View on Explorer
-              </a>
-            ) : (
-              <p className="text-sm text-muted-foreground">
-                This network has no explorer configured, so there is no link to open.
-              </p>
-            )}
-          </ResponsiveDialog>
-        )}
+        <ResponsiveDialog
+          isOpen={showSendHelp}
+          onClose={() => setShowSendHelp(false)}
+          title="Sending requires the encrypted vault"
+          size="sm"
+          footer={
+            <Button variant="secondary" onClick={() => setShowSendHelp(false)} fullWidth>
+              Close
+            </Button>
+          }
+        >
+          <p className="text-sm text-muted-foreground">
+            {activeWallet.source === "legacy"
+              ? "This wallet was imported by an older version and is not encrypted yet. Open the Vault panel and create or unlock your vault: it will be moved into encrypted storage automatically, and the unencrypted copy deleted. After that, use the vault account to sign and send."
+              : "This is a watch-only address: no private key is stored for it, so nothing can be sent from it here. To spend from this account, import it in the Vault panel, where the key is stored encrypted."}
+          </p>
+        </ResponsiveDialog>
 
         <ResponsiveDialog
           isOpen={showReceive}
@@ -1542,45 +1539,36 @@ export default function WalletCard() {
   return (
     <Card className="w-full max-w-lg">
       <CardTitle className="text-center">
-        {wallets.length > 0 ? "Add Another Wallet" : "Import Existing Wallet"}
+        {wallets.length > 0 ? "Add Watch Address" : "Track an Address"}
       </CardTitle>
       <p className="mb-4 mt-1 text-center text-sm text-muted-foreground">
-        Use a 12, 18, 24-word mnemonic or a private key.
+        Add any Ethereum address to watch its balances. To import a wallet you can spend
+        from, use the Vault panel: keys are stored encrypted there, never in this panel.
       </p>
 
       <div className="space-y-4">
-        <Field label="Wallet Label" hint="Optional.">
+        <Field label="Address Label" hint="Optional.">
           {(props) => (
             <input
               {...props}
               type="text"
               value={walletLabel}
               onChange={(e) => setWalletLabel(e.target.value)}
-              placeholder={`Wallet ${wallets.length + 1}`}
+              placeholder={`Watch ${wallets.length + 1}`}
               className={inputClassName}
             />
           )}
         </Field>
 
-        <Field
-          label="Mnemonic phrase or private key"
-          required
-          action={
-            inputValue.trim() ? (
-              <Badge tone={isMnemonic ? "success" : "warning"}>
-                {isMnemonic ? `${wordCount} words (Mnemonic)` : "Private Key"}
-              </Badge>
-            ) : undefined
-          }
-        >
+        <Field label="Ethereum address" required>
           {(props) => (
-            <textarea
+            <input
               {...props}
-              {...secretInputProps}
+              type="text"
               value={inputValue}
               onChange={(e) => setInputValue(e.target.value)}
-              placeholder="Enter your mnemonic phrase or private key..."
-              className={cn(monoInputClassName, "h-28 resize-none")}
+              placeholder="0x..."
+              className={monoInputClassName}
             />
           )}
         </Field>
@@ -1603,13 +1591,13 @@ export default function WalletCard() {
             </Button>
           )}
           <Button fullWidth onClick={handleImport}>
-            Import Wallet
+            Add Watch Address
           </Button>
         </div>
 
         <Alert tone="warning" title="Security warning">
-          This tool is intended for development and testing. Do not use a wallet containing
-          substantial funds.
+          Never paste a recovery phrase or private key into this panel. It is not stored
+          here; use the Vault panel, where secrets are encrypted before they are saved.
         </Alert>
       </div>
     </Card>
