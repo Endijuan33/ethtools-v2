@@ -1391,6 +1391,233 @@ async function initializeWalletKit(): Promise<IWalletKit> {
   })
 }
 
+/** IndexedDB database the WalletConnect Core is configured with. */
+export const WALLETCONNECT_DATABASE = "walletconnect"
+
+/** The SDK key-value store's own default database name (pre-configuration). */
+export const WALLETCONNECT_LEGACY_DATABASE = "WALLET_CONNECT_V2_INDEXED_DB"
+
+/**
+ * Whether a localStorage key belongs to WalletConnect.
+ *
+ * Mirrors the SDK's own migration matcher (`@walletconnect/keyvaluestorage`
+ * treats a key as WalletConnect-owned when its lowercase form contains
+ * `wc@`, `walletconnect`, `wc_`, or `wallet_connect`), so erase removes
+ * exactly the fallback keys the SDK itself would claim — never another
+ * library's storage.
+ */
+export function isWalletConnectStorageKey(key: string): boolean {
+  const lower = key.toLowerCase()
+  return (
+    lower.includes("wc@") ||
+    lower.includes("walletconnect") ||
+    lower.includes("wc_") ||
+    lower.includes("wallet_connect")
+  )
+}
+
+/**
+ * Race a promise against a deadline; resolves null on timeout.
+ *
+ * Every SDK/relay/IndexedDB step in the erase path is deadline-bound: a
+ * wedged relay socket (unreachable network, half-open connection) must
+ * never be able to hold the whole erase hostage, because the storage wipe
+ * that follows is the part the user actually asked for.
+ */
+async function withDeadline<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), ms)
+      }),
+    ])
+  } catch {
+    return null
+  } finally {
+    if (timer !== null) clearTimeout(timer)
+  }
+}
+
+/** Delete one IndexedDB database; resolves false when blocked or failed. */
+function deleteIndexedDbDatabase(name: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (typeof indexedDB === "undefined") {
+      resolve(false)
+      return
+    }
+    let settled = false
+    const settle = (value: boolean): void => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    // Hard deadline: a blocked deletion that never fires any handler must
+    // not stall the erase.
+    const deadline = setTimeout(() => settle(false), 4_000)
+    const done = (value: boolean): void => {
+      clearTimeout(deadline)
+      settle(value)
+    }
+    try {
+      const request = indexedDB.deleteDatabase(name)
+      request.onsuccess = () => done(true)
+      request.onerror = () => done(false)
+      // Another connection holding the database open blocks deletion.
+      request.onblocked = () => done(false)
+    } catch {
+      done(false)
+    }
+  })
+}
+
+/**
+ * Fallback when deletion is blocked: empty every object store instead.
+ *
+ * The live SDK instance in this tab holds its storage connection open, so
+ * `deleteDatabase` is routinely blocked by the app's own client. Clearing
+ * the stores removes the actual session/key data — which is what an erase
+ * promises — even when the (now empty) database shell has to stay until
+ * the connection closes. Resolves false only when the data could not be
+ * reached at all.
+ */
+function clearIndexedDbDatabaseContents(name: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (typeof indexedDB === "undefined") {
+      resolve(false)
+      return
+    }
+    let settled = false
+    const settle = (value: boolean): void => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    const deadline = setTimeout(() => settle(false), 4_000)
+    const done = (value: boolean): void => {
+      clearTimeout(deadline)
+      settle(value)
+    }
+    try {
+      const openRequest = indexedDB.open(name)
+      openRequest.onerror = () => done(false)
+      openRequest.onsuccess = () => {
+        const db = openRequest.result
+        const stores = Array.from(db.objectStoreNames)
+        if (stores.length === 0) {
+          db.close()
+          done(true)
+          return
+        }
+        try {
+          const tx = db.transaction(stores, "readwrite")
+          for (const store of stores) tx.objectStore(store).clear()
+          tx.oncomplete = () => {
+            db.close()
+            done(true)
+          }
+          tx.onerror = () => {
+            db.close()
+            done(false)
+          }
+        } catch {
+          db.close()
+          done(false)
+        }
+      }
+    } catch {
+      done(false)
+    }
+  })
+}
+
+/**
+ * Erase every trace of WalletConnect state (RA-04).
+ *
+ * Steps, in order: disconnect live sessions through the SDK while it is
+ * still initialized, remove the SDK's localStorage fallback keys, then
+ * empty its IndexedDB databases (deleting the shell too when no live SDK
+ * connection can be blocked by the attempt). Failures are collected and reported —
+ * the caller must not claim a complete erase when a database was blocked
+ * by another open tab.
+ *
+ * Safe to call when WalletConnect was never initialized in this tab: the
+ * storage steps still run, because a previous session may have left them.
+ */
+export async function eraseWalletConnectData(): Promise<{ ok: boolean; error?: string }> {
+  const failures: string[] = []
+  // Whether the SDK was initialized in THIS tab. Its storage connection
+  // stays open for the tab's lifetime, which shapes the IndexedDB strategy
+  // below: a deleteDatabase attempted against our own live connection
+  // stays pending-blocked and would stall later opens of that database.
+  const sdkWasInitialized = walletKitPromise !== null
+
+  // 1. Disconnect live sessions while the client exists. Every step is
+  // deadline-bound (see withDeadline): a relay that cannot be reached —
+  // exactly the situation in a sandboxed or offline browser — must not
+  // stall the erase; the storage wipe below proceeds regardless, and the
+  // sessions die with their storage.
+  if (walletKitPromise !== null) {
+    const kit = await withDeadline(walletKitPromise, 3_000)
+    if (kit !== null) {
+      const sessions = Object.values(kit.getActiveSessions())
+      await withDeadline(
+        Promise.allSettled(
+          sessions.map((session) =>
+            kit.disconnectSession({ topic: session.topic, reason: WC_ERROR.USER_DISCONNECTED })
+          )
+        ),
+        3_000
+      )
+      const relayer = (
+        kit.core as unknown as {
+          relayer?: { transportClose?: () => Promise<void> }
+        }
+      )?.relayer
+      if (relayer?.transportClose) {
+        await withDeadline(relayer.transportClose().catch(() => undefined), 1_500)
+      }
+    }
+    walletKitPromise = null
+  }
+
+  if (typeof window !== "undefined") {
+    // 2. localStorage fallback keys owned by the SDK.
+    try {
+      const keys: string[] = []
+      for (let i = 0; i < window.localStorage.length; i++) {
+        const key = window.localStorage.key(i)
+        if (key !== null && isWalletConnectStorageKey(key)) keys.push(key)
+      }
+      for (const key of keys) window.localStorage.removeItem(key)
+    } catch {
+      failures.push("WalletConnect's local fallback storage could not be cleared.")
+    }
+
+    // 3. IndexedDB databases. Contents first: emptying the stores always
+    // works and removes the actual session/key data. Deletion of the
+    // database shell is attempted only when the SDK was never initialized
+    // in this tab — against our own live connection a deletion would stay
+    // pending-blocked and stall later opens, while the empty shell it
+    // leaves behind holds no data and disappears with the tab.
+    for (const database of [WALLETCONNECT_DATABASE, WALLETCONNECT_LEGACY_DATABASE]) {
+      const emptied = await clearIndexedDbDatabaseContents(database)
+      if (!emptied && typeof indexedDB !== "undefined") {
+        failures.push(
+          `The WalletConnect database "${database}" could not be emptied (it may be open in another tab).`
+        )
+        continue
+      }
+      if (!sdkWasInitialized) {
+        await deleteIndexedDbDatabase(database)
+      }
+    }
+  }
+
+  return failures.length > 0 ? { ok: false, error: failures.join(" ") } : { ok: true }
+}
+
 /** Event handlers the panel wires up to a WalletKit client. */
 export interface WalletKitEventHandlers {
   onSessionProposal?: (event: WcSessionProposalEvent) => void
